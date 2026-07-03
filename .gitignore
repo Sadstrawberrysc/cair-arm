@@ -1,0 +1,109 @@
+py-xiaokai/models
+py-xiaokai/logs
+py-xiaokai/libs
+py-xiaokai/assets
+**/__pycache__/
+**/.vscode/
+# ==========================
+# 1. 操作系统与编辑器配置
+# ==========================
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ==========================
+# 2. Python 缓存与环境
+# ==========================
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# ==========================
+# 3. 深度学习通用日志与监控
+# ==========================
+# WandB 日志文件夹 (非常大，必须忽略)
+wandb/
+# 通用日志文件
+*.log
+nohup.out
+
+# ==========================
+# 4. 模型权重文件 (Large Files)
+# ==========================
+# 忽略所有 PyTorch 和 YOLO 权重文件
+*.pt
+*.pth
+*.ckpt
+*.weights
+*.onnx
+scan_pilot/intergrate_infer/weights
+# 特例：如果你确实需要上传某些小的预训练权重，可以使用 git add -f 强制添加
+# 这里明确忽略文件夹：
+pose_pilot/pretrain_weights/
+encoder_pretrain/echocare_finetune/models/
+
+# ==========================
+# 5. 数据集与原始数据 (Datasets)
+# ==========================
+# 根据你的目录结构，以下文件夹包含大量数据，不应上传：
+encoder_pretrain/data_carotid_0714/
+pose_pilot/datasets/
+pose_pilot/raw_data/
+yolotrain/data_artery/
+scan_pilot/phase_clc/kaili_data/
+
+# 忽略 Robot 模块下的数据
+infer/Robot/data/
+
+# ==========================
+# 6. 训练输出与运行记录 (Runs & Logs)
+# ==========================
+# 忽略各个模块的训练输出文件夹
+encoder_pretrain/trainlogs/
+pose_pilot/runs/
+yolotrain/runs/
+scan_pilot/phase_clc/runs/
+
+# ==========================
+# 7. 推理结果与可视化报告
+# ==========================
+# 忽略生成的图片和 CSV 结果
+scan_pilot/phase_clc/inference_reports/
+scan_pilot/phase_clc/inference_results/
+pose_pilot/visual/*.png
+pose_pilot/visual/*.jpg
+pose_pilot/yolotrain/data_artery
+pose_pilot/yolotrain/runs
+pose_pilot/yolotrain/train_new
+pose_pilot/yolotrain/val_new
+# ==========================
+# 8. C++ 编译文件 (Robot 模块)
+# ==========================
+infer/Robot/build/
+infer/Robot/3rdparty/
+
+# ==========================
+# 9. 备份文件与临时脚本
+# ==========================
+scan_pilot/terminal_clc/data_collect/
+pose_pilot/yolotrain/translation_fake/
+segmentation/carotid/data_coco
+segmentation/carotid/data_mask
+segmentation/carotid/images
+segmentation/carotid/inference_results
+segmentation/carotid/masks
+segmentation/carotid/test_results
+infer/Camera_RT/data
+infer/ContactPointShow/model
+# 忽略备份文件夹或文件 (通常以 bk, back 结尾)
+*.mp4
+*.avi
+*_bk/
+*_back/
+*backup*
+# 3D models
+*.stl
+*.obj
