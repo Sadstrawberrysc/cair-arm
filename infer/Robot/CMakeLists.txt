@@ -55,9 +55,15 @@ add_executable(arm_read_state_raw
     ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_read_state_raw.cpp
 )
 
+add_executable(arm_movej_delta
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_movej_delta.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
+)
+
 # set c++11 and threading
 set_property(TARGET arm_read_state PROPERTY CXX_STANDARD 17)
 set_property(TARGET arm_read_state_raw PROPERTY CXX_STANDARD 17)
+set_property(TARGET arm_movej_delta PROPERTY CXX_STANDARD 17)
 if(BUILD_LEGACY_MAIN_NOMOVE)
     set_property(TARGET main_nomove PROPERTY CXX_STANDARD 17)
 endif()

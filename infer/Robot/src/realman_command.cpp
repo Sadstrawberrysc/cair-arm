@@ -1,6 +1,8 @@
 #include <realman_command.hpp>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <sys/select.h>
 
 namespace {
 
@@ -17,14 +19,24 @@ bool SendAndParse(RMCommand& rm, const nlohmann::json& request, const char* labe
         std::exit(0);
     }
 
-    memset(rm.recv_msg, 0, 1000);
-    rm.recv_times = 0;
-    while (recv(rm.rlm_socket, rm.recv_msg, 1000, 0) < 10 && rm.recv_times < 3) {
-        rm.recv_times++;
-    }
-    if (rm.recv_times == 3) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(rm.rlm_socket, &read_fds);
+    timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+
+    int ready = select(rm.rlm_socket + 1, &read_fds, nullptr, nullptr, &timeout);
+    if (ready <= 0) {
         std::cout << "ERROR! Can't receive message in " << label << "!" << std::endl;
-        std::exit(0);
+        std::exit(1);
+    }
+
+    memset(rm.recv_msg, 0, 1000);
+    int received = recv(rm.rlm_socket, rm.recv_msg, 999, 0);
+    if (received <= 0) {
+        std::cout << "ERROR! Can't receive message in " << label << "!" << std::endl;
+        std::exit(1);
     }
 
     rm.return_msg.clear();
@@ -37,11 +49,108 @@ bool SendAndParse(RMCommand& rm, const nlohmann::json& request, const char* labe
     return true;
 }
 
+bool ReceiveAndParse(RMCommand& rm, const char* label, int timeout_ms) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(rm.rlm_socket, &read_fds);
+    timeval timeout;
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int ready = select(rm.rlm_socket + 1, &read_fds, nullptr, nullptr, &timeout);
+    if (ready < 0) {
+        std::cout << "ERROR! select failed in " << label << ": "
+                  << std::strerror(errno) << std::endl;
+        return false;
+    }
+    if (ready == 0) {
+        return false;
+    }
+
+    memset(rm.recv_msg, 0, 1000);
+    int received = recv(rm.rlm_socket, rm.recv_msg, 999, 0);
+    if (received <= 0) {
+        std::cout << "ERROR! recv failed in " << label << std::endl;
+        return false;
+    }
+
+    rm.return_msg.clear();
+    rm.return_msg = nlohmann::json::parse(rm.recv_msg, nullptr, false);
+    if (rm.return_msg.is_discarded()) {
+        std::cout << "WARNING! Invalid JSON in " << label << ": "
+                  << rm.recv_msg << std::endl;
+        return false;
+    }
+    return true;
+}
+
+void SendRequest(RMCommand& rm, const nlohmann::json& request, const char* label) {
+    rm.cmd_str = request.dump() + "\r\n";
+    memset(rm.send_msg, 0, 1000);
+    strcpy(rm.send_msg, rm.cmd_str.c_str());
+
+    if (send(rm.rlm_socket, rm.send_msg, strlen(rm.send_msg), 0) < 0) {
+        std::cout << "ERROR! Can't send message in " << label << "!" << std::endl;
+        std::exit(1);
+    }
+}
+
 template <int JointCount>
 void FillJointCommand(nlohmann::json& msg, const Eigen::Matrix<double, JointCount, 1>& joints) {
     for (int i = 0; i < joints.size(); i++) {
         msg["joint"][i] = int(kRadToMilliDegree * joints[i]);
     }
+}
+
+void WaitTrajectoryResponse(RMCommand& rm, const char* label) {
+    bool saw_receive_ack = false;
+    constexpr int kMaxMessages = 30;
+
+    for (int i = 0; i < kMaxMessages; ++i) {
+        if (!ReceiveAndParse(rm, label, 1000)) {
+            continue;
+        }
+
+        const auto& response = rm.return_msg;
+        std::cout << label << " response:\t" << response.dump() << std::endl;
+
+        if (response.contains("arm_err") && response["arm_err"].is_number_integer()
+            && response["arm_err"].get<int>() != 0) {
+            std::cout << "ERROR! " << label << " arm_err is non-zero!" << std::endl;
+            std::exit(1);
+        }
+
+        if (response.contains("receive_state")) {
+            if (response["receive_state"].is_boolean() && !response["receive_state"].get<bool>()) {
+                std::cout << "ERROR! " << label << " receive_state is false!" << std::endl;
+                std::exit(1);
+            }
+            saw_receive_ack = true;
+            continue;
+        }
+
+        if (response.contains("trajectory_state")) {
+            const auto& trajectory_state = response["trajectory_state"];
+            if (trajectory_state.is_boolean()) {
+                if (trajectory_state.get<bool>()) {
+                    std::cout << label << " OK!" << std::endl;
+                    return;
+                }
+                std::cout << "ERROR! " << label << " trajectory_state is false!" << std::endl;
+                std::exit(1);
+            } else {
+                std::cout << "WARNING! " << label
+                          << " trajectory_state is not a boolean; keep waiting."
+                          << std::endl;
+            }
+        }
+    }
+
+    std::cout << "ERROR! " << label
+              << " did not receive trajectory completion after "
+              << (saw_receive_ack ? "ack." : "sending command.")
+              << std::endl;
+    std::exit(1);
 }
 
 }  // namespace
@@ -229,35 +338,41 @@ void RMCommand::ReadArmState(Eigen::Matrix<double,7,1>& joints,
                              int& sys_err_out){
     command_msg.clear();
     command_msg["command"] = "get_current_arm_state";
-    if (SendAndParse(*this, command_msg, "ReadArmState")) {
+    SendRequest(*this, command_msg, "ReadArmState");
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (!ReceiveAndParse(*this, "ReadArmState", 1000)) {
+            continue;
+        }
         if (!return_msg.contains("arm_state") || !return_msg["arm_state"].is_object()) {
             std::cout << "WARNING! ReadArmState return has no arm_state object: "
                       << return_msg.dump() << std::endl;
-        } else {
-            auto& state = return_msg["arm_state"];
-            arm_err = state.value("arm_err", arm_err);
-            sys_err = state.value("sys_err", sys_err);
+            continue;
+        }
 
-            if (state.contains("joint") && state["joint"].is_array()) {
-                last_joint_count = state["joint"].size();
-                if (last_joint_count != cmd_joints.size()) {
-                    std::cout << "WARNING! ReadArmState received " << last_joint_count
-                              << " joints; expected 7 for RM75." << std::endl;
-                }
-                int n = std::min<int>(last_joint_count, cmd_joints.size());
-                for (int i = 0; i < n; i++) {
-                    cmd_joints[i] = state["joint"][i].get<double>();
-                }
+        auto& state = return_msg["arm_state"];
+        arm_err = state.value("arm_err", arm_err);
+        sys_err = state.value("sys_err", sys_err);
+
+        if (state.contains("joint") && state["joint"].is_array()) {
+            last_joint_count = state["joint"].size();
+            if (last_joint_count != cmd_joints.size()) {
+                std::cout << "WARNING! ReadArmState received " << last_joint_count
+                          << " joints; expected 7 for RM75." << std::endl;
             }
-
-            if (state.contains("pose") && state["pose"].is_array()) {
-                auto& p = state["pose"];
-                int n = std::min<int>(p.size(), cmd_pose.size());
-                for (int i = 0; i < n; i++) {
-                    cmd_pose[i] = p[i].get<double>();
-                }
+            int n = std::min<int>(last_joint_count, cmd_joints.size());
+            for (int i = 0; i < n; i++) {
+                cmd_joints[i] = state["joint"][i].get<double>();
             }
         }
+
+        if (state.contains("pose") && state["pose"].is_array()) {
+            auto& p = state["pose"];
+            int n = std::min<int>(p.size(), cmd_pose.size());
+            for (int i = 0; i < n; i++) {
+                cmd_pose[i] = p[i].get<double>();
+            }
+        }
+        break;
     }
 
     joints = cmd_joints * kMilliDegreeToRad;
@@ -277,32 +392,8 @@ void RMCommand::MoveJ(Eigen::Matrix<double,7,1>& joints, int velo){
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
     std::cout << cmd_str << std::endl;
-    memset(send_msg, 0, 1000);
-    strcpy(send_msg, cmd_str.c_str());
-    if(send(rlm_socket, send_msg, strlen(send_msg), 0) < 0){
-        std::cout << "ERROR! Can't send message! " << std::endl;
-        std::exit(0);
-    }else{
-        memset(recv_msg, 0, 1000); recv_times=0;
-        while (recv(rlm_socket, recv_msg, 1000, 0) < 10 && recv_times < 3) recv_times++;
-        if(recv_times == 3){
-            std::cout << "ERROR! Can't recive message! " << std::endl;
-            std::exit(0);
-        }else{
-            return_msg.clear();
-            return_msg = nlohmann::json::parse(recv_msg, nullptr, false);
-            if (return_msg.is_discarded()){
-                std::cout << "WARNING! Missing a return message." << return_msg.dump() << std::endl;
-            }else{
-                if(return_msg["trajectory_state"].get<bool>()){
-                    std::cout << "MoveJ OK!\t" << return_msg.dump() << std::endl;
-                }else{
-                    std::cout << "ERROR! MoveJ False!\t" << return_msg.dump() << std::endl;
-                    std::exit(0);
-                }
-            }
-        }
-    }
+    SendRequest(*this, command_msg, "MoveJ");
+    WaitTrajectoryResponse(*this, "MoveJ");
 }
 
 
@@ -320,32 +411,8 @@ void RMCommand::MoveL(Eigen::Matrix<double,6,1>& pose, int velo){
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
     std::cout << cmd_str << std::endl;
-    memset(send_msg, 0, 1000);
-    strcpy(send_msg, cmd_str.c_str());
-    if(send(rlm_socket, send_msg, strlen(send_msg), 0) < 0){
-        std::cout << "ERROR! Can't send message! " << std::endl;
-        std::exit(0);
-    }else{
-        memset(recv_msg, 0, 1000); recv_times=0;
-        while (recv(rlm_socket, recv_msg, 1000, 0) < 10 && recv_times < 3) recv_times++;
-        if(recv_times == 3){
-            std::cout << "ERROR! Can't recive message! " << std::endl;
-            std::exit(0);
-        }else{
-            return_msg.clear();
-            return_msg = nlohmann::json::parse(recv_msg, nullptr, false);
-            if (return_msg.is_discarded()){
-                std::cout << "WARNING! Missing a return message." << return_msg.dump() << std::endl;
-            }else{
-                if(return_msg["trajectory_state"].get<bool>()){
-                    std::cout << "MoveL OK!\t" << return_msg.dump() << std::endl;
-                }else{
-                    std::cout << "ERROR! MoveL False!\t" << return_msg.dump() << std::endl;
-                    std::exit(0);
-                }
-            }
-        }
-    }
+    SendRequest(*this, command_msg, "MoveL");
+    WaitTrajectoryResponse(*this, "MoveL");
 }
 
 
@@ -363,32 +430,8 @@ void RMCommand::MoveJP(Eigen::Matrix<double,6,1>& pose, int velo){
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
     std::cout << cmd_str << std::endl;
-    memset(send_msg, 0, 1000);
-    strcpy(send_msg, cmd_str.c_str());
-    if(send(rlm_socket, send_msg, strlen(send_msg), 0) < 0){
-        std::cout << "ERROR! Can't send message! " << std::endl;
-        std::exit(0);
-    }else{
-        memset(recv_msg, 0, 1000); recv_times=0;
-        while (recv(rlm_socket, recv_msg, 1000, 0) < 10 && recv_times < 3) recv_times++;
-        if(recv_times == 3){
-            std::cout << "ERROR! Can't recive message! " << std::endl;
-            std::exit(0);
-        }else{
-            return_msg.clear();
-            return_msg = nlohmann::json::parse(recv_msg, nullptr, false);
-            if (return_msg.is_discarded()){
-                std::cout << "WARNING! Missing a return message." << return_msg.dump() << std::endl;
-            }else{
-                if(return_msg["trajectory_state"].get<bool>()){
-                    std::cout << "MoveJ_P OK!\t" << return_msg.dump() << std::endl;
-                }else{
-                    std::cout << "ERROR! MoveJ_P False!\t" << return_msg.dump() << std::endl;
-                    std::exit(0);
-                }
-            }
-        }
-    }
+    SendRequest(*this, command_msg, "MoveJ_P");
+    WaitTrajectoryResponse(*this, "MoveJ_P");
 }
 
 void RMCommand::ServoJ(Eigen::Matrix<double,7,1>& joints, bool follow){
