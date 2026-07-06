@@ -26,6 +26,7 @@ public:
     Eigen::Matrix<double, 6, 1> cmd_pose;
     int last_joint_count;
     int arm_err, sys_err;
+    bool quiet;
 
 public:
     RMCommand();

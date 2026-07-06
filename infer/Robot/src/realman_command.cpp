@@ -112,7 +112,9 @@ void WaitTrajectoryResponse(RMCommand& rm, const char* label) {
         }
 
         const auto& response = rm.return_msg;
-        std::cout << label << " response:\t" << response.dump() << std::endl;
+        if (!rm.quiet) {
+            std::cout << label << " response:\t" << response.dump() << std::endl;
+        }
 
         if (response.contains("arm_err") && response["arm_err"].is_number_integer()
             && response["arm_err"].get<int>() != 0) {
@@ -133,7 +135,9 @@ void WaitTrajectoryResponse(RMCommand& rm, const char* label) {
             const auto& trajectory_state = response["trajectory_state"];
             if (trajectory_state.is_boolean()) {
                 if (trajectory_state.get<bool>()) {
-                    std::cout << label << " OK!" << std::endl;
+                    if (!rm.quiet) {
+                        std::cout << label << " OK!" << std::endl;
+                    }
                     return;
                 }
                 std::cout << "ERROR! " << label << " trajectory_state is false!" << std::endl;
@@ -165,6 +169,7 @@ RMCommand::RMCommand(){
     last_joint_count = 0;
     arm_err = 0;
     sys_err = 0;
+    quiet = false;
 }
 
 
@@ -180,7 +185,9 @@ void RMCommand::ConnectTCPSocket(){
         std::cout << "ERROR! Can't connect robot!" << std::endl;
         std::exit(0);
     }else{
-        std::cout << "Robot connect!" << std::endl;
+        if (!quiet) {
+            std::cout << "Robot connect!" << std::endl;
+        }
     }
 }
 
@@ -217,7 +224,7 @@ void RMCommand::SetHighSpeedEth(){
     // Set IP
     command_msg.clear();
     command_msg["command"] = "set_high_ethernet";
-    command_msg["ip"] = "192.168.1.18";
+    command_msg["ip"] = "192.168.50.254";
     command_msg["mask"] = "255.255.255.0";
     command_msg["gateway"] = "192.168.1.1";
     cmd_str = command_msg.dump()+"\r\n";
@@ -391,7 +398,9 @@ void RMCommand::MoveJ(Eigen::Matrix<double,7,1>& joints, int velo){
     command_msg["v"] = velo;
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
-    std::cout << cmd_str << std::endl;
+    if (!quiet) {
+        std::cout << cmd_str << std::endl;
+    }
     SendRequest(*this, command_msg, "MoveJ");
     WaitTrajectoryResponse(*this, "MoveJ");
 }
@@ -410,7 +419,9 @@ void RMCommand::MoveL(Eigen::Matrix<double,6,1>& pose, int velo){
     command_msg["v"] = velo;
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
-    std::cout << cmd_str << std::endl;
+    if (!quiet) {
+        std::cout << cmd_str << std::endl;
+    }
     SendRequest(*this, command_msg, "MoveL");
     WaitTrajectoryResponse(*this, "MoveL");
 }
@@ -429,7 +440,9 @@ void RMCommand::MoveJP(Eigen::Matrix<double,6,1>& pose, int velo){
     command_msg["v"] = velo;
     command_msg["r"] = 0;
     cmd_str = command_msg.dump()+"\r\n";
-    std::cout << cmd_str << std::endl;
+    if (!quiet) {
+        std::cout << cmd_str << std::endl;
+    }
     SendRequest(*this, command_msg, "MoveJ_P");
     WaitTrajectoryResponse(*this, "MoveJ_P");
 }

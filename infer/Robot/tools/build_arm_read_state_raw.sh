@@ -3,7 +3,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 robot_dir="$(cd "${script_dir}/.." && pwd)"
-output="${1:-/tmp/arm_read_state_raw}"
+output="${1:-${robot_dir}/build/arm_read_state_raw}"
+mkdir -p "$(dirname "${output}")"
 
 g++ -std=c++17 -O2 \
     -I"${robot_dir}/include" \
