@@ -452,29 +452,33 @@ void RMCommand::ServoJ(Eigen::Matrix<double,7,1>& joints, bool follow){
     command_msg["command"] = "movej_canfd";
     FillJointCommand(command_msg, joints);
     command_msg["follow"] = follow;
-    cmd_str = command_msg.dump()+"\r\n";
-    memset(send_msg, 0, 1000);
-    strcpy(send_msg, cmd_str.c_str());
-    if(send(rlm_socket, send_msg, strlen(send_msg), 0) < 0){
-        std::cout << "ERROR! Can't send message! " << std::endl;
-        std::exit(0);
-    }else{
-        memset(recv_msg, 0, 1000); recv_times=0;
-        while (recv(rlm_socket, recv_msg, 1000, 0) < 10 && recv_times < 3) recv_times++;
-        if(recv_times == 3){
-            std::cout << "ERROR! Can't recive message! " << std::endl;
-            std::exit(0);
-        }else{
-            return_msg.clear();
-            return_msg = nlohmann::json::parse(recv_msg, nullptr, false);
-            if (return_msg.is_discarded()){
-                std::cout << "WARNING! Missing a return message." << return_msg.dump() << std::endl;
-            }else{
-                if(return_msg["arm_err"].get<int>() != 0){
-                    std::cout << "WARNING! ServoJ False!\t" << return_msg.dump() << std::endl;
-                }
-            }
+
+    if (!quiet) {
+        std::cout << command_msg.dump() << std::endl;
+    }
+    SendRequest(*this, command_msg, "ServoJ");
+    if (!ReceiveAndParse(*this, "ServoJ", 0)) {
+        return;
+    }
+
+    if (!quiet) {
+        std::cout << "ServoJ response:\t" << return_msg.dump() << std::endl;
+    }
+
+    if (return_msg.contains("arm_err") && return_msg["arm_err"].is_number_integer()) {
+        if (return_msg["arm_err"].get<int>() != 0) {
+            std::cout << "WARNING! ServoJ arm_err is non-zero:\t"
+                      << return_msg.dump() << std::endl;
         }
+        return;
+    }
+
+    if (return_msg.contains("receive_state") && return_msg["receive_state"].is_boolean()) {
+        if (!return_msg["receive_state"].get<bool>()) {
+            std::cout << "WARNING! ServoJ receive_state is false:\t"
+                      << return_msg.dump() << std::endl;
+        }
+        return;
     }
 }
 

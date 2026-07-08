@@ -3,10 +3,6 @@ cmake_minimum_required (VERSION 3.1)
 # set project
 project (AutoRUSS)
 
-# find opencv
-find_package(OpenCV REQUIRED)
-message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-
 # find torch
 # set(Torch_DIR /home/cair-jacen/Libtorch/libtorch/share/cmake/Torch)
 # find_package(Torch REQUIRED)
@@ -32,6 +28,9 @@ include_directories(
 
 # set(CMAKE_CXX_FLAGS "${CAMKE_CXX_FLAGS} -std=c++14 -pthread")
 if(BUILD_LEGACY_MAIN_NOMOVE)
+    find_package(OpenCV REQUIRED)
+    message(STATUS "OpenCV version: ${OpenCV_VERSION}")
+
     set(ROBOT_COMMON_SRCS
         ${CMAKE_CURRENT_SOURCE_DIR}/src/contact_sensing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/force_sensor.cpp
@@ -51,57 +50,21 @@ add_executable(arm_read_state
     ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
 )
 
-add_executable(arm_read_state_raw
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_read_state_raw.cpp
-)
-
-add_executable(arm_read_frames
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_read_frames.cpp
-)
-
-add_executable(arm_movej_delta
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_movej_delta.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-)
-
 add_executable(arm_preset_pose
     ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_preset_pose.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
 )
 
-add_executable(arm_pose_delta
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_pose_delta.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-)
-
-add_executable(arm_jacobian_position_delta
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_jacobian_position_delta.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_kinematics.cpp
-)
-
-add_executable(arm_estimate_jacobian
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_estimate_jacobian.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_kinematics.cpp
-)
-
-add_executable(arm_check_kinematics
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_check_kinematics.cpp
+add_executable(main_rm75
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_servoj_line_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_kinematics.cpp
 )
 
 # set c++11 and threading
 set_property(TARGET arm_read_state PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_read_state_raw PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_read_frames PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_movej_delta PROPERTY CXX_STANDARD 17)
 set_property(TARGET arm_preset_pose PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_pose_delta PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_jacobian_position_delta PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_estimate_jacobian PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_check_kinematics PROPERTY CXX_STANDARD 17)
+set_property(TARGET main_rm75 PROPERTY CXX_STANDARD 17)
 if(BUILD_LEGACY_MAIN_NOMOVE)
     set_property(TARGET main_nomove PROPERTY CXX_STANDARD 17)
 endif()

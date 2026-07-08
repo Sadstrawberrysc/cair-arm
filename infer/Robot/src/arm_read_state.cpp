@@ -1,6 +1,9 @@
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -9,6 +12,8 @@
 #include <realman_command.hpp>
 
 namespace {
+
+constexpr double kRadToDeg = 180.0 / M_PI;
 
 struct Options {
     std::string ip = "192.168.50.254";
@@ -103,6 +108,26 @@ void PrintVector(const char* label, const Eigen::Matrix<double, Size, 1>& values
     std::cout << "]\n";
 }
 
+std::string FormatVector3(const Eigen::Vector3d& values) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(4)
+           << values[0] << "," << values[1] << "," << values[2];
+    return stream.str();
+}
+
+void PrintPoseFriendly(const Eigen::Matrix<double, 6, 1>& pose) {
+    Eigen::Vector3d position_cm = pose.head<3>() * 100.0;
+    Eigen::Vector3d rotation_deg = pose.tail<3>() * kRadToDeg;
+
+    PrintVector("position_cm", position_cm);
+    PrintVector("rotation_deg", rotation_deg);
+    std::cout << "current_as_target_position_cm: \""
+              << FormatVector3(position_cm) << "\"\n";
+    std::cout << "copyable_absolute_position_dry_run: ./main_rm75 "
+              << "--target-position-cm \"" << FormatVector3(position_cm)
+              << "\"\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -134,6 +159,7 @@ int main(int argc, char** argv) {
         std::cout << "sys_err: " << sys_err << "\n";
         PrintVector("joints7_rad", joints);
         PrintVector("pose_m_rad", pose);
+        PrintPoseFriendly(pose);
 
         if (index + 1 < options.repeat && options.interval_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
