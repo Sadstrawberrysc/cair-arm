@@ -1,161 +1,170 @@
-# Realman RM75 机械臂控制进度记录
+# Realman RM75 机械臂控制进度
 
-## 当前目标
+## 当前状态
 
-- 只保留 RM75 机械臂控制主线。
-- 以 `main_rm75` 作为主程序。
-- 主程序源码为 `infer/Robot/src/arm_servoj_line_test.cpp`。
-- 控制方式为固定周期 streaming ServoJ。
+RM75 七轴控制主线已经打通，当前统一使用：
 
-## 当前保留入口
+- 主程序：`infer/Robot/build/main_rm75`
+- 主程序源码：`infer/Robot/src/arm_servoj_line_test.cpp`
+- 通信封装：`infer/Robot/src/realman_command.cpp`
+- 运动学模型：`infer/Robot/src/realman_kinematics.cpp`
+- 控制方式：固定周期 streaming ServoJ
+- 控制器地址：`192.168.50.254:8080`
 
-- `main_rm75`：主控制程序，支持相对位置运动和绝对 6D 位姿控制。
-- `arm_read_state`：读取七轴关节、末端位置和末端姿态。
-- `arm_preset_pose`：按七轴关节角移动到安全姿态，用于脱离奇异点或回到准备位。
+辅助程序：
 
-## 已删除/移除的测试入口
+- `arm_read_state`：只读七轴关节状态和末端 6D 位姿。
+- `arm_preset_pose`：通过 MoveJ 移动到指定七轴关节姿态。
+- `test_rm75_precision.sh`：依次测试 X/Y/Z 负向平移、组合平移和纯姿态旋转，并汇总精度。
 
-- `arm_servoj_delta`：单关节 ServoJ 小角度测试入口，已完成验证后移除。
-- `arm_servoj_pose`：临时 6D ServoJ 入口，已并入 `main_rm75`。
-- `arm_jacobian_6d_pose.cpp`：旧 6D 测试主程序，已被 `arm_servoj_line_test.cpp` 取代。
-- `build_arm_servoj_delta.sh`、`build_arm_servoj_pose.sh`、`build_arm_servoj_line_test.sh`：临时构建脚本已移除，统一使用 `build_main_rm75.sh`。
+## 技术路径
 
-## 主程序能力
+```text
+目标位置/姿态
+    -> 位姿插值
+    -> RM75 FK 与 6x7 Jacobian
+    -> 阻尼伪逆数值 IK
+    -> 关节步长、限位与奇异风险检查
+    -> 固定周期发送 ServoJ
+    -> 周期读取真机状态
+    -> 终点保持与误差验证
+    -> 自动保存 CSV 和 SVG
+```
 
-`main_rm75` 当前支持两类控制：
+已完成的关键步骤：
 
-1. 相对位置运动，姿态保持当前值：
+1. 通过 TCP JSON 协议连接控制器，并完成七轴状态读取。
+2. 将原六轴关节接口改为 RM75 七轴接口，验证七轴 MoveJ。
+3. 使用 RM75 MDH 参数建立 FK，真机多姿态测试的最大位置误差约为 `1.13e-5 m`。
+4. 建立 `6x7` Jacobian，并用真机中心差分结果验证模型。
+5. 使用阻尼伪逆求解每周期关节增量，实现位置和姿态的数值 IK。
+6. 完成相对位置、相对姿态和绝对 6D 位姿控制。
+7. 将分段运动升级为固定周期 streaming ServoJ。
+8. 加入关节限位、RM75 四类奇异位形检查、速度限制和 dry-run。
+9. 加入终点保持、轨迹记录和 C++ SVG 离线绘图。
+
+## 主程序用法
+
+先进入构建目录：
+
+```bash
+cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
+```
+
+相对位置运动，单位为厘米：
+
+```bash
+./main_rm75 --delta-cm "-5,0,0"
+./main_rm75 --delta-cm "-5,0,0" --execute
+```
+
+相对姿态运动，单位为度：
+
+```bash
+./main_rm75 --delta-rotation-deg "0,0,-5"
+./main_rm75 --delta-rotation-deg "0,0,-5" --execute
+```
+
+绝对 6D 位姿控制：
 
 ```bash
 ./main_rm75 \
-  --delta-cm "0,0,20" \
-  --execute
-```
+  --target-position-cm "40,20,45" \
+  --target-rotation-deg "96,71,97"
 
-2. 绝对 6D 位姿控制，同时给 position 和 rotation：
-
-```bash
 ./main_rm75 \
   --target-position-cm "40,20,45" \
   --target-rotation-deg "96,71,97" \
   --execute
 ```
 
-也支持只给位置或只给姿态：
-
-```bash
-./main_rm75 --target-position-cm "40,20,45" --execute
-./main_rm75 --target-rotation-deg "96,71,97" --execute
-```
-
-未给出的目标字段默认使用当前位姿。
+未提供的位置或姿态字段会保持当前值。所有新目标都应先 dry-run，确认没有限位、奇异或路径风险后再添加 `--execute`。
 
 ## 当前默认参数
 
-- 控制器地址：`192.168.50.254:8080`
-- ServoJ 周期：`period_ms=20`
-- 反馈读取：`feedback_every=10`
-- 终点追踪：`final_hold_ms=2000`
-- 末端主轨迹速度上限：`max_tcp_speed_cm_s=5`
-- 最大总位置变化：`max_total_delta_cm=100`
-- 最大姿态变化：`max_rotation_delta_deg=180`
-- 关节速度限幅：使用 RM75 官方最大关节角速度
-  - J1/J2：`180 deg/s`
-  - J3-J7：`225 deg/s`
-- 位姿插值：默认 `linear`
-- S 曲线插值：可通过 `--interpolation s-curve` 显式启用
-- 关节加速度限幅：默认关闭，`max_joint_accel_deg_s2=0`
-- 关节加速度限幅可通过 `--max-joint-accel-deg-s2` 显式启用
-- 关节限位预警：`joint_limit_warning_deg=10`
-- 关节限位停止：`joint_limit_stop_deg=3`
-- 奇异点预警：`singularity_warning_deg=5`
+| 参数 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `period_ms` | `20 ms` | ServoJ 发送周期 |
+| `feedback_every` | `2` | 每两个周期读取一次真机状态 |
+| `final_hold_ms` | `2000 ms` | 终点继续发送目标，降低跟踪滞后 |
+| `max_tcp_speed_cm_s` | `3 cm/s` | 末端平移速度上限 |
+| `max_total_delta_cm` | `100 cm` | 单次位置变化上限 |
+| `max_rotation_delta_deg` | `180 deg` | 单次姿态变化上限 |
+| `damping` | `0.001` | Jacobian 阻尼伪逆系数 |
+| `joint_limit_warning_deg` | `10 deg` | 距关节限位的预警距离 |
+| `joint_limit_stop_deg` | `3 deg` | 距关节限位的停止距离 |
+| `singularity_warning_deg` | `5 deg` | RM75 奇异位形预警阈值 |
 
-## 技术路径总结
+关节速度默认采用 RM75 官方上限：J1/J2 为 `180 deg/s`，J3-J7 为 `225 deg/s`。默认使用线性位姿插值；`--interpolation s-curve` 和 `--max-joint-accel-deg-s2` 仅保留作调参实验，当前稳定基线不启用。
 
-1. 先完成 Realman TCP JSON 通信。
-2. 将原 6 轴接口适配为 RM75 七轴接口。
-3. 验证七轴 `MoveJ()` 基础运动。
-4. 使用 RM75 官方 MDH 参数建立 FK 和 `6x7` Jacobian。
-5. 用真机数据验证 FK 与控制器末端位置一致。
-6. 用阻尼伪逆 Jacobian 实现数值 IK。
-7. 先完成位置闭环，再完成姿态闭环，最后合成 6D 位姿控制。
-8. 将控制方式从分段 ServoJ 改为固定周期 streaming ServoJ。
-9. 在主程序中加入：
-   - 终点 hold 追踪
-   - 反馈校正
-   - 关节限位保护
-   - RM75 官方奇异点保护
-   - 位置和姿态 S 曲线插值
-   - 关节加速度限制
+## 编译与状态读取
 
-## 当前结论
-
-- `main_rm75` 已经可以作为当前 RM75 控制主入口。
-- 真机反馈显示首次 S 曲线版本反而更晃，原因判断为：
-  - 五次 S 曲线中段峰值速度是平均速度的 `1.875` 倍，原估时没有计入该峰值，导致中段实际速度偏激进。
-  - 反馈校正后清零上一周期关节增量，会在反馈点制造重复起步感。
-- 已修正并回退默认策略：
-  - 默认恢复到此前较稳定的线性插值。
-  - 默认关闭额外关节加速度限幅，避免外层限幅与控制器内部 ServoJ 滤波耦合振荡。
-  - 保留 S 曲线插值作为可选调参项：`--interpolation s-curve`。
-  - 保留关节加速度限幅作为可选调参项：`--max-joint-accel-deg-s2 N`。
-  - 估时按 S 曲线峰值速度重新计算，保证峰值 TCP 速度不超过 `max_tcp_speed_cm_s`。
-  - 反馈校正后保留上一周期关节增量历史，避免周期性速度突变。
-- 相对位置 streaming ServoJ 已在真机上取得较好结果：
-  - 终点误差可到约 `0.0036 cm`
-  - 横向误差约 `0.07 cm`
-  - 周期丢失通常为 `0-2`
-- 旧 `arm_jacobian_6d_pose.cpp` 直接追目标误差时，大位姿目标误差较大；因此当前主程序改用 `arm_servoj_line_test.cpp` 的连续轨迹 + 终点追踪逻辑。
-
-## 常用命令
-
-重新编译主程序：
+重新编译：
 
 ```bash
 cd /home/cair-jacen/uspilot_ctrl-main
 infer/Robot/tools/build_main_rm75.sh
-cmake -S infer/Robot -B infer/Robot/build
-cmake --build infer/Robot/build --target main_rm75 -j2
 ```
 
-读取当前状态：
+读取一次机械臂状态：
 
 ```bash
 cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 ./arm_read_state --repeat 1
 ```
 
-移动到安全关节姿态：
+移动到已检查的关节姿态：
 
 ```bash
 ./arm_preset_pose \
-  --target-deg "10,-20,30,80,-50,50,70" \
+  --target-deg "40,55,0,60,0,60,70" \
   --allow-multistep \
   --max-joint-delta-deg 15 \
   --execute
 ```
 
-主程序 dry-run：
+## 轨迹记录与精度测试
 
-```bash
-./main_rm75 \
-  --target-position-cm "40,20,45" \
-  --target-rotation-deg "96,71,97"
+执行 `main_rm75 --execute` 后，程序自动生成：
+
+```text
+logs/main_rm75_时间戳/trajectory.csv
+logs/main_rm75_时间戳/trajectory.svg
 ```
 
-确认安全后执行：
+SVG 左侧为三维目标、模型和真机轨迹；右侧为横向偏差随时间变化，单位为 `mm`。横向偏差适合衡量轨迹抖动，不包含沿运动方向的跟踪滞后。
+
+指定记录路径：
 
 ```bash
 ./main_rm75 \
-  --target-position-cm "40,20,45" \
-  --target-rotation-deg "96,71,97" \
+  --delta-cm "-5,0,0" \
+  --trajectory-log logs/x_neg_5cm.csv \
   --execute
 ```
 
-## 风险/注意事项
+运行完整精度测试：
 
-- 大范围目标仍可能触发关节限位、奇异点或不可达问题。
-- 如果出现 `Target joint Jx exceeds RM75 joint limits`，不要强行放开，应换姿态或拆小目标。
-- 如果出现 `rm75_singularity_warning`，说明当前或规划目标靠近 RM75 官方奇异位形。
-- `final_hold_ms` 会增加总运动时间，但能显著降低终点误差。
-- 所有大位移或大姿态变化都应先 dry-run，再 `--execute`。
+```bash
+cd /home/cair-jacen/uspilot_ctrl-main
+infer/Robot/tools/test_rm75_precision.sh
+```
+
+测试结果保存在 `infer/Robot/build/logs/precision_时间戳/`，包括每项测试的 CSV、SVG、终端输出和 `summary.csv`。
+
+## 当前结论与下一步
+
+- 七轴通信、FK、Jacobian、数值 IK 和 streaming ServoJ 已完成真机验证。
+- 小范围位置闭环的终点误差已达到毫米以下，周期丢失通常较少；实际结果仍受姿态、方向和奇异程度影响。
+- 线性插值是目前更稳定的默认方案。此前五次 S 曲线在现有外层 IK 与 ServoJ 组合下出现更明显抖动，因此暂不作为默认值。
+- 轨迹图应以真机反馈红线和横向偏差为主要判断依据；模型蓝线仅表示内部运动学预测。
+- 下一步使用同一安全初始姿态完成 X/Y/Z、组合平移和纯姿态对比测试，再根据 `summary.csv` 定位方向相关抖动。
+- 后续优化重点是降低 Jacobian 条件数较差区域的关节增量波动，并评估更稳定的阻尼、自适应速度和冗余自由度零空间策略。
+
+## 安全注意事项
+
+- `--execute` 会真实驱动机械臂；dry-run 不会发送运动命令。
+- 出现 `Target joint Jx exceeds RM75 joint limits` 时，应调整目标或初始姿态，不应直接放宽限位。
+- 出现 `rm75_singularity_warning` 时，应先移动到远离奇异点的关节姿态。
+- 大位移和大角度测试应逐级增加，并保持急停可用。
+- 不要同时使用示教器、其他 JSON 客户端和本程序发送控制命令。

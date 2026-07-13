@@ -14,8 +14,20 @@ RMKinematics::RMKinematics(){
     mdh_alpha  = {0, -90*kDegToRad, 90*kDegToRad, -90*kDegToRad,
                   90*kDegToRad, -90*kDegToRad, 90*kDegToRad};
     mdh_d      = {240.5*kMmToM, 0, 256.0*kMmToM, 0,
-                  210.0*kMmToM, 0, 0};
+                  210.0*kMmToM, 0, 144*kMmToM};
     joint_offset = {0, 0, 0, 0, 0, 0, 0};
+    // RM75 MDH table
+    //
+    // | joint | a(i-1) m | alpha(i-1) deg | d(i) mm | offset deg |
+    // | ----- | -------- | -------------- | ------ | ---------- |
+    // | J1    | 0        | 0              | 240.5  | 0          |
+    // | J2    | 0        | -90            | 0      | 0          |
+    // | J3    | 0        | 90             | 256.0  | 0          |
+    // | J4    | 0        | -90            | 0      | 0          |
+    // | J5    | 0        | 90             | 210.0  | 0          |
+    // | J6    | 0        | -90            | 0      | 0          |
+    // | J7    | 0        | 90             | 144.0  | 0          |
+    //Rm75-B（J7，d(i))=144
 
     joint_min = {-178*kDegToRad, -130*kDegToRad, -178*kDegToRad,
                  -135*kDegToRad, -178*kDegToRad, -128*kDegToRad,
@@ -24,10 +36,7 @@ RMKinematics::RMKinematics(){
                   135*kDegToRad,  178*kDegToRad,  128*kDegToRad,
                   360*kDegToRad};
 
-    // Controller "Arm_Tip" pose is offset from the MDH joint-7 frame.
-    // The current RM75 reports zero tool frame, so keep this as the robot
-    // geometric tip offset and validate it across multiple poses.
-    tool_offset << 0.0, 0.0, 0.143998;
+    tool_offset << 0.0, 0.0, 0.0;
 }
 
 Eigen::Matrix4d RMKinematics::GetModifiedDhTransform(double a,
