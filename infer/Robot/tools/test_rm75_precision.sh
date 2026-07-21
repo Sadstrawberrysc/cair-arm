@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" != "--execute" ]]; then
+  echo "This script performs 10 real RM75 motions." >&2
+  echo "Usage: $0 --execute" >&2
+  exit 2
+fi
+shift
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BUILD_DIR="$ROOT_DIR/infer/Robot/build"
-BIN="$BUILD_DIR/main_rm75"
+BIN="$BUILD_DIR/rm75_servoj_diagnostic"
 
 if [[ ! -x "$BIN" ]]; then
-  "$ROOT_DIR/infer/Robot/tools/build_main_rm75.sh"
+  "$ROOT_DIR/infer/Robot/tools/build_rm75_servoj_diagnostic.sh"
 fi
 
 RUN_DIR="$BUILD_DIR/logs/precision_$(date +%Y%m%d_%H%M%S)"

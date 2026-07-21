@@ -1,82 +1,107 @@
-cmake_minimum_required (VERSION 3.1)
+cmake_minimum_required(VERSION 3.16)
 
-# set project
-project (AutoRUSS)
+project(AutoRUSS_RM75 LANGUAGES CXX)
 
-# find torch
-# set(Torch_DIR /home/cair-jacen/Libtorch/libtorch/share/cmake/Torch)
-# find_package(Torch REQUIRED)
+find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+find_library(HIREDIS_LIB hiredis REQUIRED)
 
-# find hiredis
-find_library(HIREDIS_LIB hiredis)
-option(BUILD_LEGACY_MAIN_NOMOVE "Build legacy 6-axis main_nomove controller" OFF)
+option(BUILD_LEGACY_MAIN_NOMOVE
+       "Deprecated: main_nomove is retained as six-axis reference source only"
+       OFF)
+option(BUILD_MAINTENANCE_TOOLS
+       "Build retained robot diagnostics and sensor calibration utilities"
+       OFF)
+if(BUILD_LEGACY_MAIN_NOMOVE)
+    message(WARNING
+        "main_nomove is retained unchanged as an original six-axis reference; "
+        "it is not built against the RM75 seven-axis libraries.")
+endif()
 
-# find CUDA
-# find_package(CUDA REQUIRED)
-# message(STATUS "Cuda cublas: ${CUDA_CUBLAS_LIBRARYS}")
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
-# disable eigen tensor
-add_definitions(-DOPENCV_DISABLE_EIGEN_TENSOR_SUPPORT)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# add libraries
-include_directories(
-    ${OpenCV_INCLUDE_DIRS}
-    /usr/include/eigen3
+add_library(robot_project_options INTERFACE)
+target_include_directories(robot_project_options INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
+)
+target_link_libraries(robot_project_options INTERFACE Eigen3::Eigen)
+target_compile_definitions(robot_project_options INTERFACE
+    OPENCV_DISABLE_EIGEN_TENSOR_SUPPORT
+)
+target_compile_options(robot_project_options INTERFACE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>
 )
 
-# set(CMAKE_CXX_FLAGS "${CAMKE_CXX_FLAGS} -std=c++14 -pthread")
-if(BUILD_LEGACY_MAIN_NOMOVE)
-    find_package(OpenCV REQUIRED)
-    message(STATUS "OpenCV version: ${OpenCV_VERSION}")
+# RM75 communication and seven-axis motion.
+add_library(realman_transport STATIC
+    src/realman_command.cpp
+)
+target_link_libraries(realman_transport PUBLIC
+    robot_project_options
+    Threads::Threads
+)
 
-    set(ROBOT_COMMON_SRCS
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/contact_sensing.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/force_sensor.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_kinematics.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/robot_control.cpp
+add_library(rm75_motion STATIC
+    src/realman_kinematics.cpp
+    src/rm75_control.cpp
+)
+target_link_libraries(rm75_motion PUBLIC robot_project_options)
+
+# Haptron sensor, calibration compensation and contact estimation.
+add_library(robot_sensor STATIC
+    src/force_sensor.cpp
+    src/contact_sensing.cpp
+)
+target_link_libraries(robot_sensor PUBLIC
+    robot_project_options
+    Threads::Threads
+    OpenSSL::Crypto
+)
+
+if(BUILD_MAINTENANCE_TOOLS)
+    # Original RM75 diagnostic programs are retained unchanged.
+    add_executable(arm_read_state src/arm_read_state.cpp)
+    target_link_libraries(arm_read_state PRIVATE realman_transport)
+
+    add_executable(arm_preset_pose src/arm_preset_pose.cpp)
+    target_link_libraries(arm_preset_pose PRIVATE realman_transport)
+
+    add_executable(rm75_servoj_diagnostic src/arm_servoj_line_test.cpp)
+    target_link_libraries(rm75_servoj_diagnostic PRIVATE
+        realman_transport
+        rm75_motion
     )
 
-    add_executable(main_nomove
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/main_nomove.cpp
-        ${ROBOT_COMMON_SRCS}
+    # Sensor calibration utilities retained for future physical re-calibration.
+    add_executable(force_sensor_calibrate src/force_sensor_calibrate.cpp)
+    target_link_libraries(force_sensor_calibrate PRIVATE robot_sensor)
+
+    add_executable(force_sensor_calibration_capture
+        src/force_sensor_calibration_capture.cpp
+    )
+    target_link_libraries(force_sensor_calibration_capture PRIVATE
+        realman_transport
+        robot_sensor
     )
 endif()
 
-add_executable(arm_read_state
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_read_state.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-)
-
-add_executable(arm_preset_pose
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_preset_pose.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-)
-
+# Single migrated RM75 production controller. Keep the entry/orchestration
+# separate from Redis I/O while producing only one runtime executable.
 add_executable(main_rm75
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/arm_servoj_line_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_command.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/realman_kinematics.cpp
+    src/main_rm75.cpp
+    src/redis_bridge.cpp
 )
-
-# set c++11 and threading
-set_property(TARGET arm_read_state PROPERTY CXX_STANDARD 17)
-set_property(TARGET arm_preset_pose PROPERTY CXX_STANDARD 17)
-set_property(TARGET main_rm75 PROPERTY CXX_STANDARD 17)
-if(BUILD_LEGACY_MAIN_NOMOVE)
-    set_property(TARGET main_nomove PROPERTY CXX_STANDARD 17)
-endif()
-set(CMAKE_BUILD_TYPE "Release" CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG)
-
-if(BUILD_LEGACY_MAIN_NOMOVE)
-    target_link_libraries(main_nomove
-        ${HIREDIS_LIB}
-        ${OpenCV_LIBS}
-        # ${DEPENDENCIES}
-        # ${TORCH_LIBRARIES}
-        # /usr/lib
-        # /usr/local/lib
-    )
-endif()
+target_link_libraries(main_rm75 PRIVATE
+    realman_transport
+    rm75_motion
+    robot_sensor
+    Threads::Threads
+    ${HIREDIS_LIB}
+)

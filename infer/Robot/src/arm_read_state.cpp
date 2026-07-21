@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -123,7 +124,7 @@ void PrintPoseFriendly(const Eigen::Matrix<double, 6, 1>& pose) {
     PrintVector("rotation_deg", rotation_deg);
     std::cout << "current_as_target_position_cm: \""
               << FormatVector3(position_cm) << "\"\n";
-    std::cout << "copyable_absolute_position_dry_run: ./main_rm75 "
+    std::cout << "copyable_absolute_position_dry_run: ./rm75_servoj_diagnostic "
               << "--target-position-cm \"" << FormatVector3(position_cm)
               << "\"\n";
 }
@@ -144,15 +145,36 @@ int main(int argc, char** argv) {
 
     std::cout << "Connecting to Realman controller at "
               << command.rlm_ip << ":" << command.rlm_port << "\n";
-    command.ConnectTCPSocket();
+    const RMResult connect_result = command.TryConnectTCPSocket();
+    if (!connect_result) {
+        std::cerr << "Robot connection failed: "
+                  << connect_result.message << '\n';
+        return 3;
+    }
 
     for (int index = 0; index < options.repeat; ++index) {
-        Eigen::Matrix<double, 7, 1> joints;
-        Eigen::Matrix<double, 6, 1> pose;
+        Eigen::Matrix<double, 7, 1> joints =
+            Eigen::Matrix<double, 7, 1>::Constant(
+                std::numeric_limits<double>::quiet_NaN());
+        Eigen::Matrix<double, 6, 1> pose =
+            Eigen::Matrix<double, 6, 1>::Constant(
+                std::numeric_limits<double>::quiet_NaN());
         int arm_err = 0;
         int sys_err = 0;
 
-        command.ReadArmState(joints, pose, arm_err, sys_err);
+        const RMResult read_result = command.TryReadArmState(
+            joints, pose, arm_err, sys_err, 2000);
+        if (!read_result) {
+            std::cerr << "Robot state read failed at sample "
+                      << (index + 1) << ": " << read_result.message << '\n';
+            return 4;
+        }
+        if (arm_err != 0 || sys_err != 0) {
+            std::cerr << "Robot reported an error at sample " << (index + 1)
+                      << ": arm_err=" << arm_err
+                      << " sys_err=" << sys_err << '\n';
+            return 5;
+        }
 
         std::cout << "\nSample " << (index + 1) << "/" << options.repeat << "\n";
         std::cout << "arm_err: " << arm_err << "\n";

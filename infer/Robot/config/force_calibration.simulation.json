@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "sensor_id": "SIMULATION_ONLY_DO_NOT_USE_ON_HARDWARE",
+  "probe_model": "Lprobe-IFS.STL",
+  "probe_model_sha256": "03f751286e06e4e8f05ba05bc89d7d797c7defff7bcb8d9f8f43727ff9f7c82d",
+  "created_at": "2026-07-15T00:00:00Z",
+  "tool_chain_verified": false,
+  "quality": {
+    "residuals_verified": false,
+    "force_rms_n": 0.0,
+    "torque_rms_nm": 0.0,
+    "force_max_n": 0.0,
+    "torque_max_nm": 0.0,
+    "accepted_force_max_n": 0.5,
+    "accepted_torque_max_nm": 0.05
+  },
+  "units": {
+    "force": "N",
+    "torque": "N*m",
+    "length": "m"
+  },
+  "gravity_model": {
+    "gravity_base_n": [0.0, 0.0, -9.80665],
+    "force_bias_n": [0.0, 0.0, 0.0],
+    "torque_bias_nm": [0.0, 0.0, 0.0],
+    "center_of_mass_sensor_m": [0.0, 0.0, 0.05]
+  },
+  "sensor_to_tool": {
+    "rotation_row_major": [
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0
+    ],
+    "translation_sensor_to_tool_m": [0.0, 0.0, 0.0]
+  },
+  "probe_tcp_sensor_m": [0.0, 0.0, 0.188]
+}

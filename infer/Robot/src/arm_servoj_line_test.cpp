@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <ctime>
 #include <cstring>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -25,6 +27,13 @@ constexpr double kRadToDeg = 180.0 / M_PI;
 constexpr double kEulerSingularityEps = 1e-9;
 constexpr double kQuinticSmoothPeakVelocityScale = 1.875;
 constexpr double kControlFeedbackBlend = 0;
+constexpr double kAsyncJointSpeedScale = 0.5;
+constexpr std::chrono::milliseconds kMinimumAsyncServoSendGap{10};
+std::atomic<bool> g_stop_requested{false};
+
+void HandleSignal(int) {
+    g_stop_requested.store(true);
+}
 const Eigen::Matrix<double, 7, 1> kRm75JointMaxSpeedDegS =
     (Eigen::Matrix<double, 7, 1>() << 180.0, 180.0, 225.0, 225.0, 225.0, 225.0, 225.0).finished();
 
@@ -49,7 +58,7 @@ struct Options {
     double max_rotation_delta_deg = 180.0;
     double max_joint_step_deg = 1.0;
     bool use_official_joint_max_speed = true;
-    double max_joint_accel_deg_s2 = 0.0;
+    double max_joint_accel_deg_s2 = 90.0;
     double joint_limit_warning_deg = 10.0;
     double joint_limit_stop_deg = 3.0;
     double damping = 0.001;
@@ -74,13 +83,15 @@ std::string CurrentTimestampForFilename() {
 std::string DefaultTrajectoryLogPath() {
     const std::string timestamp = CurrentTimestampForFilename();
     const std::filesystem::path run_dir =
-        std::filesystem::current_path() / "logs" / ("main_rm75_" + timestamp);
+        std::filesystem::current_path() / "logs"
+        / ("rm75_servoj_diagnostic_" + timestamp);
     return (run_dir / "trajectory.csv").string();
 }
 
 void PrintUsage(const char* program) {
     std::cout
-        << "Usage: " << program << " [--delta-cm X,Y,Z]\n"
+        << "Usage: " << program << " [--ip A.B.C.D] [--port PORT]\n"
+        << "       [--delta-cm X,Y,Z]\n"
         << "       [--delta-rotation-deg RX,RY,RZ]\n"
         << "       [--target-position-cm X,Y,Z]\n"
         << "       [--target-rotation-deg RX,RY,RZ]\n"
@@ -102,8 +113,8 @@ void PrintUsage(const char* program) {
         << "The tool uses fixed-period streaming ServoJ only.\n"
         << "Default interpolation is linear, matching the stable ServoJ baseline.\n"
         << "Use --interpolation s-curve only for tuning.\n"
-        << "Joint step is limited by official RM75 max joint speeds unless --max-joint-step-deg is set.\n"
-        << "Joint acceleration is limited only when --max-joint-accel-deg-s2 is greater than 0.\n"
+        << "Joint step is capped at 50% of official RM75 max speed; --max-joint-step-deg may lower it.\n"
+        << "Joint acceleration defaults to a conservative 90 deg/s^2 envelope.\n"
         << "Duration is estimated automatically from joint and TCP speed limits.\n"
         << "During --execute, trajectory CSV/SVG are saved automatically under ./logs.\n"
         << "Use --trajectory-log during --execute to choose a custom CSV path.\n"
@@ -115,7 +126,7 @@ bool ParseInt(const char* text, int& value) {
     try {
         size_t parsed = 0;
         int parsed_value = std::stoi(text, &parsed, 10);
-        if (parsed != std::strlen(text)) return false;
+        if (parsed != std::strlen(text) || !std::isfinite(parsed_value)) return false;
         value = parsed_value;
         return true;
     } catch (...) {
@@ -127,7 +138,7 @@ bool ParseDouble(const char* text, double& value) {
     try {
         size_t parsed = 0;
         double parsed_value = std::stod(text, &parsed);
-        if (parsed != std::strlen(text)) return false;
+        if (parsed != std::strlen(text) || !std::isfinite(parsed_value)) return false;
         value = parsed_value;
         return true;
     } catch (...) {
@@ -289,6 +300,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         std::cerr << "period-ms must be in 20..200\n";
         return false;
     }
+    if (options.execute && options.period_ms != 20) {
+        std::cerr << "--execute requires period-ms=20\n";
+        return false;
+    }
     if (options.feedback_every < 0 || options.feedback_every > 100) {
         std::cerr << "feedback-every must be in 0..100\n";
         return false;
@@ -320,8 +335,12 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    if (options.max_joint_accel_deg_s2 < 0.0 || options.max_joint_accel_deg_s2 > 5000.0) {
-        std::cerr << "max-joint-accel-deg-s2 must be in 0..5000; 0 disables it\n";
+    if (options.max_joint_accel_deg_s2 < 0.0 || options.max_joint_accel_deg_s2 > 90.0) {
+        std::cerr << "max-joint-accel-deg-s2 must be in 0..90; 0 is dry-run only\n";
+        return false;
+    }
+    if (options.execute && options.max_joint_accel_deg_s2 <= 0.0) {
+        std::cerr << "--execute requires a positive joint acceleration limit\n";
         return false;
     }
     if (options.joint_limit_warning_deg < 0.0 || options.joint_limit_warning_deg > 60.0) {
@@ -432,7 +451,9 @@ Eigen::Matrix<double, 7, 1> LimitJointAcceleration(
 
     const double period_s = static_cast<double>(options.period_ms) / 1000.0;
     const double max_delta_delta =
-        options.max_joint_accel_deg_s2 * kDegToRad * period_s * period_s;
+        options.max_joint_accel_deg_s2
+        * kAsyncJointSpeedScale * kAsyncJointSpeedScale
+        * kDegToRad * period_s * period_s;
     Eigen::Matrix<double, 7, 1> limited_delta = requested_delta;
 
     for (int joint = 0; joint < 7; ++joint) {
@@ -581,12 +602,16 @@ bool PlanPoseStep(RMKinematics& kinematics,
             + options.damping * Eigen::Matrix<double, 6, 6>::Identity()).inverse());
     Eigen::Matrix<double, 7, 1> joint_delta = damped_inverse * error;
 
+    const double period_s = static_cast<double>(options.period_ms) / 1000.0;
+    const Eigen::Matrix<double, 7, 1> safe_official_step_rad =
+        kAsyncJointSpeedScale
+        * kRm75JointMaxSpeedDegS * period_s * kDegToRad;
     Eigen::Matrix<double, 7, 1> max_step_rad;
     if (options.use_official_joint_max_speed) {
-        const double period_s = static_cast<double>(options.period_ms) / 1000.0;
-        max_step_rad = kRm75JointMaxSpeedDegS * period_s * kDegToRad;
+        max_step_rad = safe_official_step_rad;
     } else {
         max_step_rad.setConstant(options.max_joint_step_deg * kDegToRad);
+        max_step_rad = max_step_rad.cwiseMin(safe_official_step_rad);
     }
 
     double scale = 1.0;
@@ -758,7 +783,7 @@ bool ParseCsvDouble(const std::string& text, double& value) {
     try {
         size_t parsed = 0;
         const double parsed_value = std::stod(text, &parsed);
-        if (parsed != text.size()) return false;
+        if (parsed != text.size() || !std::isfinite(parsed_value)) return false;
         value = parsed_value;
         return true;
     } catch (...) {
@@ -1389,6 +1414,8 @@ int main(int argc, char** argv) {
         PrintUsage(argv[0]);
         return 2;
     }
+    std::signal(SIGINT, HandleSignal);
+    std::signal(SIGTERM, HandleSignal);
     if (options.execute && options.trajectory_log_path.empty()) {
         options.trajectory_log_path = DefaultTrajectoryLogPath();
     }
@@ -1398,13 +1425,35 @@ int main(int argc, char** argv) {
     command.rlm_port = options.port;
     std::strncpy(command.rlm_ip, options.ip.c_str(), sizeof(command.rlm_ip) - 1);
     command.rlm_ip[sizeof(command.rlm_ip) - 1] = '\0';
-    command.ConnectTCPSocket();
+    const RMResult connect_result = command.TryConnectTCPSocket();
+    if (!connect_result) {
+        std::cerr << "Failed to connect to the robot: "
+                  << connect_result.message << "\n";
+        return 3;
+    }
+    if (options.execute) {
+        const RMResult startup_stop = command.TryStopMotion(1000);
+        if (!startup_stop) {
+            std::cerr << "Failed to stop inherited motion before state read: "
+                      << startup_stop.message << "\n";
+            return 6;
+        }
+    }
 
     Eigen::Matrix<double, 7, 1> current_joints;
     Eigen::Matrix<double, 6, 1> current_pose;
     int arm_err = 0;
     int sys_err = 0;
-    command.ReadArmState(current_joints, current_pose, arm_err, sys_err);
+    const RMResult initial_state_result =
+        command.TryReadArmState(current_joints,
+                                current_pose,
+                                arm_err,
+                                sys_err);
+    if (!initial_state_result) {
+        std::cerr << "Failed to read the initial robot state: "
+                  << initial_state_result.message << "\n";
+        return 3;
+    }
     if (arm_err != 0 || sys_err != 0) {
         std::cerr << "Robot reports an error. Refusing to plan motion.\n";
         return 3;
@@ -1496,11 +1545,14 @@ int main(int argc, char** argv) {
                   << kQuinticSmoothPeakVelocityScale << "\n";
     }
     std::cout << "period_ms: " << options.period_ms << "\n";
+    std::cout << "async_joint_speed_scale: " << kAsyncJointSpeedScale << "\n";
+    std::cout << "minimum_servoj_send_gap_ms: "
+              << kMinimumAsyncServoSendGap.count() << "\n";
     if (options.use_official_joint_max_speed) {
-        std::cout << "joint_speed_limit: official_rm75_max\n";
-        std::cout << "joint_max_speed_deg_s: [180, 180, 225, 225, 225, 225, 225]\n";
+        std::cout << "joint_speed_limit: scaled_official_rm75_max\n";
+        std::cout << "joint_max_speed_deg_s: [90, 90, 112.5, 112.5, 112.5, 112.5, 112.5]\n";
     } else {
-        std::cout << "joint_speed_limit: manual_step\n";
+        std::cout << "joint_speed_limit: manual_step_capped_by_scaled_official_max\n";
         std::cout << "max_joint_step_deg: " << options.max_joint_step_deg << "\n";
     }
     if (options.max_joint_accel_deg_s2 > 0.0) {
@@ -1535,6 +1587,50 @@ int main(int argc, char** argv) {
     if (!trajectory_logger.Open(options.trajectory_log_path)) {
         return 2;
     }
+
+    // One background owner receives every JSON response on this same TCP
+    // connection. The 20 ms control path below only sends ServoJ and reads a
+    // latest snapshot; it never performs a blocking ReadArmState call.
+    const int state_poll_ms =
+        options.feedback_every > 0
+            ? std::max(40, options.feedback_every * options.period_ms)
+            : 100;
+    const int state_stale_ms = std::max(250, state_poll_ms * 4);
+    RMStateReader state_reader(command,
+                               std::chrono::milliseconds(state_poll_ms),
+                               std::chrono::milliseconds(state_stale_ms));
+    const RMResult state_reader_result = state_reader.Start();
+    if (!state_reader_result) {
+        std::cerr << "Failed to start the asynchronous robot state reader: "
+                  << state_reader_result.message << "\n";
+        return 6;
+    }
+    const std::uint64_t initial_reader_sequence =
+        state_reader.Latest().sequence;
+    RobotStateSnapshot primed_state;
+    if (!state_reader.WaitForUpdate(initial_reader_sequence,
+                                    std::chrono::milliseconds(1500),
+                                    primed_state)
+        || !primed_state.valid || primed_state.stale) {
+        const RMResult reader_error = state_reader.LastResult();
+        std::cerr << "Asynchronous robot feedback did not become ready before motion";
+        if (!reader_error) std::cerr << ": " << reader_error.message;
+        std::cerr << "\n";
+        return 6;
+    }
+    if (primed_state.arm_err != 0 || primed_state.sys_err != 0) {
+        std::cerr << "Asynchronous robot feedback reports an error before motion.\n";
+        return 6;
+    }
+    std::uint64_t last_feedback_sequence = primed_state.sequence;
+    auto stop_motion = [&]() {
+        const RMResult stop_result = command.TryStopMotion(1000);
+        if (!stop_result) {
+            std::cerr << "StopMotion was not confirmed: "
+                      << stop_result.message << "\n";
+        }
+        return stop_result;
+    };
     if (trajectory_logger.Enabled()) {
         trajectory_logger.Record("start",
                                  0,
@@ -1578,6 +1674,7 @@ int main(int argc, char** argv) {
                                int t_ms,
                                double phase,
                                const Eigen::Matrix<double, 6, 1>& desired_pose) -> int {
+        if (g_stop_requested.load()) return 130;
         const bool is_hold = std::strcmp(stage, "hold") == 0;
         const char* target_label = is_hold ? "final_hold_target" : "planned_target";
 
@@ -1617,7 +1714,63 @@ int main(int argc, char** argv) {
             return 5;
         }
 
-        command.ServoJ(target_joints, options.follow);
+        // Reject stale or faulted feedback before sending the next target.
+        // Holding uses the previous model target, which is the last target
+        // accepted by the control loop.
+        const RobotStateSnapshot latest_state = state_reader.Latest();
+        const RMResult reader_health = state_reader.LastResult();
+        const ServoSendSnapshot servo_status = command.ServoStatus();
+        if (!reader_health) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " asynchronous I/O fault: "
+                      << reader_health.message << "\n";
+            return 6;
+        }
+        if (servo_status.result_sequence != 0 && !servo_status.result) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " asynchronous ServoJ failure: "
+                      << servo_status.result.message << "\n";
+            return 6;
+        }
+        if (servo_status.submitted_sequence
+            > std::max(servo_status.sent_sequence,
+                       servo_status.discarded_sequence)) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " previous target is still pending or in flight; "
+                         "refusing to queue fixed-period targets.\n";
+            return 6;
+        }
+        const auto servo_check_time = std::chrono::steady_clock::now();
+        if (servo_status.sent_sequence != 0
+            && servo_status.sent_at
+                   != std::chrono::steady_clock::time_point{}
+            && servo_check_time - servo_status.sent_at
+                   < kMinimumAsyncServoSendGap) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " previous socket write was less than "
+                      << kMinimumAsyncServoSendGap.count()
+                      << " ms ago; refusing unsafe dispatch cadence.\n";
+            return 6;
+        }
+        if (latest_state.stale) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " feedback is stale; holding the last safe target.\n";
+            return 6;
+        }
+        if (latest_state.arm_err != 0 || latest_state.sys_err != 0) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " feedback reports robot error state.\n";
+            return 6;
+        }
+
+        if (g_stop_requested.load()) return 130;
+        const RMResult servo_result =
+            command.TryServoJ(target_joints, options.follow);
+        if (!servo_result) {
+            std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
+                      << " send failed: " << servo_result.message << "\n";
+            return 6;
+        }
         model_joints = target_joints;
         previous_joint_delta = limited_joint_delta;
         model_pose = ControllerPoseFromJoints(kinematics, model_joints);
@@ -1625,27 +1778,32 @@ int main(int argc, char** argv) {
         bool actual_valid_for_log = false;
         Eigen::Matrix<double, 6, 1> actual_pose_for_log = current_pose;
         if (options.feedback_every > 0 && cycle % options.feedback_every == 0) {
-            command.ReadArmState(current_joints, current_pose, arm_err, sys_err);
-            if (arm_err != 0 || sys_err != 0) {
-                std::cerr << (is_hold ? "ServoJ final hold" : "ServoJ line")
-                          << " feedback reports robot error state.\n";
-                return 6;
+            if (latest_state.valid
+                && latest_state.sequence > last_feedback_sequence) {
+                current_joints = latest_state.joints;
+                current_pose = latest_state.pose;
+                arm_err = latest_state.arm_err;
+                sys_err = latest_state.sys_err;
+                last_feedback_sequence = latest_state.sequence;
+                actual_valid_for_log = true;
+                actual_pose_for_log = current_pose;
             }
             model_joints = (1.0 - kControlFeedbackBlend) * model_joints
                          + kControlFeedbackBlend * current_joints;
             model_pose = (1.0 - kControlFeedbackBlend) * model_pose
                        + kControlFeedbackBlend * current_pose;
-            actual_valid_for_log = true;
-            actual_pose_for_log = current_pose;
 
-            const double lateral_cm = LateralErrorCm(start_pose.head<3>(),
-                                                     target_pose.head<3>(),
-                                                     current_pose.head<3>());
-            max_lateral_error_cm = std::max(max_lateral_error_cm, lateral_cm);
-            if (!options.summary_only && cycle % (options.feedback_every * 5) == 0) {
-                std::cout << (is_hold ? "final_hold_cycle: " : "cycle: ")
-                          << cycle << "/" << total_cycles
-                          << " lateral_error_cm=" << lateral_cm << "\n";
+            if (actual_valid_for_log) {
+                const double lateral_cm = LateralErrorCm(start_pose.head<3>(),
+                                                         target_pose.head<3>(),
+                                                         current_pose.head<3>());
+                max_lateral_error_cm = std::max(max_lateral_error_cm, lateral_cm);
+                if (!options.summary_only
+                    && cycle % (options.feedback_every * 5) == 0) {
+                    std::cout << (is_hold ? "final_hold_cycle: " : "cycle: ")
+                              << cycle << "/" << total_cycles
+                              << " lateral_error_cm=" << lateral_cm << "\n";
+                }
             }
         }
 
@@ -1679,6 +1837,7 @@ int main(int argc, char** argv) {
                                            phase,
                                            desired_pose);
         if (result != 0) {
+            (void)stop_motion();
             return result;
         }
     }
@@ -1691,11 +1850,30 @@ int main(int argc, char** argv) {
                                            1.0,
                                            target_pose);
         if (result != 0) {
+            (void)stop_motion();
             return result;
         }
     }
 
-    command.ReadArmState(current_joints, current_pose, arm_err, sys_err);
+    if (!stop_motion()) {
+        return 6;
+    }
+
+    RobotStateSnapshot final_state;
+    state_reader.WaitForUpdate(last_feedback_sequence,
+                               std::chrono::milliseconds(
+                                   std::max(500, state_poll_ms * 3)),
+                               final_state);
+    if (!final_state.valid) final_state = state_reader.Latest();
+    state_reader.Stop();
+    if (!final_state.valid || final_state.stale) {
+        std::cerr << "ServoJ line finished without fresh robot feedback.\n";
+        return 6;
+    }
+    current_joints = final_state.joints;
+    current_pose = final_state.pose;
+    arm_err = final_state.arm_err;
+    sys_err = final_state.sys_err;
     if (arm_err != 0 || sys_err != 0) {
         std::cerr << "ServoJ line finished with robot error state.\n";
         return 6;

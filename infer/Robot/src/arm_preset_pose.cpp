@@ -44,6 +44,54 @@ const std::vector<Preset>& Presets() {
                                                 -28.429, -7.429, 1.023).finished(),
             "Pose observed after successful RM75 10-degree joint-space tests."
         },
+        {
+            "calib_v4_1",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                 15.000, -5.000, 1.023).finished(),
+            "Force calibration v4 pose 1/8; moderate wrist range."
+        },
+        {
+            "calib_v4_2",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                 15.000, 25.000, 1.023).finished(),
+            "Force calibration v4 pose 2/8; moderate wrist range."
+        },
+        {
+            "calib_v4_3",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                  0.000, 40.000, 1.023).finished(),
+            "Force calibration v4 pose 3/8; moderate wrist range."
+        },
+        {
+            "calib_v4_4",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                -25.000, 40.000, 1.023).finished(),
+            "Force calibration v4 pose 4/8; moderate wrist range."
+        },
+        {
+            "calib_v4_5",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                -45.000, 25.000, 1.023).finished(),
+            "Force calibration v4 pose 5/8; replaces the cable-sensitive v3 extreme."
+        },
+        {
+            "calib_v4_6",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                -45.000, -5.000, 1.023).finished(),
+            "Force calibration v4 pose 6/8; moderate wrist range."
+        },
+        {
+            "calib_v4_7",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                -35.000, -35.000, 1.023).finished(),
+            "Force calibration v4 pose 7/8; moderate wrist range."
+        },
+        {
+            "calib_v4_8",
+            (Eigen::Matrix<double, 7, 1>() << 27.215, 17.843, 82.979, 110.588,
+                                                 -5.000, -35.000, 31.023).finished(),
+            "Force calibration v4 pose 8/8; replaces the cable-sensitive v3 extreme."
+        },
     };
     return presets;
 }
@@ -67,7 +115,7 @@ bool ParseInt(const char* text, int& value) {
     try {
         size_t parsed = 0;
         int parsed_value = std::stoi(text, &parsed, 10);
-        if (parsed != std::strlen(text)) return false;
+        if (parsed != std::strlen(text) || !std::isfinite(parsed_value)) return false;
         value = parsed_value;
         return true;
     } catch (...) {
@@ -79,7 +127,7 @@ bool ParseDouble(const char* text, double& value) {
     try {
         size_t parsed = 0;
         double parsed_value = std::stod(text, &parsed);
-        if (parsed != std::strlen(text)) return false;
+        if (parsed != std::strlen(text) || !std::isfinite(parsed_value)) return false;
         value = parsed_value;
         return true;
     } catch (...) {
@@ -103,7 +151,7 @@ bool ParseJointDegList(const std::string& text, Eigen::Matrix<double, 7, 1>& joi
         try {
             size_t parsed = 0;
             double value = std::stod(item, &parsed);
-            if (parsed != item.size()) return false;
+            if (parsed != item.size() || !std::isfinite(value)) return false;
             values.push_back(value);
         } catch (...) {
             return false;
@@ -292,6 +340,25 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Reject malformed or unknown targets before opening the robot socket.
+    // In particular, an invalid --execute request must not have any observable
+    // effect on a controller that happens to be reachable.
+    if (!options.target_deg_text.empty()) {
+        Eigen::Matrix<double, 7, 1> validated_target_deg;
+        if (!ParseJointDegList(options.target_deg_text,
+                               validated_target_deg)) {
+            std::cerr << "Invalid --target-deg. Expected 7 finite, "
+                         "comma-separated degree values.\n";
+            return 2;
+        }
+    }
+    if (!options.preset.empty() && options.preset != "home_current"
+        && FindPreset(options.preset) == nullptr) {
+        std::cerr << "Unknown preset: " << options.preset << "\n";
+        PrintPresets();
+        return 2;
+    }
+
     RMCommand command;
     command.rlm_port = options.port;
     std::strncpy(command.rlm_ip, options.ip.c_str(), sizeof(command.rlm_ip) - 1);
@@ -299,13 +366,34 @@ int main(int argc, char** argv) {
 
     std::cout << "Connecting to Realman controller at "
               << command.rlm_ip << ":" << command.rlm_port << "\n";
-    command.ConnectTCPSocket();
+    const RMResult connect_result = command.TryConnectTCPSocket();
+    if (!connect_result) {
+        std::cerr << "Failed to connect to the Realman controller: "
+                  << connect_result.message << "\n";
+        return 3;
+    }
+    if (options.execute) {
+        const RMResult startup_stop = command.TryStopMotion(1000);
+        if (!startup_stop) {
+            std::cerr << "Failed to stop inherited motion before planning: "
+                      << startup_stop.message << "\n";
+            return 3;
+        }
+    }
 
-    Eigen::Matrix<double, 7, 1> current_joints;
-    Eigen::Matrix<double, 6, 1> current_pose;
+    Eigen::Matrix<double, 7, 1> current_joints =
+        Eigen::Matrix<double, 7, 1>::Zero();
+    Eigen::Matrix<double, 6, 1> current_pose =
+        Eigen::Matrix<double, 6, 1>::Zero();
     int arm_err = 0;
     int sys_err = 0;
-    command.ReadArmState(current_joints, current_pose, arm_err, sys_err);
+    const RMResult initial_state_result = command.TryReadArmState(
+        current_joints, current_pose, arm_err, sys_err);
+    if (!initial_state_result) {
+        std::cerr << "Failed to read the initial robot state: "
+                  << initial_state_result.message << "\n";
+        return 3;
+    }
 
     std::cout << "arm_err: " << arm_err << "\n";
     std::cout << "sys_err: " << sys_err << "\n";
@@ -398,12 +486,27 @@ int main(int argc, char** argv) {
         std::cout << "\nStep " << step << "/" << step_count << "\n";
         PrintTargetDeg(waypoint_deg);
         Eigen::Matrix<double, 7, 1> waypoint_rad = DegToRad(waypoint_deg);
-        command.MoveJ(waypoint_rad, options.velocity);
+        const RMResult move_result = command.TryMoveJ(
+            waypoint_rad, options.velocity);
+        if (!move_result) {
+            std::cerr << "MoveJ step " << step << " failed: "
+                      << move_result.message << "\n";
+            (void)command.TryStopMotion(1000);
+            return 5;
+        }
     }
 
-    Eigen::Matrix<double, 7, 1> final_joints;
-    Eigen::Matrix<double, 6, 1> final_pose;
-    command.ReadArmState(final_joints, final_pose, arm_err, sys_err);
+    Eigen::Matrix<double, 7, 1> final_joints =
+        Eigen::Matrix<double, 7, 1>::Zero();
+    Eigen::Matrix<double, 6, 1> final_pose =
+        Eigen::Matrix<double, 6, 1>::Zero();
+    const RMResult final_state_result = command.TryReadArmState(
+        final_joints, final_pose, arm_err, sys_err);
+    if (!final_state_result) {
+        std::cerr << "Failed to read the final robot state: "
+                  << final_state_result.message << "\n";
+        return 5;
+    }
     std::cout << "\nFinal state\n";
     std::cout << "arm_err: " << arm_err << "\n";
     std::cout << "sys_err: " << sys_err << "\n";
