@@ -35,12 +35,15 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.legacy_contact_roll_max_velocity_rad_s,
         config.approach_speed_m_s,
         config.approach_direction_tool_z,
+        config.max_force_axis_speed_m_s,
         config.max_linear_speed_m_s,
         config.max_angular_speed_rad_s,
         config.model_y_gain,
         config.model_rz_gain,
         config.contact_pitch_gain_rad_per_m,
         config.scan_start_force_n,
+        config.scan_force_tolerance_n,
+        config.scan_force_stable_duration_s,
         config.scan_speed_m_s,
         config.maximum_scan_distance_m,
         config.scan_alignment_tolerance_m,
@@ -48,7 +51,17 @@ bool ValidConfig(const Rm75ControlConfig& config) {
     for (double value : values) {
         if (!std::isfinite(value)) return false;
     }
-    if (!config.probe_tcp_tool_m.array().isFinite().all()) return false;
+    if (!config.rotation_pose_from_tool.array().isFinite().all()
+        || !config.probe_tcp_tool_m.array().isFinite().all()) return false;
+    const Eigen::Matrix3d rotation_identity_error =
+        config.rotation_pose_from_tool.transpose()
+            * config.rotation_pose_from_tool
+        - Eigen::Matrix3d::Identity();
+    if (rotation_identity_error.norm() > 1e-6
+        || std::abs(config.rotation_pose_from_tool.determinant() - 1.0)
+               > 1e-6) {
+        return false;
+    }
     return config.cycle_s > 0.0
         && config.desired_force_n < 0.0
         && std::abs(config.desired_force_n) <= config.force_limit_z_n
@@ -80,10 +93,13 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.legacy_contact_roll_max_velocity_rad_s > 0.0
         && config.approach_speed_m_s >= 0.0
         && std::abs(config.approach_direction_tool_z) <= 1.0
+        && config.max_force_axis_speed_m_s > 0.0
         && config.max_linear_speed_m_s > 0.0
         && config.max_angular_speed_rad_s > 0.0
         && config.scan_start_force_n >= config.contact_threshold_n
         && config.scan_start_force_n <= config.force_limit_z_n
+        && config.scan_force_tolerance_n > 0.0
+        && config.scan_force_stable_duration_s > 0.0
         && config.scan_speed_m_s >= 0.0
         && config.maximum_scan_distance_m >= 0.0
         && config.scan_alignment_tolerance_m >= 0.0
@@ -145,6 +161,8 @@ void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     force_axis_velocity_m_s_ = 0.0;
     contact_roll_velocity_rad_s_ = 0.0;
     scan_distance_m_ = 0.0;
+    scan_force_stable_time_s_ = 0.0;
+    scan_latched_ = false;
     active_scan_phase_ = -1;
     remaining_model_y_m_ = 0.0;
     remaining_model_rz_rad_ = 0.0;
@@ -305,18 +323,18 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
             config_.model_rz_gain * intent.model_rz_deg * M_PI / 180.0;
     }
     double delta_z = 0.0;
+    const double requested_force = std::isfinite(intent.desired_force_n)
+        ? intent.desired_force_n
+        : config_.desired_force_n;
     if (in_contact) {
-        const double requested_force = std::isfinite(intent.desired_force_n)
-            ? intent.desired_force_n
-            : config_.desired_force_n;
         const double acceleration =
             (force.z() - requested_force
              - config_.force_virtual_damping * force_axis_velocity_m_s_)
             / config_.force_virtual_mass;
         force_axis_velocity_m_s_ = Clamp(
             force_axis_velocity_m_s_ + acceleration * dt,
-            -config_.max_linear_speed_m_s,
-            config_.max_linear_speed_m_s);
+            -config_.max_force_axis_speed_m_s,
+            config_.max_force_axis_speed_m_s);
         delta_z = force_axis_velocity_m_s_ * dt;
     } else {
         force_axis_velocity_m_s_ = 0.0;
@@ -326,25 +344,48 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
 
     double delta_x = 0.0;
     const bool scan_phase = intent.phase_index == 0 || intent.phase_index == 2;
-    if (scan_phase && in_contact
-        && std::abs(force.z()) >= config_.scan_start_force_n
-        && std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m) {
+    if (!scan_phase) {
+        scan_distance_m_ = 0.0;
+        scan_force_stable_time_s_ = 0.0;
+        scan_latched_ = false;
+        active_scan_phase_ = -1;
+    } else {
         if (active_scan_phase_ != intent.phase_index) {
             active_scan_phase_ = intent.phase_index;
             scan_distance_m_ = 0.0;
+            scan_force_stable_time_s_ = 0.0;
+            scan_latched_ = false;
         }
-        double scan_step = config_.scan_speed_m_s * dt;
-        if (config_.maximum_scan_distance_m > 0.0) {
-            const double remaining = std::max(
-                0.0, config_.maximum_scan_distance_m - scan_distance_m_);
-            constexpr double kScanCompletionToleranceM = 1e-12;
-            scan_step = remaining > kScanCompletionToleranceM
-                ? std::min(scan_step, remaining) : 0.0;
+
+        const bool scan_alignment_ready =
+            std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m;
+        const bool scan_force_in_band = in_contact
+            && std::abs(force.z()) >= config_.scan_start_force_n
+            && std::abs(force.z() - requested_force)
+                   <= config_.scan_force_tolerance_n;
+        if (!scan_latched_) {
+            scan_force_stable_time_s_ = scan_alignment_ready
+                    && scan_force_in_band
+                ? scan_force_stable_time_s_ + dt : 0.0;
+            if (scan_force_stable_time_s_ + 1e-12
+                >= config_.scan_force_stable_duration_s) {
+                scan_latched_ = true;
+            }
         }
-        delta_x = config_.scan_direction_tool_x * scan_step;
-    } else if (!scan_phase) {
-        scan_distance_m_ = 0.0;
-        active_scan_phase_ = -1;
+
+        // Once the force-settle gate has opened, keep scanning through small
+        // force fluctuations instead of alternating between X+Z and Z-only.
+        if (scan_latched_ && in_contact && scan_alignment_ready) {
+            double scan_step = config_.scan_speed_m_s * dt;
+            if (config_.maximum_scan_distance_m > 0.0) {
+                const double remaining = std::max(
+                    0.0, config_.maximum_scan_distance_m - scan_distance_m_);
+                constexpr double kScanCompletionToleranceM = 1e-12;
+                scan_step = remaining > kScanCompletionToleranceM
+                    ? std::min(scan_step, remaining) : 0.0;
+            }
+            delta_x = config_.scan_direction_tool_x * scan_step;
+        }
     }
 
     const double model_y_step = Clamp(remaining_model_y_m_,
@@ -353,7 +394,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     Eigen::Vector3d translation_delta;
     translation_delta << delta_x,
         model_y_step,
-        Clamp(delta_z, -max_linear_step, max_linear_step);
+        delta_z;
     if (translation_delta.norm() > max_linear_step) {
         translation_delta *= max_linear_step / translation_delta.norm();
     }
@@ -363,8 +404,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         force_axis_velocity_m_s_ = translation_delta.z() / dt;
     }
     remaining_model_y_m_ -= translation_delta.y();
-    if (scan_phase && in_contact
-        && std::abs(force.z()) >= config_.scan_start_force_n
+    if (scan_latched_ && in_contact
         && std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m) {
         scan_distance_m_ += std::abs(translation_delta.x());
     }
@@ -423,31 +463,36 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         translation_delta.y(), translation_delta.z(),
         delta_roll, delta_pitch, delta_rz;
 
-    // All control deltas are expressed in the current tool frame. Compose the
-    // rigid transform and keep the calibrated probe TCP fixed during pure
-    // orientation corrections. Directly adding these values to base XYZ and
-    // Euler angles would move along the wrong axis whenever the tool is tilted.
-    const Eigen::Matrix3d rotation_base_from_tool =
+    // The controller pose is Base -> Arm_Tip, while all control deltas are
+    // expressed in the physical Tool/Sensor frame. Keep the fixed mount
+    // rotation explicit so -Tool-X does not accidentally mean -ArmTip-X.
+    const Eigen::Matrix3d rotation_base_from_pose =
         RotationFromEuler(input.current_pose.tail<3>());
-    const Eigen::Matrix3d incremental_rotation =
+    const Eigen::Matrix3d rotation_base_from_tool =
+        rotation_base_from_pose * config_.rotation_pose_from_tool;
+    const Eigen::Matrix3d incremental_rotation_tool =
         (Eigen::AngleAxisd(delta_rz, Eigen::Vector3d::UnitZ())
          * Eigen::AngleAxisd(delta_pitch, Eigen::Vector3d::UnitY())
          * Eigen::AngleAxisd(delta_roll, Eigen::Vector3d::UnitX()))
             .toRotationMatrix();
-    const Eigen::Matrix3d desired_rotation =
-        rotation_base_from_tool * incremental_rotation;
+    const Eigen::Matrix3d desired_rotation_base_from_tool =
+        rotation_base_from_tool * incremental_rotation_tool;
+    const Eigen::Matrix3d desired_rotation_base_from_pose =
+        desired_rotation_base_from_tool
+        * config_.rotation_pose_from_tool.transpose();
     const Eigen::Vector3d current_probe_tcp_base =
         input.current_pose.head<3>()
         + rotation_base_from_tool * config_.probe_tcp_tool_m;
     const Eigen::Vector3d desired_probe_tcp_base =
         current_probe_tcp_base + rotation_base_from_tool * translation_delta;
     output.desired_pose.head<3>() = desired_probe_tcp_base
-        - desired_rotation * config_.probe_tcp_tool_m;
-    output.desired_pose.tail<3>() = EulerFromRotation(desired_rotation);
+        - desired_rotation_base_from_tool * config_.probe_tcp_tool_m;
+    output.desired_pose.tail<3>() =
+        EulerFromRotation(desired_rotation_base_from_pose);
     output.command_motion = output.requested_delta.cwiseAbs().maxCoeff() > 0.0;
     output.state = in_contact
-        ? (intent.phase_index >= 0 ? Rm75SupervisorState::kScan
-                                   : Rm75SupervisorState::kContact)
+        ? (scan_latched_ ? Rm75SupervisorState::kScan
+                         : Rm75SupervisorState::kContact)
         : Rm75SupervisorState::kApproach;
     return output;
 }

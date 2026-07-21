@@ -35,7 +35,7 @@ namespace {
 std::atomic<bool> g_stop_requested{false};
 constexpr std::chrono::milliseconds kMinimumAsyncServoSendGap{10};
 constexpr const char* kImplicitProfileName =
-    "rm75_v6_force_scan_x_continuous_3n_tcp188";
+    "rm75_v6_armtip_tool30_force_settle_scan_x_continuous_3n_tcp188";
 constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
 // RM75 pose feedback is quantized at roughly 0.001 rad. At the legacy
 // 188 mm probe TCP this can appear as about 0.19 mm of endpoint motion even
@@ -100,9 +100,12 @@ struct Options {
     double raw_torque_limit_nm = 5.0;
     double approach_speed_cm_s = 0.0;
     double approach_direction_tool_z = 0.0;
+    double maximum_force_axis_speed_cm_s = 0.5;
     double maximum_linear_speed_cm_s = 0.5;
     double maximum_approach_distance_mm = 5.0;
     double scan_start_force_n = 2.0;
+    double scan_force_tolerance_n = 0.3;
+    double scan_force_stable_duration_s = 0.5;
     double scan_speed_cm_s = 0.1;
     double scan_distance_mm = 5.0;
     double scan_direction_tool_x = -1.0;
@@ -196,6 +199,8 @@ struct RuntimeLogRow {
         Eigen::Matrix<double, 6, 1>::Zero();
     Eigen::Matrix<double, 6, 1> desired_pose =
         Eigen::Matrix<double, 6, 1>::Zero();
+    double reference_model_position_error_mm = 0.0;
+    double reference_model_orientation_error_deg = 0.0;
     Eigen::Matrix<double, 7, 1> target_joints =
         Eigen::Matrix<double, 7, 1>::Zero();
     std::string fault;
@@ -260,6 +265,8 @@ public:
                    "requested_drx_tool_rad,requested_dry_tool_rad,"
                    "requested_drz_tool_rad,"
                    "desired_x_m,desired_y_m,desired_z_m,desired_rx_rad,desired_ry_rad,desired_rz_rad,"
+                   "reference_model_position_error_mm,"
+                   "reference_model_orientation_error_deg,"
                    "j1_rad,j2_rad,j3_rad,j4_rad,j5_rad,j6_rad,j7_rad,fault\n";
         queue_.resize(kMaximumRows);
         queue_head_ = 0;
@@ -403,6 +410,8 @@ private:
                     << ',' << row.filtered_contact_point.z();
             for (int i = 0; i < 6; ++i) stream_ << ',' << row.requested_delta[i];
             for (int i = 0; i < 6; ++i) stream_ << ',' << row.desired_pose[i];
+            stream_ << ',' << row.reference_model_position_error_mm
+                    << ',' << row.reference_model_orientation_error_deg;
             for (int i = 0; i < 7; ++i) stream_ << ',' << row.target_joints[i];
             std::string escaped_fault = row.fault;
             std::replace(escaped_fault.begin(), escaped_fault.end(), ',', ';');
@@ -479,14 +488,17 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.raw_torque_limit_nm = 5.0;
     options.approach_speed_cm_s = 0.05;
     options.approach_direction_tool_z = 1.0;
+    options.maximum_force_axis_speed_cm_s = 0.05;
     // XYZ translation shares this combined speed envelope. During contact,
     // simultaneous Tool-X scan and Tool-Z admittance divide the same limit.
     options.maximum_linear_speed_cm_s = 0.2;
     options.maximum_approach_distance_mm = 250.0;
-    // Phase 0 reproduces the old forward scan: once |Fz| reaches 2 N,
-    // maintain -3 N admittance while moving continuously along -Tool X.
+    // Phase 0 uses 2 N as a coarse contact floor, then requires the signed
+    // force to remain near -3 N before continuously scanning along -Tool X.
     options.manual_phase = 0;
     options.scan_start_force_n = 2.0;
+    options.scan_force_tolerance_n = 0.3;
+    options.scan_force_stable_duration_s = 0.5;
     options.scan_speed_cm_s = 0.2;
     options.scan_distance_mm = 0.0;
     options.scan_direction_tool_x = -1.0;
@@ -511,7 +523,7 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.enable_force_retract = false;
     options.runtime_log_path =
         (executable_directory / "logs"
-         / ("rm75_v6_force_scan_x_continuous_3n_tcp188_"
+         / ("rm75_v6_armtip_tool30_force_settle_scan_x_continuous_3n_tcp188_"
             + TimestampForFilename() + ".csv"))
             .string();
     options.implicit_commissioning_profile = true;
@@ -550,10 +562,12 @@ void Usage(const char* program) {
         << "  --allow-provisional-force-control explicit restricted commissioning\n"
         << "  --approach-speed-cm-s SPEED        default 0, maximum 0.5\n"
         << "  --approach-direction-tool-z -1|0|1\n"
-        << "  --max-linear-speed-cm-s SPEED     combined XYZ maximum 0.5\n"
+        << "  --max-force-axis-speed-cm-s SPEED contact Tool-Z maximum 0.5\n"
+        << "  --max-linear-speed-cm-s SPEED     final combined XYZ maximum 0.5\n"
         << "  --max-approach-distance-mm MM      default/maximum 5\n"
         << "    bare --execute uses 250 mm only as the no-contact approach ceiling\n"
         << "  --scan-start-force-n N --scan-speed-cm-s SPEED\n"
+        << "  --scan-force-tolerance-n N --scan-force-stable-sec SEC\n"
         << "  --scan-distance-mm MM (0 continuous) --scan-direction-tool-x -1|1\n"
         << "  --max-orientation-excursion-deg DEG default 5, 0 disables, maximum 15\n"
         << "  --max-tracking-joint-error-deg DEG --max-tracking-position-error-mm MM\n"
@@ -672,12 +686,18 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* item = value(); if (!item || !ParseDouble(item, options.approach_speed_cm_s)) return false;
         } else if (argument == "--approach-direction-tool-z") {
             const char* item = value(); if (!item || !ParseDouble(item, options.approach_direction_tool_z)) return false;
+        } else if (argument == "--max-force-axis-speed-cm-s") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.maximum_force_axis_speed_cm_s)) return false;
         } else if (argument == "--max-linear-speed-cm-s") {
             const char* item = value(); if (!item || !ParseDouble(item, options.maximum_linear_speed_cm_s)) return false;
         } else if (argument == "--max-approach-distance-mm") {
             const char* item = value(); if (!item || !ParseDouble(item, options.maximum_approach_distance_mm)) return false;
         } else if (argument == "--scan-start-force-n") {
             const char* item = value(); if (!item || !ParseDouble(item, options.scan_start_force_n)) return false;
+        } else if (argument == "--scan-force-tolerance-n") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_force_tolerance_n)) return false;
+        } else if (argument == "--scan-force-stable-sec") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_force_stable_duration_s)) return false;
         } else if (argument == "--scan-speed-cm-s") {
             const char* item = value(); if (!item || !ParseDouble(item, options.scan_speed_cm_s)) return false;
         } else if (argument == "--scan-distance-mm") {
@@ -738,6 +758,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         || options.raw_torque_limit_nm <= 0.0
         || options.raw_torque_limit_nm > 5.0
         || options.approach_speed_cm_s < 0.0 || options.approach_speed_cm_s > 0.5
+        || options.maximum_force_axis_speed_cm_s <= 0.0
+        || options.maximum_force_axis_speed_cm_s > 0.5
         || options.maximum_linear_speed_cm_s <= 0.0
         || options.maximum_linear_speed_cm_s > 0.5
         || options.maximum_approach_distance_mm <= 0.0
@@ -745,6 +767,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                > (options.implicit_commissioning_profile ? 250.0 : 5.0)
         || options.scan_start_force_n < 0.99
         || options.scan_start_force_n > 50.0
+        || options.scan_force_tolerance_n <= 0.0
+        || options.scan_force_tolerance_n > 3.0
+        || options.scan_force_stable_duration_s < 0.02
+        || options.scan_force_stable_duration_s > 10.0
         || options.scan_speed_cm_s <= 0.0 || options.scan_speed_cm_s > 0.5
         || options.scan_distance_mm < 0.0 || options.scan_distance_mm > 50.0
         || !direction_valid(options.scan_direction_tool_x, false)
@@ -883,16 +909,16 @@ double MaximumWrappedJointDeltaDeg(
 
 Eigen::Vector3d ProbeTcpBase(
     const Eigen::Matrix<double, 6, 1>& controller_pose,
-    const Eigen::Vector3d& probe_tcp_tool_m) {
+    const Eigen::Vector3d& probe_tcp_pose_frame_m) {
     return controller_pose.head<3>()
         + RotationBaseFromControllerEuler(controller_pose.tail<3>())
-            * probe_tcp_tool_m;
+            * probe_tcp_pose_frame_m;
 }
 
 RMResult StopAndConfirmStationary(
     RMCommand& command,
     RMStateReader& state_reader,
-    const Eigen::Vector3d& probe_tcp_tool_m,
+    const Eigen::Vector3d& probe_tcp_pose_frame_m,
     std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
     const RMResult stop_result = RequestConfirmedStop(command);
     if (!stop_result) return stop_result;
@@ -930,12 +956,12 @@ RMResult StopAndConfirmStationary(
         const double window_joint_deg =
             MaximumWrappedJointDeltaDeg(current.joints, window_anchor.joints);
         const double adjacent_tcp_mm =
-            (ProbeTcpBase(current.pose, probe_tcp_tool_m)
-             - ProbeTcpBase(previous.pose, probe_tcp_tool_m)).norm()
+            (ProbeTcpBase(current.pose, probe_tcp_pose_frame_m)
+             - ProbeTcpBase(previous.pose, probe_tcp_pose_frame_m)).norm()
             * 1000.0;
         const double window_tcp_mm =
-            (ProbeTcpBase(current.pose, probe_tcp_tool_m)
-             - ProbeTcpBase(window_anchor.pose, probe_tcp_tool_m)).norm()
+            (ProbeTcpBase(current.pose, probe_tcp_pose_frame_m)
+             - ProbeTcpBase(window_anchor.pose, probe_tcp_pose_frame_m)).norm()
             * 1000.0;
         const Eigen::Matrix3d adjacent_rotation =
             RotationBaseFromControllerEuler(current.pose.tail<3>())
@@ -987,7 +1013,7 @@ RuntimeTareResult CollectRuntimeTare(
     ForceSensorReader& force_reader,
     RMStateReader& state_reader,
     const ForceCalibration& calibration,
-    const Eigen::Vector3d& probe_tcp_tool_m,
+    const Eigen::Vector3d& probe_tcp_pose_frame_m,
     int seconds,
     double raw_force_limit_n,
     double raw_torque_limit_nm) {
@@ -1029,10 +1055,10 @@ RuntimeTareResult CollectRuntimeTare(
             result.error = "runtime tare rejected raw sensor overrange";
             return result;
         }
-        const Eigen::Matrix3d rotation_base_from_tool =
+        const Eigen::Matrix3d rotation_base_from_arm_tip =
             RotationBaseFromControllerEuler(robot.pose.tail<3>());
         const Eigen::Matrix3d rotation_base_from_sensor =
-            rotation_base_from_tool * calibration.rotation_tool_from_sensor;
+            rotation_base_from_arm_tip * calibration.rotation_tool_from_sensor;
         const CompensatedWrench compensated =
             calibration.Compensate(raw, rotation_base_from_sensor);
         if (!compensated.valid) {
@@ -1049,10 +1075,11 @@ RuntimeTareResult CollectRuntimeTare(
             MaximumWrappedJointDeltaDeg(robot.joints, anchor.joints));
         result.maximum_tcp_span_mm = std::max(
             result.maximum_tcp_span_mm,
-            (ProbeTcpBase(robot.pose, probe_tcp_tool_m)
-             - ProbeTcpBase(anchor.pose, probe_tcp_tool_m)).norm() * 1000.0);
+            (ProbeTcpBase(robot.pose, probe_tcp_pose_frame_m)
+             - ProbeTcpBase(anchor.pose, probe_tcp_pose_frame_m)).norm()
+                * 1000.0);
         const Eigen::Matrix3d orientation_delta =
-            rotation_base_from_tool
+            rotation_base_from_arm_tip
             * RotationBaseFromControllerEuler(anchor.pose.tail<3>()).transpose();
         result.maximum_orientation_span_deg = std::max(
             result.maximum_orientation_span_deg,
@@ -1120,19 +1147,25 @@ RuntimeTareResult CollectRuntimeTare(
     return result;
 }
 
-void ApplyRuntimeTare(const ForceCalibration& calibration,
-                      const Eigen::Matrix<double, 6, 1>& sensor_offset,
+void ApplyRuntimeTare(const Eigen::Matrix<double, 6, 1>& sensor_offset,
                       CompensatedWrench& compensated) {
     if (!compensated.valid) return;
     compensated.sensor -= sensor_offset;
-    const Eigen::Vector3d force_sensor = compensated.sensor.head<3>();
-    const Eigen::Vector3d torque_at_tool_sensor =
-        compensated.sensor.tail<3>()
-        - calibration.translation_sensor_to_tool_m.cross(force_sensor);
-    compensated.tool.head<3>() =
-        calibration.rotation_tool_from_sensor * force_sensor;
-    compensated.tool.tail<3>() =
-        calibration.rotation_tool_from_sensor * torque_at_tool_sensor;
+}
+
+// On this RM75 installation the logical Tool axes are coincident with the
+// force-sensor axes. The legacy calibration field named sensor_to_tool stores
+// the fixed Arm_Tip <- Sensor mount rotation needed to combine controller pose
+// feedback with sensor gravity compensation; it must not rotate the wrench a
+// second time when exposing it in the logical Tool frame.
+void ExpressWrenchInSensorAlignedToolFrame(
+    const ForceCalibration& calibration,
+    CompensatedWrench& compensated) {
+    if (!compensated.valid) return;
+    const Eigen::Vector3d force_tool = compensated.sensor.head<3>();
+    const Eigen::Vector3d torque_tool = compensated.sensor.tail<3>()
+        - calibration.translation_sensor_to_tool_m.cross(force_tool);
+    compensated.tool << force_tool, torque_tool;
 }
 
 }  // namespace
@@ -1186,6 +1219,7 @@ int main(int argc, char** argv) {
             && options.approach_speed_cm_s > 0.0
             && options.approach_speed_cm_s <= 0.05
             && options.approach_direction_tool_z != 0.0
+            && options.maximum_force_axis_speed_cm_s <= 0.05
             && options.maximum_linear_speed_cm_s <= 0.5
             && options.maximum_approach_distance_mm
                    <= maximum_commissioning_distance_mm
@@ -1198,6 +1232,8 @@ int main(int argc, char** argv) {
             && options.contact_pitch_gain_rad_per_m == 0.0
             && (!options.implicit_commissioning_profile
                 || (options.scan_start_force_n == 2.0
+                    && options.scan_force_tolerance_n == 0.3
+                    && options.scan_force_stable_duration_s == 0.5
                     && options.scan_speed_cm_s > 0.0
                     && options.scan_speed_cm_s
                            <= options.maximum_linear_speed_cm_s
@@ -1212,12 +1248,13 @@ int main(int argc, char** argv) {
                    "duration 1.."
                 << maximum_commissioning_duration_s
                 << " s, tare >=3 s, -3 N, approach speed <=0.05 cm/s, "
-                   "combined XYZ speed <=0.5 cm/s, max distance <= "
+                   "force-axis speed <=0.05 cm/s, combined XYZ speed "
+                   "<=0.5 cm/s, max distance <= "
                 << maximum_commissioning_distance_mm
                 << " mm, no Y/RZ/pitch or independent retract, and the "
                    "implicit profile uses phase 0 with a positive scan speed "
                    "not above max linear speed, a 2 N / continuous / "
-                   "-Tool-X scan, "
+                   "-Tool-X scan after -3+/-0.3 N remains stable for 0.5 s, "
                    "and --manual-action\n";
             return 3;
         }
@@ -1366,16 +1403,28 @@ int main(int argc, char** argv) {
     }
     control_config.approach_speed_m_s = options.approach_speed_cm_s / 100.0;
     control_config.approach_direction_tool_z = options.approach_direction_tool_z;
+    control_config.max_force_axis_speed_m_s =
+        options.maximum_force_axis_speed_cm_s / 100.0;
     control_config.max_linear_speed_m_s = options.maximum_linear_speed_cm_s / 100.0;
     control_config.scan_start_force_n = options.scan_start_force_n;
+    control_config.scan_force_tolerance_n = options.scan_force_tolerance_n;
+    control_config.scan_force_stable_duration_s =
+        options.scan_force_stable_duration_s;
     control_config.scan_speed_m_s = options.scan_speed_cm_s / 100.0;
     control_config.maximum_scan_distance_m = options.scan_distance_mm / 1000.0;
     control_config.scan_direction_tool_x = options.scan_direction_tool_x;
     control_config.contact_pitch_gain_rad_per_m =
         options.contact_pitch_gain_rad_per_m;
-    control_config.probe_tcp_tool_m = calibration.rotation_tool_from_sensor
-        * (calibration.probe_tcp_sensor_m
-           - calibration.translation_sensor_to_tool_m);
+    // RMState pose is Base -> Arm_Tip. The current hardware Tool frame is
+    // coincident with Sensor, while Arm_Tip and Tool differ by the calibrated
+    // fixed 30-degree Z mount rotation. Keep control deltas in Tool/Sensor.
+    control_config.rotation_pose_from_tool =
+        calibration.rotation_tool_from_sensor;
+    control_config.probe_tcp_tool_m = calibration.probe_tcp_sensor_m
+        - calibration.translation_sensor_to_tool_m;
+    const Eigen::Vector3d probe_tcp_pose_frame_m =
+        control_config.rotation_pose_from_tool
+        * control_config.probe_tcp_tool_m;
     Rm75ControlLaw control_law(control_config);
 
     Rm75ServoPlannerConfig planner_config;
@@ -1480,7 +1529,7 @@ int main(int argc, char** argv) {
         const RMResult stationary_result = StopAndConfirmStationary(
             command,
             *state_reader,
-            control_config.probe_tcp_tool_m);
+            probe_tcp_pose_frame_m);
         if (!stationary_result) {
             std::cerr << "Execute startup stop/stationary gate failed: "
                       << stationary_result.message << '\n';
@@ -1499,7 +1548,7 @@ int main(int argc, char** argv) {
             *force_reader,
             *state_reader,
             calibration,
-            control_config.probe_tcp_tool_m,
+            probe_tcp_pose_frame_m,
             warmup_seconds,
             options.raw_force_limit_n,
             options.raw_torque_limit_nm);
@@ -1507,7 +1556,7 @@ int main(int argc, char** argv) {
             const RMResult stop_result = StopAndConfirmStationary(
                 command,
                 *state_reader,
-                control_config.probe_tcp_tool_m);
+                probe_tcp_pose_frame_m);
             if (!stop_result) {
                 std::cerr << "Stop after cancelled warm-up was not physically confirmed: "
                           << stop_result.message << '\n';
@@ -1547,7 +1596,7 @@ int main(int argc, char** argv) {
             *force_reader,
             *state_reader,
             calibration,
-            control_config.probe_tcp_tool_m,
+            probe_tcp_pose_frame_m,
             options.tare_no_contact_s,
             options.raw_force_limit_n,
             options.raw_torque_limit_nm);
@@ -1589,6 +1638,9 @@ int main(int argc, char** argv) {
               << (options.duration_s == 0 ? " (continuous)" : "") << '\n'
               << "desired_force_n: " << options.desired_force_n << '\n'
               << "approach_speed_cm_s: " << options.approach_speed_cm_s << '\n'
+              << "maximum_force_axis_speed_cm_s: "
+              << options.maximum_force_axis_speed_cm_s << '\n'
+              << "cartesian_reference_mode: persistent_arm_tip_pose_with_tool_sensor_deltas_and_fk_error_feedback\n"
               << "independent_force_retract: "
               << (control_config.force_retract_enabled
                       ? "enabled" : "disabled")
@@ -1618,15 +1670,33 @@ int main(int argc, char** argv) {
               << options.maximum_approach_distance_mm << '\n'
               << "maximum_orientation_excursion_deg: "
               << options.maximum_orientation_excursion_deg << '\n'
+              << "controller_pose_frame: arm_tip\n"
+              << "control_tool_frame: sensor\n"
+              << "rotation_arm_tip_from_tool_row_major: ["
+              << control_config.rotation_pose_from_tool(0, 0) << ' '
+              << control_config.rotation_pose_from_tool(0, 1) << ' '
+              << control_config.rotation_pose_from_tool(0, 2) << "; "
+              << control_config.rotation_pose_from_tool(1, 0) << ' '
+              << control_config.rotation_pose_from_tool(1, 1) << ' '
+              << control_config.rotation_pose_from_tool(1, 2) << "; "
+              << control_config.rotation_pose_from_tool(2, 0) << ' '
+              << control_config.rotation_pose_from_tool(2, 1) << ' '
+              << control_config.rotation_pose_from_tool(2, 2) << "]\n"
               << "probe_tcp_sensor_m: ["
               << calibration.probe_tcp_sensor_m.transpose() << "]\n"
               << "probe_tcp_tool_m: ["
               << control_config.probe_tcp_tool_m.transpose() << "]\n"
+              << "probe_tcp_arm_tip_m: ["
+              << probe_tcp_pose_frame_m.transpose() << "]\n"
               << "maximum_linear_speed_cm_s: "
               << options.maximum_linear_speed_cm_s << '\n'
               << "phase_index: " << options.manual_phase << '\n'
               << "scan_start_force_n: "
               << control_config.scan_start_force_n << '\n'
+              << "scan_force_tolerance_n: "
+              << control_config.scan_force_tolerance_n << '\n'
+              << "scan_force_stable_duration_s: "
+              << control_config.scan_force_stable_duration_s << '\n'
               << "scan_direction_tool_x: "
               << control_config.scan_direction_tool_x << '\n'
               << "scan_speed_cm_s: "
@@ -1668,10 +1738,15 @@ int main(int argc, char** argv) {
 
     Eigen::Matrix<double, 7, 1> model_joints = robot_state.joints;
     Eigen::Matrix<double, 6, 1> model_pose = robot_state.pose;
+    // Persistent ideal Cartesian trajectory. Unlike model_pose (the FK of
+    // the latest joint target), this reference is never replaced by an
+    // imperfect one-step IK result. The next IK solve therefore sees and
+    // corrects the complete residual Cartesian error from previous cycles.
+    Eigen::Matrix<double, 6, 1> cartesian_reference_pose = robot_state.pose;
     Eigen::Matrix<double, 7, 1> previous_joint_delta =
         Eigen::Matrix<double, 7, 1>::Zero();
     const Eigen::Vector3d initial_probe_tcp =
-        ProbeTcpBase(model_pose, control_config.probe_tcp_tool_m);
+        ProbeTcpBase(model_pose, probe_tcp_pose_frame_m);
     const Eigen::Matrix3d initial_tool_rotation =
         RotationBaseFromControllerEuler(model_pose.tail<3>());
     const auto started_at = std::chrono::steady_clock::now();
@@ -1689,6 +1764,8 @@ int main(int argc, char** argv) {
     bool contact_established = false;
     std::string completion_reason;
     double planned_scan_distance_m = 0.0;
+    double maximum_reference_model_position_error_mm = 0.0;
+    double maximum_reference_model_orientation_error_deg = 0.0;
     Rm75SupervisorState previous_state = Rm75SupervisorState::kInitializing;
     std::string previous_reported_fault;
     std::vector<double> work_durations_us;
@@ -1767,13 +1844,12 @@ int main(int argc, char** argv) {
                 Eigen::AngleAxisd(tracking_rotation_error).angle()
                 * 180.0 / M_PI;
             const double position_error_mm =
-                (ProbeTcpBase(robot_state.pose, control_config.probe_tcp_tool_m)
-                 - ProbeTcpBase(model_pose, control_config.probe_tcp_tool_m))
+                (ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m)
+                 - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m))
                     .norm()
                 * 1000.0;
             const Eigen::Vector3d actual_probe_tcp =
-                ProbeTcpBase(robot_state.pose,
-                             control_config.probe_tcp_tool_m);
+                ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m);
             const double actual_total_distance_mm =
                 (actual_probe_tcp - initial_probe_tcp).norm() * 1000.0;
             const Eigen::Matrix3d actual_rotation =
@@ -1826,10 +1902,11 @@ int main(int argc, char** argv) {
             force_sample.timestamp = std::chrono::system_clock::now();
             force_sample.monotonic_timestamp = cycle_started;
             force_sample.io_status = ForceSensorIoStatus::kStreaming;
-            const Eigen::Matrix3d rotation_base_from_tool =
+            const Eigen::Matrix3d rotation_base_from_arm_tip =
                 RotationBaseFromControllerEuler(model_pose.tail<3>());
             const Eigen::Matrix3d rotation_base_from_sensor =
-                rotation_base_from_tool * calibration.rotation_tool_from_sensor;
+                rotation_base_from_arm_tip
+                * calibration.rotation_tool_from_sensor;
             const Eigen::Vector3d gravity_sensor =
                 rotation_base_from_sensor.transpose() * calibration.gravity_base_n;
             raw_wrench.head<3>() = calibration.force_bias_n + gravity_sensor;
@@ -1838,10 +1915,10 @@ int main(int argc, char** argv) {
             raw_wrench.z() -= 1.0;
         }
 
-        const Eigen::Matrix3d rotation_base_from_tool =
+        const Eigen::Matrix3d rotation_base_from_arm_tip =
             RotationBaseFromControllerEuler(robot_state.pose.tail<3>());
         const Eigen::Matrix3d rotation_base_from_sensor =
-            rotation_base_from_tool * calibration.rotation_tool_from_sensor;
+            rotation_base_from_arm_tip * calibration.rotation_tool_from_sensor;
         CompensatedWrench compensated;
         const bool raw_wrench_in_range = RawWrenchWithinLimits(
             raw_wrench,
@@ -1854,10 +1931,10 @@ int main(int argc, char** argv) {
                                                  force_sample.sequence,
                                                  SystemNs(force_sample.timestamp));
             if (runtime_tare_applied) {
-                ApplyRuntimeTare(calibration,
-                                 runtime_tare.sensor_offset,
+                ApplyRuntimeTare(runtime_tare.sensor_offset,
                                  compensated);
             }
+            ExpressWrenchInSensorAlignedToolFrame(calibration, compensated);
         } else if (!raw_wrench_in_range) {
             compensated.error = "force_sensor_raw_overrange";
         } else {
@@ -1927,12 +2004,15 @@ int main(int argc, char** argv) {
         }
 
         Rm75ControlInput control_input;
-        control_input.current_pose = model_pose;
+        // Integrate Tool-frame force/scan increments on the ideal Cartesian
+        // reference, not on the drifted FK result returned by the planner.
+        control_input.current_pose = cartesian_reference_pose;
         control_input.compensated_wrench_tool = compensated.tool;
         if (contact.valid) {
+            // ContactLocation returns Sensor coordinates, which are already
+            // the physical Tool coordinates on this installation.
             control_input.contact_point_probe_m =
-                calibration.rotation_tool_from_sensor
-                * (contact.point - calibration.probe_tcp_sensor_m);
+                contact.point - calibration.probe_tcp_sensor_m;
         } else {
             control_input.contact_point_probe_m.setZero();
         }
@@ -2121,7 +2201,7 @@ int main(int argc, char** argv) {
                 fatal_fault_code = "maximum_orientation_excursion_exceeded";
             } else if (!contact_established
                        && (ProbeTcpBase(servo_plan.model_pose,
-                              control_config.probe_tcp_tool_m)
+                              probe_tcp_pose_frame_m)
                  - initial_probe_tcp).norm()
                 > options.maximum_approach_distance_mm / 1000.0) {
                 fatal_fault = true;
@@ -2140,9 +2220,18 @@ int main(int argc, char** argv) {
                     model_joints = servo_plan.target_joints;
                     model_pose = servo_plan.model_pose;
                     previous_joint_delta = servo_plan.joint_delta;
-                    if (retreat_step_planned
-                        && options.mode == ControllerMode::kExecute) {
-                        retreat_distance_m += retreat_planned_step_m;
+                    if (retreat_step_planned) {
+                        // Retreat is intentionally based on the realized FK
+                        // path, so hand its result back to normal control as a
+                        // fresh Cartesian reference.
+                        cartesian_reference_pose = model_pose;
+                        if (options.mode == ControllerMode::kExecute) {
+                            retreat_distance_m += retreat_planned_step_m;
+                        }
+                    } else if (control_output.command_motion) {
+                        // Advance the ideal reference only after planning (and
+                        // hardware submission in execute mode) succeeds.
+                        cartesian_reference_pose = control_output.desired_pose;
                     }
                 }
             }
@@ -2154,6 +2243,9 @@ int main(int argc, char** argv) {
                 control_output.fault = hold_result.message;
             }
             previous_joint_delta.setZero();
+            // A Hold cancels any unapplied Cartesian lead. Resuming begins
+            // from the last valid FK target instead of an old reference.
+            cartesian_reference_pose = model_pose;
         }
 
         if (!fatal_fault && options.mode == ControllerMode::kExecute) {
@@ -2183,7 +2275,7 @@ int main(int argc, char** argv) {
                 const RMResult stop_result = StopAndConfirmStationary(
                     command,
                     *state_reader,
-                    control_config.probe_tcp_tool_m);
+                    probe_tcp_pose_frame_m);
                 if (!stop_result) {
                     std::cerr << "StopMotion/stationary confirmation failed: "
                               << stop_result.message << '\n';
@@ -2328,6 +2420,26 @@ int main(int argc, char** argv) {
             control_output.filtered_contact_point_probe_m;
         row.requested_delta = control_output.requested_delta;
         row.desired_pose = control_output.desired_pose;
+        row.reference_model_position_error_mm =
+            (ProbeTcpBase(cartesian_reference_pose,
+                          probe_tcp_pose_frame_m)
+             - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m))
+                .norm()
+            * 1000.0;
+        row.reference_model_orientation_error_deg =
+            Eigen::AngleAxisd(
+                RotationBaseFromControllerEuler(
+                    cartesian_reference_pose.tail<3>())
+                * RotationBaseFromControllerEuler(model_pose.tail<3>())
+                      .transpose())
+                .angle()
+            * 180.0 / M_PI;
+        maximum_reference_model_position_error_mm = std::max(
+            maximum_reference_model_position_error_mm,
+            row.reference_model_position_error_mm);
+        maximum_reference_model_orientation_error_deg = std::max(
+            maximum_reference_model_orientation_error_deg,
+            row.reference_model_orientation_error_deg);
         row.target_joints = servo_plan.target_joints;
         row.fault = fatal_fault ? fatal_fault_code : control_output.fault;
 
@@ -2360,7 +2472,7 @@ int main(int argc, char** argv) {
             const RMResult stop_result = StopAndConfirmStationary(
                 command,
                 *state_reader,
-                control_config.probe_tcp_tool_m);
+                probe_tcp_pose_frame_m);
             if (!stop_result) {
                 std::cerr << "Stop/stationary confirmation after deadline failed: "
                           << stop_result.message << '\n';
@@ -2384,7 +2496,7 @@ int main(int argc, char** argv) {
         const RMResult stop_result = StopAndConfirmStationary(
             command,
             *state_reader,
-            control_config.probe_tcp_tool_m);
+            probe_tcp_pose_frame_m);
         if (!stop_result) {
             std::cerr << "Final stop/stationary confirmation failed: "
                       << stop_result.message << '\n';
@@ -2441,6 +2553,20 @@ int main(int argc, char** argv) {
         {"sensor_id", calibration.sensor_id},
         {"probe_model", calibration.probe_model},
         {"probe_model_sha256", selected_probe_sha256},
+        {"controller_pose_frame", "arm_tip"},
+        {"control_tool_frame", "sensor"},
+        {"legacy_rotation_field_interpretation",
+         "rotation_arm_tip_from_tool_sensor"},
+        {"rotation_arm_tip_from_tool_row_major", {
+            control_config.rotation_pose_from_tool(0, 0),
+            control_config.rotation_pose_from_tool(0, 1),
+            control_config.rotation_pose_from_tool(0, 2),
+            control_config.rotation_pose_from_tool(1, 0),
+            control_config.rotation_pose_from_tool(1, 1),
+            control_config.rotation_pose_from_tool(1, 2),
+            control_config.rotation_pose_from_tool(2, 0),
+            control_config.rotation_pose_from_tool(2, 1),
+            control_config.rotation_pose_from_tool(2, 2)}},
         {"rotation_tool_from_sensor_row_major", {
             calibration.rotation_tool_from_sensor(0, 0),
             calibration.rotation_tool_from_sensor(0, 1),
@@ -2459,6 +2585,10 @@ int main(int argc, char** argv) {
             calibration.probe_tcp_sensor_m.x(),
             calibration.probe_tcp_sensor_m.y(),
             calibration.probe_tcp_sensor_m.z()}},
+        {"probe_tcp_arm_tip_m", {
+            probe_tcp_pose_frame_m.x(),
+            probe_tcp_pose_frame_m.y(),
+            probe_tcp_pose_frame_m.z()}},
         {"tool_chain_verified", calibration.tool_chain_verified},
         {"residuals_verified", calibration.calibration_residuals_verified}};
     summary["provisional_force_control"] = provisional_execute;
@@ -2470,16 +2600,25 @@ int main(int argc, char** argv) {
         {"desired_force_n", options.desired_force_n},
         {"approach_speed_cm_s", options.approach_speed_cm_s},
         {"approach_direction_tool_z", options.approach_direction_tool_z},
+        {"maximum_force_axis_speed_cm_s",
+         options.maximum_force_axis_speed_cm_s},
         {"maximum_linear_speed_cm_s", options.maximum_linear_speed_cm_s},
         {"maximum_no_contact_approach_distance_mm",
          options.maximum_approach_distance_mm},
         {"phase_index", options.manual_phase},
         {"scan_start_force_n", control_config.scan_start_force_n},
+        {"scan_force_tolerance_n", control_config.scan_force_tolerance_n},
+        {"scan_force_stable_duration_s",
+         control_config.scan_force_stable_duration_s},
         {"scan_speed_cm_s", control_config.scan_speed_m_s * 100.0},
         {"scan_distance_mm",
          control_config.maximum_scan_distance_m * 1000.0},
         {"scan_direction_tool_x", control_config.scan_direction_tool_x},
         {"planned_scan_distance_mm", planned_scan_distance_m * 1000.0},
+        {"maximum_reference_model_position_error_mm",
+         maximum_reference_model_position_error_mm},
+        {"maximum_reference_model_orientation_error_deg",
+         maximum_reference_model_orientation_error_deg},
         {"retract_direction_tool_z", options.retract_direction_tool_z},
         {"retract_distance_mm", options.retract_distance_mm},
         {"retract_speed_cm_s", options.retract_speed_cm_s},
@@ -2585,6 +2724,10 @@ int main(int argc, char** argv) {
               << (fatal_fault ? "none" : completion_reason) << '\n'
               << "planned_scan_distance_mm: "
               << planned_scan_distance_m * 1000.0 << '\n'
+              << "maximum_reference_model_position_error_mm: "
+              << maximum_reference_model_position_error_mm << '\n'
+              << "maximum_reference_model_orientation_error_deg: "
+              << maximum_reference_model_orientation_error_deg << '\n'
               << "fault_code: "
               << (fatal_fault_code.empty() ? "none" : fatal_fault_code) << '\n'
               << "missed_periods: " << missed_periods << '\n'

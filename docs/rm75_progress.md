@@ -46,7 +46,7 @@
 | 旧六轴 `-3 N` 力控参数基线 | 软件已配置，真机待验收 | 已迁移 `0.99 N` 接触阈值、`M=3`、`D=20` 和 `-3 N` 目标；保留 RM75 低速、关节与奇异约束 |
 | 旧六轴 wrench/接触点滤波与接触姿态 | 已回退、默认关闭 | 实现代码保留用于离线对照；裸 execute 不再启用，接触点不再产生姿态增量 |
 | Redis 兼容与新消息 | 软件完成 | 旧命令和 `sensor_data` 保留，新增 `robot:sensor:v1`；部署端口 `7777` 待联调 |
-| Tool-X 扫描 | 软件基线完成，真机待验收 | `|Fz|≥2 N` 后保持 Z 导纳并沿 `-Tool X` 持续低速运动；无时间和扫描距离终点 |
+| Tool-X 扫描 | 稳定力启动门已完成，真机待验收 | 接触后先保持 Z 导纳；`Fz` 连续 `0.5 s` 位于目标 `-3±0.3 N` 才锁存启动 `-Tool X`，无时间和扫描距离终点 |
 | Y/RZ 修正与完整扫描闭环 | 未完成 | 等基础力控和 X 扫描真机通过后接入 Redis 阶段命令 |
 | 源码收敛与生产构建 | 已完成 | 默认只构建 `main_rm75`；诊断和标定工具按需开启 |
 
@@ -103,8 +103,9 @@ T = [-0.0510, 0.0506, 0.0821] N·m
 
 ### 3. 完成后续正式标定
 
-- 独立测量 `R_tool_from_sensor`、`translation_sensor_to_tool_m` 和
-  `probe_tcp_sensor_m`。
+- 独立测量 `R_arm_tip_from_tool_sensor`、Arm_Tip/Tool 原点平移和
+  `probe_tcp_sensor_m`；当前硬件定义为 `Tool=Sensor`，不能再把控制器返回的
+  Arm_Tip 姿态直接命名为 Tool 姿态。
 - 保持传感器末端器材与最终运行配置完全一致。
 - 采集至少 8 个无接触、静止、线缆松弛且方向覆盖充分的姿态。
 - 目标：最大力残差 `≤0.5 N`、最大力矩残差 `≤0.05 N·m`。
@@ -114,7 +115,8 @@ T = [-0.0510, 0.0506, 0.0821] N·m
 
 1. 已知表面静态按压，接触点误差 `≤3 mm`。
 2. 软质仿体低速 `-3 N` 基线闭环，稳态误差 `±0.5 N`。
-3. 接触力达到 `2 N` 后验证沿 `-Tool X` 持续运动，同时保持 Z 向力控。
+3. 接触力连续 `0.5 s` 稳定在 `-3±0.3 N` 后，验证锁存启动 `-Tool X`
+   持续运动，同时保持 Z 向力控。
 4. 真实机器人和传感器连续 10 分钟实时性测试。
 5. 30 分钟 observe 和串口、机器人、Redis 故障注入。
 6. Redis observe、Redis dry-run、Y/RZ 修正和完整扫描端到端联调。
@@ -140,12 +142,18 @@ T = [-0.0510, 0.0506, 0.0821] N·m
 当前文件为 `infer/Robot/build/rm75_force_calibration_v6_provisional.json`：
 
 ```text
-R_tool_from_sensor       = Rz(30 deg)
+controller_pose_frame        = Arm_Tip
+control_tool_frame           = Sensor
+R_arm_tip_from_tool_sensor   = Rz(30 deg)
 translation_sensor_to_tool_m = [0, 0, 0]
 probe_tcp_sensor_m           = [0, 0, 0.188]
 tool_chain_verified          = false
 residuals_verified           = false
 ```
+
+为兼容 v6 标定 JSON，文件中的旧字段 `sensor_to_tool.rotation_row_major` 暂时仍保存
+上述 `R_arm_tip_from_tool_sensor`。控制器已显式解释该兼容字段，不再把它误认为
+Sensor 到逻辑 Tool 的旋转；逻辑 Tool 与 Sensor 的轴完全一致。
 
 `0.188 m` TCP 来自旧六轴几何假设，仅用于当前受限调试，不等于正式测量结果。
 
@@ -160,8 +168,11 @@ residuals_verified           = false
 | 接近方向/速度 | `+Tool Z / 0.05 cm/s` |
 | 接触阈值 | `0.99 N` |
 | 轴向导纳参数 | 虚拟质量 `M=3`、虚拟阻尼 `D=20` |
-| 扫描阶段 | `phase_index=0`，`|Fz|≥2 N` 后启动 |
+| 坐标链 | 控制器位姿为 `Base→Arm_Tip`；控制增量为 `Tool=Sensor`；通过 `R_arm_tip_from_tool=Rz(30°)` 转为 Arm_Tip 目标 |
+| 扫描阶段 | `phase_index=0`；`|Fz|≥2 N` 为粗接触下限，且 `Fz` 必须连续 `0.5 s` 位于 `-3±0.3 N` 才启动 |
 | X 扫描 | `-Tool X / 0.2 cm/s / 连续`，同时保持 Z 向力导纳 |
+| Tool-X 参考轨迹 | 独立持久笛卡尔参考；IK 使用参考位姿与关节目标 FK 之间的完整误差反馈，不再从漂移 FK 自由累计 |
+| 接触后 Z 力控速度上限 | `0.05 cm/s`，在 XYZ 综合限幅前独立应用 |
 | XYZ 综合速度上限 | `0.2 cm/s`；X 与 Z 同时运动时共同分配此向量速度 |
 | 旧 wrench/接触点滤波 | 关闭；补偿 wrench 与原始接触估计直接进入基础控制链 |
 | 接触姿态导纳 | 关闭；接触点不产生 roll/pitch/yaw 姿态增量 |
@@ -175,9 +186,27 @@ residuals_verified           = false
 | 启动流程 | Stop、确认静止、3 秒完全悬空 tare |
 | Redis、模型 Y/RZ、额外 pitch 修正 | 关闭；旧接触姿态 roll 也已关闭 |
 
-注意：`maximum_linear_speed_cm_s=0.2` 是 XYZ 综合速度上限，也会将 Z 导纳限制为
-最高 `0.2 cm/s`。X 与 Z 同时运动时，三维平移向量会按比例缩放，共同分配这一个
-综合速度包络，而不是分别都达到 `0.2 cm/s`。
+当前速度分三层：未接触 Z 接近为 `0.05 cm/s`；接触后 Z 导纳先单独限制为
+`0.05 cm/s`；Tool-X 扫描请求为 `0.2 cm/s`。最后仍对完整 XYZ 平移向量应用
+`maximum_linear_speed_cm_s=0.2` 综合安全限幅。X 与 Z 同时运动且合成速度超限时，
+三维向量会按比例缩放，因此两轴不会各自同时达到其独立上限。
+
+Tool-X/Z 增量现在积分到独立 `cartesian_reference_pose`。关节规划仍从当前
+`model_pose`（关节目标 FK）出发，但目标始终是未被 IK 残差污染的持久参考位姿，
+因此上一周期的笛卡尔误差会在下一周期继续进入 Jacobian 求解。只有规划和发送成功
+后才推进参考；Hold 会将参考重置到最后有效 FK。CSV/summary 记录参考与 FK 的位置、
+姿态误差及其运行最大值，用于真机验证反馈是否收敛。
+
+`cartesian_reference_pose` 本身是 Arm_Tip 位姿，但 `requested_dx/dy/dz_tool` 始终
+定义在真实 Tool/Sensor 坐标系。每周期使用
+`R_base_from_tool = R_base_from_arm_tip * R_arm_tip_from_tool` 将控制增量转换到基座系，
+再生成 Arm_Tip 目标交给 IK。因此 `-Tool-X` 在当前 `+30°` 安装下会正确转换成
+Arm_Tip 平面内的 `[-0.866, -0.500, 0]`，而不再误发为 `-ArmTip-X`。
+
+扫描启动增加了连续稳定力门。进入接触后先保持 Tool-Z 导纳，扫描计时器只在
+`|Fz-(-3 N)|≤0.3 N` 且 `|Fz|≥2 N` 时累积；任一周期越界都会重新计时。连续满足
+`0.5 s`（20 ms 周期下为 25 个周期）后锁存 Tool-X 扫描。锁存后不会因小幅力波动
+反复切换成仅 Z 运动；停止动作、切换扫描 phase 或控制复位后才重新等待稳定力门。
 
 ### 旧六轴力相关参数映射
 
@@ -188,7 +217,7 @@ residuals_verified           = false
 | Z 向导纳 | `M=3`、`D=20` | `M=3`、`D=20` | 已复现 |
 | 导纳模型周期 | `10 ms`，实际主循环约 `20 ms` | 模型与控制循环统一为 `20 ms` | 修复旧时基不一致 |
 | 未接触推进 | 每周期 `3 mm` | `0.05 cm/s` 连续限速 | 不复现旧六轴大步进 |
-| Z 向速度夹紧 | `±0.5 m/s` | `±0.002 m/s`（`0.2 cm/s`），且与 X/Y 共用 XYZ 综合限幅 | 保留低速真机边界 |
+| Z 向速度夹紧 | `±0.5 m/s` | 接触后先限 `±0.0005 m/s`（`0.05 cm/s`），随后与 X/Y 共用 `0.2 cm/s` XYZ 综合限幅 | 保留低速真机边界 |
 | 原始传感器量程检查 | `50 N / 5 N·m` | `50 N / 5 N·m` | 已恢复旧边界 |
 | 补偿 wrench 控制边界 | `Fx/Fy=20 N`、`Fz=50 N` | `Fx/Fy=20 N`、`Fz=50 N`、力矩 `5 N·m` | 已取消临时 `5 N` 轴向门 |
 | 独立过力回退 | 无 | 关闭 | 已取消 `4.0/3.2 N` retreat 迟滞 |
@@ -215,6 +244,8 @@ residuals_verified           = false
 | 2026-07-20 当前姿态 observe | 250 周期，missed 0，最大工作时间 `286.311 us`；合力/合力矩最大 `4.240 N / 0.1111 N·m` | 通信和周期正常，标定残差阻塞 execute |
 | v6 60 秒力控诊断 | 3000 周期、missed 0；132 approach、2058 contact、810 retreat | 小力时规划方向确为 `+Tool Z`，但旧 `0.5 cm/s` 正常力控速度使 Fz 在约 80 ms 内从 `-0.85 N` 越过目标到 `-1.27 N`，随后反向卸载；已将正常力控限速降到 `0.05 cm/s` |
 | Tool-X/Z 综合限幅离线回放 | X 扫描和 Z 导纳可同时输出；合成 XYZ 步长不超过 `0.2 cm/s × 20 ms = 0.04 mm` | X/Z 共同参与三维向量归一化限幅；真机待验收 |
+| Tool-X 稳定力启动门 | `-3±0.3 N` 前 24 个连续周期无 X，第 25 周期启动；中途越界会清零计时；启动后力波动不停止 X | 离线确定性时序验证通过，真机待验收 |
+| Arm_Tip/Tool 30° 坐标变换 | `-Tool-X 0.04 mm` 正确转换为 Arm_Tip `[-0.034641,-0.020000] mm`；Tool 请求仍保持 `[-0.04,0,0] mm` | 离线方向验证通过，真机待验收 |
 
 历史调试中曾因接触迟滞和方向问题达到约 `-20 N`；随后使用过 `5 N` 轴向门以及
 `4.0/3.2 N` retreat 迟滞。按 2026-07-21 当前阶段决策，这三项已从默认 profile
@@ -327,8 +358,9 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 ./main_rm75 --execute
 ```
 
-当前裸 execute 使用未滤波补偿 wrench 的基础轴向力控；`|Fz|≥2 N` 后同时沿
-`-Tool X` 持续运动，Z 向 `-3 N` 力控继续运行。默认无时间和 X 扫描距离终点，
+当前裸 execute 使用未滤波补偿 wrench 的基础轴向力控；接触后先等待 `Fz` 连续
+`0.5 s` 稳定在 `-3±0.3 N`，再锁存并沿 `-Tool X` 持续运动，Z 向 `-3 N` 力控
+继续运行。默认无时间和 X 扫描距离终点，
 直到 Ctrl+C、终止命令或故障才结束；`250 mm` 只限制未接触接近阶段。不启用旧
 wrench Kalman、接触点 Kalman、旧接触姿态导纳或独立 retreat；总姿态行程和姿态
 跟踪误差检查保持关闭。关节规划、奇异、关节/位置跟踪误差、通信故障和旧量程边界

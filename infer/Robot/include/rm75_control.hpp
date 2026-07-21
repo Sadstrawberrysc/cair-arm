@@ -73,6 +73,9 @@ struct Rm75ControlConfig {
     bool legacy_contact_roll_limits_enabled = true;
     double approach_speed_m_s = 0.0;
     double approach_direction_tool_z = 0.0;
+    // Contact-admittance Tool-Z speed limit, applied before the final XYZ
+    // vector safety envelope.
+    double max_force_axis_speed_m_s = 0.005;
     // Combined XYZ translation-speed limit. Simultaneous X/Z motion shares
     // this vector envelope.
     double max_linear_speed_m_s = 0.005;
@@ -81,17 +84,25 @@ struct Rm75ControlConfig {
     double model_y_gain = 0.5;
     double model_rz_gain = 0.05;
     double contact_pitch_gain_rad_per_m = 0.0;
-    // Match the old six-axis workflow: lateral scanning starts only after
-    // axial contact is established above 2 N, while Z admittance remains on.
+    // Coarse contact-force floor for allowing the scan-ready timer to run.
     double scan_start_force_n = 2.0;
+    // Tool-X scanning starts only after the signed axial force remains within
+    // this band around desired_force_n for scan_force_stable_duration_s.
+    double scan_force_tolerance_n = 0.3;
+    double scan_force_stable_duration_s = 0.5;
     double scan_speed_m_s = 0.001;
     double maximum_scan_distance_m = 0.005;
     double scan_alignment_tolerance_m = 0.0008;
     double scan_direction_tool_x = -1.0;
 
-    // Position of the configured probe TCP expressed in the controller tool
-    // frame. Tool-frame translations and rotations are composed around this
-    // point rather than added directly to base-frame XYZ/Euler components.
+    // The controller pose describes Base -> Arm_Tip. Control increments use
+    // the physical Tool frame, which is coincident with the force-sensor axes
+    // on the current installation. This fixed rotation maps Tool vectors into
+    // Arm_Tip coordinates before composing a controller pose target.
+    Eigen::Matrix3d rotation_pose_from_tool = Eigen::Matrix3d::Identity();
+    // Position of the configured probe TCP expressed in physical Tool axes.
+    // The current installation assumes coincident Arm_Tip/Tool origins; their
+    // axes may differ by rotation_pose_from_tool.
     Eigen::Vector3d probe_tcp_tool_m = Eigen::Vector3d::Zero();
 };
 
@@ -157,6 +168,8 @@ private:
     double force_axis_velocity_m_s_ = 0.0;
     double contact_roll_velocity_rad_s_ = 0.0;
     double scan_distance_m_ = 0.0;
+    double scan_force_stable_time_s_ = 0.0;
+    bool scan_latched_ = false;
     int active_scan_phase_ = -1;
     std::uint64_t active_correction_sequence_ =
         std::numeric_limits<std::uint64_t>::max();
