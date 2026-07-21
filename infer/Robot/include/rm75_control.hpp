@@ -73,12 +73,17 @@ struct Rm75ControlConfig {
     bool legacy_contact_roll_limits_enabled = true;
     double approach_speed_m_s = 0.0;
     double approach_direction_tool_z = 0.0;
+    // Combined XYZ translation-speed limit. Simultaneous X/Z motion shares
+    // this vector envelope.
     double max_linear_speed_m_s = 0.005;
     double max_angular_speed_rad_s = 2.0 * M_PI / 180.0;
 
     double model_y_gain = 0.5;
     double model_rz_gain = 0.05;
     double contact_pitch_gain_rad_per_m = 0.0;
+    // Match the old six-axis workflow: lateral scanning starts only after
+    // axial contact is established above 2 N, while Z admittance remains on.
+    double scan_start_force_n = 2.0;
     double scan_speed_m_s = 0.001;
     double maximum_scan_distance_m = 0.005;
     double scan_alignment_tolerance_m = 0.0008;
@@ -153,7 +158,6 @@ private:
     double contact_roll_velocity_rad_s_ = 0.0;
     double scan_distance_m_ = 0.0;
     int active_scan_phase_ = -1;
-    int completed_scan_phase_ = -1;
     std::uint64_t active_correction_sequence_ =
         std::numeric_limits<std::uint64_t>::max();
     double remaining_model_y_m_ = 0.0;

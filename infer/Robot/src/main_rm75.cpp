@@ -35,7 +35,7 @@ namespace {
 std::atomic<bool> g_stop_requested{false};
 constexpr std::chrono::milliseconds kMinimumAsyncServoSendGap{10};
 constexpr const char* kImplicitProfileName =
-    "rm75_v6_axial_force_3n_tcp188_60s";
+    "rm75_v6_force_scan_x_continuous_3n_tcp188";
 constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
 // RM75 pose feedback is quantized at roughly 0.001 rad. At the legacy
 // 188 mm probe TCP this can appear as about 0.19 mm of endpoint motion even
@@ -102,6 +102,10 @@ struct Options {
     double approach_direction_tool_z = 0.0;
     double maximum_linear_speed_cm_s = 0.5;
     double maximum_approach_distance_mm = 5.0;
+    double scan_start_force_n = 2.0;
+    double scan_speed_cm_s = 0.1;
+    double scan_distance_mm = 5.0;
+    double scan_direction_tool_x = -1.0;
     double maximum_orientation_excursion_deg = 5.0;
     double max_tracking_joint_error_deg = 5.0;
     double max_tracking_position_error_mm = 3.0;
@@ -464,7 +468,9 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.expected_sensor_id = "DU0DU5LC";
     options.probe_model_path =
         (executable_directory / "../model/Lprobe-IFS.STL").lexically_normal().string();
-    options.duration_s = 60;
+    // Zero means continuous operation. Tool-X scanning and Z-force admittance
+    // both continue until Ctrl+C, terminate or a fault.
+    options.duration_s = 0;
     options.tare_no_contact_s = 3;
     // First RM75 force-control baseline: reproduce the original six-axis
     // operating target before tuning new gains or force bands.
@@ -473,11 +479,17 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.raw_torque_limit_nm = 5.0;
     options.approach_speed_cm_s = 0.05;
     options.approach_direction_tool_z = 1.0;
-    // Preserve the RM75 commissioning speed envelope while restoring the
-    // original six-axis force target and admittance parameters. The legacy
-    // 3 mm/cycle no-contact step is intentionally not restored.
-    options.maximum_linear_speed_cm_s = 0.05;
+    // XYZ translation shares this combined speed envelope. During contact,
+    // simultaneous Tool-X scan and Tool-Z admittance divide the same limit.
+    options.maximum_linear_speed_cm_s = 0.2;
     options.maximum_approach_distance_mm = 250.0;
+    // Phase 0 reproduces the old forward scan: once |Fz| reaches 2 N,
+    // maintain -3 N admittance while moving continuously along -Tool X.
+    options.manual_phase = 0;
+    options.scan_start_force_n = 2.0;
+    options.scan_speed_cm_s = 0.2;
+    options.scan_distance_mm = 0.0;
+    options.scan_direction_tool_x = -1.0;
     // Zero disables the separate total Cartesian-orientation excursion gate.
     options.maximum_orientation_excursion_deg = 0.0;
     options.max_tracking_joint_error_deg = 5.0;
@@ -499,7 +511,7 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.enable_force_retract = false;
     options.runtime_log_path =
         (executable_directory / "logs"
-         / ("rm75_v6_axial_force_3n_tcp188_60s_"
+         / ("rm75_v6_force_scan_x_continuous_3n_tcp188_"
             + TimestampForFilename() + ".csv"))
             .string();
     options.implicit_commissioning_profile = true;
@@ -511,8 +523,9 @@ void Usage(const char* program) {
         << " [--execute | --calibration FILE [options]]\n\n"
         << "Confirmed local commissioning shortcut:\n"
         << "  " << program << " --execute\n"
-        << "    With no other arguments, load the bounded RM75/v6/DU0DU5LC profile.\n"
-        << "    The local profile is limited to 60 s and 250 mm total TCP travel.\n"
+        << "    With no other arguments, load the continuous RM75/v6/DU0DU5LC profile.\n"
+        << "    The local profile runs until Ctrl+C/terminate/fault; its 250 mm\n"
+        << "    envelope applies only before contact, not to the Tool-X scan.\n"
         << "    Real motion remains authorized only by the explicit --execute token.\n\n"
         << "Safe modes (default is observe):\n"
         << "  --observe             acquire/publish only; never plan or send motion\n"
@@ -525,7 +538,8 @@ void Usage(const char* program) {
         << "  --robot-stale-ms MS --command-stale-ms MS\n"
         << "  --calibration FILE --expected-sensor-id ID --probe-model FILE\n"
         << "  --redis-host HOST --redis-port PORT --no-redis\n"
-        << "    local --no-redis execute requires --duration-sec 1..60\n"
+        << "    explicit --no-redis execute requires --duration-sec 1..60;\n"
+        << "    bare --execute uses duration 0 (continuous)\n"
         << "  --period-ms MS --duration-sec SEC --publish-every N\n"
         << "  --runtime-log FILE\n\n"
         << "Control (SI except names carrying cm/mm/deg):\n"
@@ -536,9 +550,11 @@ void Usage(const char* program) {
         << "  --allow-provisional-force-control explicit restricted commissioning\n"
         << "  --approach-speed-cm-s SPEED        default 0, maximum 0.5\n"
         << "  --approach-direction-tool-z -1|0|1\n"
-        << "  --max-linear-speed-cm-s SPEED     maximum 0.5\n"
+        << "  --max-linear-speed-cm-s SPEED     combined XYZ maximum 0.5\n"
         << "  --max-approach-distance-mm MM      default/maximum 5\n"
-        << "    bare --execute local profile uses a dedicated 250 mm ceiling\n"
+        << "    bare --execute uses 250 mm only as the no-contact approach ceiling\n"
+        << "  --scan-start-force-n N --scan-speed-cm-s SPEED\n"
+        << "  --scan-distance-mm MM (0 continuous) --scan-direction-tool-x -1|1\n"
         << "  --max-orientation-excursion-deg DEG default 5, 0 disables, maximum 15\n"
         << "  --max-tracking-joint-error-deg DEG --max-tracking-position-error-mm MM\n"
         << "  --max-tracking-orientation-error-deg DEG (0 disables)\n"
@@ -660,6 +676,14 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* item = value(); if (!item || !ParseDouble(item, options.maximum_linear_speed_cm_s)) return false;
         } else if (argument == "--max-approach-distance-mm") {
             const char* item = value(); if (!item || !ParseDouble(item, options.maximum_approach_distance_mm)) return false;
+        } else if (argument == "--scan-start-force-n") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_start_force_n)) return false;
+        } else if (argument == "--scan-speed-cm-s") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_speed_cm_s)) return false;
+        } else if (argument == "--scan-distance-mm") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_distance_mm)) return false;
+        } else if (argument == "--scan-direction-tool-x") {
+            const char* item = value(); if (!item || !ParseDouble(item, options.scan_direction_tool_x)) return false;
         } else if (argument == "--max-orientation-excursion-deg") {
             const char* item = value(); if (!item || !ParseDouble(item, options.maximum_orientation_excursion_deg)) return false;
         } else if (argument == "--max-tracking-joint-error-deg") {
@@ -719,6 +743,11 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         || options.maximum_approach_distance_mm <= 0.0
         || options.maximum_approach_distance_mm
                > (options.implicit_commissioning_profile ? 250.0 : 5.0)
+        || options.scan_start_force_n < 0.99
+        || options.scan_start_force_n > 50.0
+        || options.scan_speed_cm_s <= 0.0 || options.scan_speed_cm_s > 0.5
+        || options.scan_distance_mm < 0.0 || options.scan_distance_mm > 50.0
+        || !direction_valid(options.scan_direction_tool_x, false)
         || options.maximum_orientation_excursion_deg < 0.0
         || options.maximum_orientation_excursion_deg > 15.0
         || options.max_tracking_joint_error_deg <= 0.0
@@ -1143,13 +1172,14 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (provisional_execute) {
-        const int maximum_commissioning_duration_s =
-            options.implicit_commissioning_profile ? 60 : 5;
+        const int maximum_commissioning_duration_s = 5;
         const double maximum_commissioning_distance_mm =
             options.implicit_commissioning_profile ? 250.0 : 1.0;
         const bool constrained = !options.redis_enabled
-            && options.duration_s >= 1
-            && options.duration_s <= maximum_commissioning_duration_s
+            && (options.implicit_commissioning_profile
+                ? options.duration_s == 0
+                : (options.duration_s >= 1
+                   && options.duration_s <= maximum_commissioning_duration_s))
             && options.tare_no_contact_s >= 3
             && options.tare_no_contact_s <= 10
             && std::abs(options.desired_force_n + 3.0) <= 1e-12
@@ -1161,21 +1191,33 @@ int main(int argc, char** argv) {
                    <= maximum_commissioning_distance_mm
             && options.maximum_orientation_excursion_deg <= 1.0
             && options.manual_action && !options.manual_terminate
-            && options.manual_phase == -1
+            && options.manual_phase
+                   == (options.implicit_commissioning_profile ? 0 : -1)
             && options.manual_y_m == 0.0
             && options.manual_rz_deg == 0.0
             && options.contact_pitch_gain_rad_per_m == 0.0
+            && (!options.implicit_commissioning_profile
+                || (options.scan_start_force_n == 2.0
+                    && options.scan_speed_cm_s > 0.0
+                    && options.scan_speed_cm_s
+                           <= options.maximum_linear_speed_cm_s
+                    && options.scan_distance_mm == 0.0
+                    && options.scan_direction_tool_x == -1.0))
             && !options.allow_near_singularity
             && !options.enable_force_retract;
         if (!constrained) {
             std::cerr
                 << "Provisional execute rejected: commissioning requires "
-                   "--no-redis, duration 1.."
+                   "--no-redis, implicit duration 0 (continuous) or explicit "
+                   "duration 1.."
                 << maximum_commissioning_duration_s
-                << " s, tare >=3 s, -3 N, speed <=0.05 cm/s, "
-                   "max linear speed <=0.5 cm/s, max distance <="
+                << " s, tare >=3 s, -3 N, approach speed <=0.05 cm/s, "
+                   "combined XYZ speed <=0.5 cm/s, max distance <= "
                 << maximum_commissioning_distance_mm
-                << " mm, no Y/RZ/pitch or independent retract, "
+                << " mm, no Y/RZ/pitch or independent retract, and the "
+                   "implicit profile uses phase 0 with a positive scan speed "
+                   "not above max linear speed, a 2 N / continuous / "
+                   "-Tool-X scan, "
                    "and --manual-action\n";
             return 3;
         }
@@ -1190,6 +1232,7 @@ int main(int argc, char** argv) {
     }
     if (options.mode == ControllerMode::kExecute
         && !options.redis_enabled
+        && !options.implicit_commissioning_profile
         && (options.duration_s <= 0 || options.duration_s > 60)) {
         std::cerr << "Execute rejected: --no-redis requires a bounded "
                      "--duration-sec in 1..60\n";
@@ -1324,6 +1367,10 @@ int main(int argc, char** argv) {
     control_config.approach_speed_m_s = options.approach_speed_cm_s / 100.0;
     control_config.approach_direction_tool_z = options.approach_direction_tool_z;
     control_config.max_linear_speed_m_s = options.maximum_linear_speed_cm_s / 100.0;
+    control_config.scan_start_force_n = options.scan_start_force_n;
+    control_config.scan_speed_m_s = options.scan_speed_cm_s / 100.0;
+    control_config.maximum_scan_distance_m = options.scan_distance_mm / 1000.0;
+    control_config.scan_direction_tool_x = options.scan_direction_tool_x;
     control_config.contact_pitch_gain_rad_per_m =
         options.contact_pitch_gain_rad_per_m;
     control_config.probe_tcp_tool_m = calibration.rotation_tool_from_sensor
@@ -1538,7 +1585,8 @@ int main(int argc, char** argv) {
               << ForceSensorProtocolName(sensor_config.protocol) << '\n'
               << "sensor_stale_ms: " << options.sensor_stale_ms << '\n'
               << "robot_stale_ms: " << options.robot_stale_ms << '\n'
-              << "duration_s: " << options.duration_s << '\n'
+              << "duration_s: " << options.duration_s
+              << (options.duration_s == 0 ? " (continuous)" : "") << '\n'
               << "desired_force_n: " << options.desired_force_n << '\n'
               << "approach_speed_cm_s: " << options.approach_speed_cm_s << '\n'
               << "independent_force_retract: "
@@ -1566,7 +1614,7 @@ int main(int argc, char** argv) {
               << (control_config.legacy_contact_roll_enabled
                       ? "enabled" : "disabled")
               << '\n'
-              << "maximum_approach_distance_mm: "
+              << "maximum_no_contact_approach_distance_mm: "
               << options.maximum_approach_distance_mm << '\n'
               << "maximum_orientation_excursion_deg: "
               << options.maximum_orientation_excursion_deg << '\n'
@@ -1576,6 +1624,15 @@ int main(int argc, char** argv) {
               << control_config.probe_tcp_tool_m.transpose() << "]\n"
               << "maximum_linear_speed_cm_s: "
               << options.maximum_linear_speed_cm_s << '\n'
+              << "phase_index: " << options.manual_phase << '\n'
+              << "scan_start_force_n: "
+              << control_config.scan_start_force_n << '\n'
+              << "scan_direction_tool_x: "
+              << control_config.scan_direction_tool_x << '\n'
+              << "scan_speed_cm_s: "
+              << control_config.scan_speed_m_s * 100.0 << '\n'
+              << "scan_distance_mm: "
+              << control_config.maximum_scan_distance_m * 1000.0 << '\n'
               << "compensated_wrench_limits_force_xy_z_n: ["
               << control_config.force_limit_xy_n << ' '
               << control_config.force_limit_z_n << "]\n"
@@ -1628,6 +1685,10 @@ int main(int argc, char** argv) {
     int stale_wrench_cycles = 0;
     bool fatal_fault = false;
     std::string fatal_fault_code;
+    bool motion_completed = false;
+    bool contact_established = false;
+    std::string completion_reason;
+    double planned_scan_distance_m = 0.0;
     Rm75SupervisorState previous_state = Rm75SupervisorState::kInitializing;
     std::string previous_reported_fault;
     std::vector<double> work_durations_us;
@@ -1725,7 +1786,8 @@ int main(int argc, char** argv) {
                     < planner.Config().joint_limit_stop_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_joint_limit_margin_exceeded";
-            } else if (actual_total_distance_mm
+            } else if (!contact_established
+                       && actual_total_distance_mm
                        > options.maximum_approach_distance_mm) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_maximum_approach_distance_exceeded";
@@ -1880,6 +1942,20 @@ int main(int argc, char** argv) {
         const bool arm_control = options.mode != ControllerMode::kObserve;
         Rm75ControlOutput control_output =
             control_law.Step(control_input, intent, arm_control);
+        if (control_output.state == Rm75SupervisorState::kContact
+            || control_output.state == Rm75SupervisorState::kScan) {
+            contact_established = true;
+        }
+        if (control_output.state == Rm75SupervisorState::kScan) {
+            planned_scan_distance_m +=
+                std::abs(control_output.requested_delta.x());
+        }
+        if (control_output.completed) {
+            motion_completed = true;
+            completion_reason = control_output.completion_reason.empty()
+                ? "movement_completed"
+                : control_output.completion_reason;
+        }
         if (!redis_hold_reason.empty() && control_output.fault.empty()) {
             control_output.fault = redis_hold_reason;
         }
@@ -2043,7 +2119,8 @@ int main(int argc, char** argv) {
                        > options.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "maximum_orientation_excursion_exceeded";
-            } else if ((ProbeTcpBase(servo_plan.model_pose,
+            } else if (!contact_established
+                       && (ProbeTcpBase(servo_plan.model_pose,
                               control_config.probe_tcp_tool_m)
                  - initial_probe_tcp).norm()
                 > options.maximum_approach_distance_mm / 1000.0) {
@@ -2293,7 +2370,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (fatal_fault) break;
+        if (fatal_fault || motion_completed) break;
 
         if (!missed) {
             std::this_thread::sleep_until(next_tick);
@@ -2350,7 +2427,13 @@ int main(int argc, char** argv) {
     summary["controller"] = "main_rm75";
     summary["mode"] = ModeName(options.mode);
     summary["simulated"] = options.simulate;
+    if (!fatal_fault && completion_reason.empty()) {
+        completion_reason = g_stop_requested.load()
+            ? "stop_requested" : "duration_elapsed";
+    }
     summary["result"] = fatal_fault ? "fault" : "completed";
+    summary["completion_reason"] = fatal_fault
+        ? nlohmann::json(nullptr) : nlohmann::json(completion_reason);
     summary["fault_code"] = fatal_fault_code.empty()
         ? nlohmann::json(nullptr)
         : nlohmann::json(fatal_fault_code);
@@ -2388,8 +2471,15 @@ int main(int argc, char** argv) {
         {"approach_speed_cm_s", options.approach_speed_cm_s},
         {"approach_direction_tool_z", options.approach_direction_tool_z},
         {"maximum_linear_speed_cm_s", options.maximum_linear_speed_cm_s},
-        {"maximum_approach_distance_mm",
+        {"maximum_no_contact_approach_distance_mm",
          options.maximum_approach_distance_mm},
+        {"phase_index", options.manual_phase},
+        {"scan_start_force_n", control_config.scan_start_force_n},
+        {"scan_speed_cm_s", control_config.scan_speed_m_s * 100.0},
+        {"scan_distance_mm",
+         control_config.maximum_scan_distance_m * 1000.0},
+        {"scan_direction_tool_x", control_config.scan_direction_tool_x},
+        {"planned_scan_distance_mm", planned_scan_distance_m * 1000.0},
         {"retract_direction_tool_z", options.retract_direction_tool_z},
         {"retract_distance_mm", options.retract_distance_mm},
         {"retract_speed_cm_s", options.retract_speed_cm_s},
@@ -2491,6 +2581,10 @@ int main(int argc, char** argv) {
     }
     std::cout << "cycles: " << cycle << '\n'
               << "result: " << (fatal_fault ? "fault" : "completed") << '\n'
+              << "completion_reason: "
+              << (fatal_fault ? "none" : completion_reason) << '\n'
+              << "planned_scan_distance_mm: "
+              << planned_scan_distance_m * 1000.0 << '\n'
               << "fault_code: "
               << (fatal_fault_code.empty() ? "none" : fatal_fault_code) << '\n'
               << "missed_periods: " << missed_periods << '\n'

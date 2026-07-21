@@ -40,6 +40,7 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.model_y_gain,
         config.model_rz_gain,
         config.contact_pitch_gain_rad_per_m,
+        config.scan_start_force_n,
         config.scan_speed_m_s,
         config.maximum_scan_distance_m,
         config.scan_alignment_tolerance_m,
@@ -81,6 +82,8 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && std::abs(config.approach_direction_tool_z) <= 1.0
         && config.max_linear_speed_m_s > 0.0
         && config.max_angular_speed_rad_s > 0.0
+        && config.scan_start_force_n >= config.contact_threshold_n
+        && config.scan_start_force_n <= config.force_limit_z_n
         && config.scan_speed_m_s >= 0.0
         && config.maximum_scan_distance_m >= 0.0
         && config.scan_alignment_tolerance_m >= 0.0
@@ -146,7 +149,6 @@ void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     remaining_model_y_m_ = 0.0;
     remaining_model_rz_rad_ = 0.0;
     if (clear_command_memory) {
-        completed_scan_phase_ = -1;
         active_correction_sequence_ =
             std::numeric_limits<std::uint64_t>::max();
     }
@@ -302,15 +304,6 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         remaining_model_rz_rad_ =
             config_.model_rz_gain * intent.model_rz_deg * M_PI / 180.0;
     }
-    if ((intent.phase_index == 0 || intent.phase_index == 2)
-        && intent.phase_index == completed_scan_phase_) {
-        output.state = Rm75SupervisorState::kHold;
-        output.completed = true;
-        output.completion_reason = "scan_distance_completed";
-        force_axis_velocity_m_s_ = 0.0;
-        return output;
-    }
-
     double delta_z = 0.0;
     if (in_contact) {
         const double requested_force = std::isfinite(intent.desired_force_n)
@@ -334,27 +327,24 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     double delta_x = 0.0;
     const bool scan_phase = intent.phase_index == 0 || intent.phase_index == 2;
     if (scan_phase && in_contact
+        && std::abs(force.z()) >= config_.scan_start_force_n
         && std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m) {
         if (active_scan_phase_ != intent.phase_index) {
             active_scan_phase_ = intent.phase_index;
             scan_distance_m_ = 0.0;
         }
-        const double remaining =
-            std::max(0.0, config_.maximum_scan_distance_m - scan_distance_m_);
-        const double scan_step = std::min(config_.scan_speed_m_s * dt, remaining);
-        delta_x = config_.scan_direction_tool_x * scan_step;
-        if (remaining <= 0.0) {
-            output.state = Rm75SupervisorState::kHold;
-            output.completed = true;
-            output.completion_reason = "scan_distance_completed";
-            completed_scan_phase_ = intent.phase_index;
-            force_axis_velocity_m_s_ = 0.0;
-            return output;
+        double scan_step = config_.scan_speed_m_s * dt;
+        if (config_.maximum_scan_distance_m > 0.0) {
+            const double remaining = std::max(
+                0.0, config_.maximum_scan_distance_m - scan_distance_m_);
+            constexpr double kScanCompletionToleranceM = 1e-12;
+            scan_step = remaining > kScanCompletionToleranceM
+                ? std::min(scan_step, remaining) : 0.0;
         }
+        delta_x = config_.scan_direction_tool_x * scan_step;
     } else if (!scan_phase) {
         scan_distance_m_ = 0.0;
         active_scan_phase_ = -1;
-        completed_scan_phase_ = -1;
     }
 
     const double model_y_step = Clamp(remaining_model_y_m_,
@@ -374,6 +364,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     }
     remaining_model_y_m_ -= translation_delta.y();
     if (scan_phase && in_contact
+        && std::abs(force.z()) >= config_.scan_start_force_n
         && std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m) {
         scan_distance_m_ += std::abs(translation_delta.x());
     }
