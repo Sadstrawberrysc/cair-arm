@@ -15,7 +15,10 @@ enum class Rm75SupervisorState {
     kArmed,
     kApproach,
     kContact,
+    kForceSettle,
     kScan,
+    kTriggerAlign,
+    kRotateAlign,
     kHold,
     kRetreat,
     kFault,
@@ -54,6 +57,27 @@ struct Rm75ControlConfig {
 
     double force_virtual_mass = 3.0;
     double force_virtual_damping = 20.0;
+    // Target-relative overload unloading. When the signed Tool-Z force is
+    // more compressive than desired_force_n by this margin, suspend lateral
+    // and angular motion and command a force-dependent -Tool-Z retreat.
+    bool target_force_unload_enabled = true;
+    double target_force_unload_margin_n = 0.1;
+    // Maximum overload-unloading speed. It is reached when the compressive
+    // force error is at least target_force_unload_deceleration_band_n and
+    // decreases linearly to zero as the force returns to its target.
+    double target_force_unload_speed_m_s = 0.005;
+    double target_force_unload_deceleration_band_n = 1.0;
+    // After the measured force reaches the target, brake the remaining
+    // negative Tool-Z velocity to zero before ordinary admittance resumes.
+    double target_force_unload_stop_acceleration_m_s2 = 0.025;
+    // After braking, reacquire lost contact with pure +Tool-Z motion only while
+    // action remains enabled. Idle cancels recovery at zero Z velocity; when
+    // moving, lateral motion stays disabled while admittance restores force.
+    double target_force_reacquire_speed_m_s = 0.005;
+    double target_force_recovery_stable_duration_s = 0.5;
+    // Limit normal admittance velocity changes so recovery from zero cannot
+    // reverse direction at the full force-axis speed in one 20 ms cycle.
+    double max_force_axis_acceleration_m_s2 = 0.005;
     // Optional legacy six-axis filters. Hard wrench limits are always checked
     // against the unfiltered input before these values are used for control.
     bool legacy_wrench_filter_enabled = false;
@@ -73,17 +97,31 @@ struct Rm75ControlConfig {
     bool legacy_contact_roll_limits_enabled = true;
     double approach_speed_m_s = 0.0;
     double approach_direction_tool_z = 0.0;
-    // Contact-admittance Tool-Z speed limit, applied before the final XYZ
-    // vector safety envelope.
+    // Contact-admittance Tool-Z speed limit.
     double max_force_axis_speed_m_s = 0.005;
-    // Combined XYZ translation-speed limit. Simultaneous X/Z motion shares
-    // this vector envelope.
-    double max_linear_speed_m_s = 0.005;
     double max_angular_speed_rad_s = 2.0 * M_PI / 180.0;
 
-    double model_y_gain = 0.5;
+    // The current RM75 Tool-Y axis is opposite to the visual model's trained
+    // Y convention. Keep this sign explicit without changing raw Redis data.
+    double model_y_direction = -1.0;
+    // Proportional visual-error velocity gain: v_y = direction * gain * y.
+    // Units are 1/s, so the control-cycle displacement is v_y * cycle_s.
+    double model_y_velocity_gain_per_s = 0.5;
+    // Pause only Tool-Y reference integration when the real probe TCP falls
+    // behind the latest realized joint-model target. Hysteresis lets the arm
+    // catch up without repeatedly toggling at one threshold.
+    double visual_y_tracking_pause_error_m = 0.002;
+    double visual_y_tracking_resume_error_m = 0.001;
+    // The legacy rotation stage first scaled visual Y by 0.3. With the
+    // 0.5/s velocity gain this gives an effective 0.15/s in rotate-align.
+    double rotate_align_y_scale = 0.3;
     double model_rz_gain = 0.05;
     double contact_pitch_gain_rad_per_m = 0.0;
+    // Visual Tool-Y alignment remains blocked until the signed Tool-Z force
+    // has stayed at or below -visual_y_enable_force_n for the configured
+    // duration. This is independent from the tighter scan-ready force band.
+    double visual_y_enable_force_n = 2.0;
+    double visual_y_force_stable_duration_s = 0.5;
     // Coarse contact-force floor for allowing the scan-ready timer to run.
     double scan_start_force_n = 2.0;
     // Tool-X scanning starts only after the signed axial force remains within
@@ -94,6 +132,8 @@ struct Rm75ControlConfig {
     double maximum_scan_distance_m = 0.005;
     double scan_alignment_tolerance_m = 0.0008;
     double scan_direction_tool_x = -1.0;
+    double trigger_alignment_tolerance_m = 0.008;
+    double trigger_alignment_stable_duration_s = 0.4;
 
     // The controller pose describes Base -> Arm_Tip. Control increments use
     // the physical Tool frame, which is coincident with the force-sensor axes
@@ -112,6 +152,7 @@ struct Rm75ControlInput {
     Eigen::Matrix<double, 6, 1> compensated_wrench_tool =
         Eigen::Matrix<double, 6, 1>::Zero();
     Eigen::Vector3d contact_point_probe_m = Eigen::Vector3d::Zero();
+    double robot_model_position_error_m = 0.0;
     bool robot_valid = false;
     bool wrench_valid = false;
     bool contact_valid = false;
@@ -128,6 +169,9 @@ struct Rm75ControlOutput {
     Rm75SupervisorState state = Rm75SupervisorState::kInitializing;
     bool command_motion = false;
     bool request_retract = false;
+    bool target_force_unloading = false;
+    bool target_force_recovering = false;
+    bool visual_y_tracking_paused = false;
     bool completed = false;
     std::string completion_reason;
     std::string fault;
@@ -157,6 +201,10 @@ private:
     // action is explicitly disarmed/reset. Dropping below the entry threshold
     // must not restart fixed-speed approach into the same surface.
     bool contact_latched_ = false;
+    bool target_force_unloading_ = false;
+    bool target_force_release_pending_ = false;
+    bool target_force_recovering_ = false;
+    bool target_force_contact_reacquired_ = false;
     bool wrench_filter_initialized_ = false;
     Eigen::Matrix<double, 6, 1> filtered_wrench_ =
         Eigen::Matrix<double, 6, 1>::Zero();
@@ -166,14 +214,20 @@ private:
     Eigen::Vector3d filtered_contact_point_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d contact_filter_covariance_ = Eigen::Vector3d::Zero();
     double force_axis_velocity_m_s_ = 0.0;
+    double target_force_recovery_stable_time_s_ = 0.0;
     double contact_roll_velocity_rad_s_ = 0.0;
     double scan_distance_m_ = 0.0;
+    double visual_y_force_stable_time_s_ = 0.0;
     double scan_force_stable_time_s_ = 0.0;
+    double trigger_alignment_stable_time_s_ = 0.0;
+    bool force_settled_ = false;
+    bool visual_y_enabled_ = false;
+    bool visual_y_tracking_paused_ = false;
     bool scan_latched_ = false;
+    bool rotation_latched_ = false;
     int active_scan_phase_ = -1;
-    std::uint64_t active_correction_sequence_ =
+    std::uint64_t active_rz_sequence_ =
         std::numeric_limits<std::uint64_t>::max();
-    double remaining_model_y_m_ = 0.0;
     double remaining_model_rz_rad_ = 0.0;
 };
 

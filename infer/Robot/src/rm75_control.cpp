@@ -9,6 +9,12 @@ double Clamp(double value, double minimum, double maximum) {
     return std::max(minimum, std::min(maximum, value));
 }
 
+double MoveToward(double value, double target, double maximum_delta) {
+    if (value < target) return std::min(value + maximum_delta, target);
+    if (value > target) return std::max(value - maximum_delta, target);
+    return target;
+}
+
 bool Finite(const Eigen::Matrix<double, 6, 1>& value) {
     return value.array().isFinite().all();
 }
@@ -25,6 +31,13 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.torque_limit_nm,
         config.force_virtual_mass,
         config.force_virtual_damping,
+        config.target_force_unload_margin_n,
+        config.target_force_unload_speed_m_s,
+        config.target_force_unload_deceleration_band_n,
+        config.target_force_unload_stop_acceleration_m_s2,
+        config.target_force_reacquire_speed_m_s,
+        config.target_force_recovery_stable_duration_s,
+        config.max_force_axis_acceleration_m_s2,
         config.legacy_wrench_filter_measurement_noise,
         config.legacy_wrench_filter_process_noise,
         config.legacy_contact_filter_measurement_noise,
@@ -36,18 +49,25 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.approach_speed_m_s,
         config.approach_direction_tool_z,
         config.max_force_axis_speed_m_s,
-        config.max_linear_speed_m_s,
         config.max_angular_speed_rad_s,
-        config.model_y_gain,
+        config.model_y_direction,
+        config.model_y_velocity_gain_per_s,
+        config.visual_y_tracking_pause_error_m,
+        config.visual_y_tracking_resume_error_m,
+        config.rotate_align_y_scale,
         config.model_rz_gain,
         config.contact_pitch_gain_rad_per_m,
+        config.visual_y_enable_force_n,
+        config.visual_y_force_stable_duration_s,
         config.scan_start_force_n,
         config.scan_force_tolerance_n,
         config.scan_force_stable_duration_s,
         config.scan_speed_m_s,
         config.maximum_scan_distance_m,
         config.scan_alignment_tolerance_m,
-        config.scan_direction_tool_x};
+        config.scan_direction_tool_x,
+        config.trigger_alignment_tolerance_m,
+        config.trigger_alignment_stable_duration_s};
     for (double value : values) {
         if (!std::isfinite(value)) return false;
     }
@@ -83,6 +103,15 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.torque_limit_nm > 0.0
         && config.force_virtual_mass > 0.0
         && config.force_virtual_damping >= 0.0
+        && config.target_force_unload_margin_n >= 0.0
+        && config.target_force_unload_margin_n < config.force_limit_z_n
+        && config.target_force_unload_speed_m_s > 0.0
+        && config.target_force_unload_deceleration_band_n
+               >= config.target_force_unload_margin_n
+        && config.target_force_unload_stop_acceleration_m_s2 > 0.0
+        && config.target_force_reacquire_speed_m_s > 0.0
+        && config.target_force_recovery_stable_duration_s > 0.0
+        && config.max_force_axis_acceleration_m_s2 > 0.0
         && config.legacy_wrench_filter_measurement_noise > 0.0
         && config.legacy_wrench_filter_process_noise > 0.0
         && config.legacy_contact_filter_measurement_noise > 0.0
@@ -94,8 +123,17 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.approach_speed_m_s >= 0.0
         && std::abs(config.approach_direction_tool_z) <= 1.0
         && config.max_force_axis_speed_m_s > 0.0
-        && config.max_linear_speed_m_s > 0.0
         && config.max_angular_speed_rad_s > 0.0
+        && std::abs(std::abs(config.model_y_direction) - 1.0) <= 1e-12
+        && config.visual_y_tracking_pause_error_m > 0.0
+        && config.visual_y_tracking_resume_error_m >= 0.0
+        && config.visual_y_tracking_resume_error_m
+               < config.visual_y_tracking_pause_error_m
+        && config.rotate_align_y_scale >= 0.0
+        && config.rotate_align_y_scale <= 1.0
+        && config.visual_y_enable_force_n >= config.contact_threshold_n
+        && config.visual_y_enable_force_n <= config.force_limit_z_n
+        && config.visual_y_force_stable_duration_s > 0.0
         && config.scan_start_force_n >= config.contact_threshold_n
         && config.scan_start_force_n <= config.force_limit_z_n
         && config.scan_force_tolerance_n > 0.0
@@ -103,7 +141,9 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.scan_speed_m_s >= 0.0
         && config.maximum_scan_distance_m >= 0.0
         && config.scan_alignment_tolerance_m >= 0.0
-        && std::abs(config.scan_direction_tool_x) <= 1.0;
+        && std::abs(config.scan_direction_tool_x) <= 1.0
+        && config.trigger_alignment_tolerance_m >= 0.0
+        && config.trigger_alignment_stable_duration_s > 0.0;
 }
 
 Eigen::Matrix3d RotationFromEuler(const Eigen::Vector3d& euler) {
@@ -135,7 +175,10 @@ const char* ToString(Rm75SupervisorState state) {
         case Rm75SupervisorState::kArmed: return "armed";
         case Rm75SupervisorState::kApproach: return "approach";
         case Rm75SupervisorState::kContact: return "contact";
+        case Rm75SupervisorState::kForceSettle: return "force_settle";
         case Rm75SupervisorState::kScan: return "scan";
+        case Rm75SupervisorState::kTriggerAlign: return "trigger_align";
+        case Rm75SupervisorState::kRotateAlign: return "rotate_align";
         case Rm75SupervisorState::kHold: return "hold";
         case Rm75SupervisorState::kRetreat: return "retreat";
         case Rm75SupervisorState::kFault: return "fault";
@@ -148,6 +191,10 @@ Rm75ControlLaw::Rm75ControlLaw(Rm75ControlConfig config)
 
 void Rm75ControlLaw::Reset() {
     contact_latched_ = false;
+    target_force_unloading_ = false;
+    target_force_release_pending_ = false;
+    target_force_recovering_ = false;
+    target_force_contact_reacquired_ = false;
     wrench_filter_initialized_ = false;
     filtered_wrench_.setZero();
     wrench_filter_covariance_.setZero();
@@ -159,15 +206,25 @@ void Rm75ControlLaw::Reset() {
 
 void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     force_axis_velocity_m_s_ = 0.0;
+    target_force_unloading_ = false;
+    target_force_release_pending_ = false;
+    target_force_recovering_ = false;
+    target_force_contact_reacquired_ = false;
+    target_force_recovery_stable_time_s_ = 0.0;
     contact_roll_velocity_rad_s_ = 0.0;
     scan_distance_m_ = 0.0;
+    visual_y_force_stable_time_s_ = 0.0;
     scan_force_stable_time_s_ = 0.0;
+    trigger_alignment_stable_time_s_ = 0.0;
+    force_settled_ = false;
+    visual_y_enabled_ = false;
+    visual_y_tracking_paused_ = false;
     scan_latched_ = false;
+    rotation_latched_ = false;
     active_scan_phase_ = -1;
-    remaining_model_y_m_ = 0.0;
     remaining_model_rz_rad_ = 0.0;
     if (clear_command_memory) {
-        active_correction_sequence_ =
+        active_rz_sequence_ =
             std::numeric_limits<std::uint64_t>::max();
     }
 }
@@ -250,6 +307,13 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         ResetMotionState(false);
         return output;
     }
+    if (!std::isfinite(input.robot_model_position_error_m)
+        || input.robot_model_position_error_m < 0.0) {
+        output.state = Rm75SupervisorState::kFault;
+        output.fault = "robot_tracking_error_invalid";
+        ResetMotionState(false);
+        return output;
+    }
     if (!input.wrench_valid || !Finite(input.compensated_wrench_tool)) {
         output.state = Rm75SupervisorState::kHold;
         output.fault = "wrench_invalid_or_stale";
@@ -285,14 +349,73 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     if (!motion_armed) {
         output.state = Rm75SupervisorState::kObserve;
         contact_latched_ = false;
+        target_force_unloading_ = false;
+        target_force_release_pending_ = false;
+        target_force_recovering_ = false;
+        target_force_contact_reacquired_ = false;
         ResetMotionState(false);
         return output;
     }
-    if (intent.terminate || !intent.action_enabled) {
-        output.state = Rm75SupervisorState::kHold;
+
+    const double dt = config_.cycle_s;
+    const double requested_force = std::isfinite(intent.desired_force_n)
+        ? intent.desired_force_n
+        : config_.desired_force_n;
+    if (std::abs(force.z()) >= config_.contact_threshold_n) {
+        contact_latched_ = true;
+    }
+    const bool in_contact = contact_latched_;
+
+    // Target-relative unloading is an independent axial safety layer. It is
+    // evaluated before visual action/terminate gates so an idle or stale Redis
+    // command cannot prevent unloading a valid excessive contact force.
+    if (in_contact && config_.target_force_unload_enabled
+        && !target_force_unloading_
+        && force.z() <= requested_force
+                - config_.target_force_unload_margin_n) {
+        target_force_unloading_ = true;
+        target_force_release_pending_ = false;
+        target_force_recovering_ = false;
+        target_force_contact_reacquired_ = false;
+        target_force_recovery_stable_time_s_ = 0.0;
+        force_settled_ = false;
+        // Unloading invalidates the previous visual-Y force qualification.
+        // The probe must establish contact and pass the complete force gate
+        // again after braking before any lateral correction can resume.
+        visual_y_enabled_ = false;
+        visual_y_force_stable_time_s_ = 0.0;
+        visual_y_tracking_paused_ = true;
+        scan_force_stable_time_s_ = 0.0;
+        trigger_alignment_stable_time_s_ = 0.0;
+    } else if (target_force_unloading_) {
+        if (force.z() <= requested_force
+                - config_.target_force_unload_margin_n) {
+            // A renewed overload during braking returns directly to the
+            // force-dependent unloading profile.
+            target_force_release_pending_ = false;
+        } else if (force.z() >= requested_force) {
+            target_force_release_pending_ = true;
+        }
+    }
+
+    // Keep all lateral/angular gates closed throughout unloading, braking,
+    // contact reacquisition and force restoration.
+    const bool target_force_transition_active = target_force_unloading_
+        || target_force_recovering_;
+
+    // Idle/terminate may not interrupt an active -Tool-Z unloading or its
+    // zero-speed braking. It does, however, have priority over the subsequent
+    // +Tool-Z contact reacquisition: recovery is allowed only while move stays
+    // enabled. This prevents an idle Redis command from driving into contact.
+    if ((intent.terminate || !intent.action_enabled)
+        && !target_force_unloading_) {
+        output.state = Rm75SupervisorState::kArmed;
         output.completed = intent.terminate;
         if (intent.terminate) output.completion_reason = "terminate_requested";
         contact_latched_ = false;
+        target_force_unloading_ = false;
+        target_force_release_pending_ = false;
+        target_force_recovering_ = false;
         ResetMotionState(false);
         return output;
     }
@@ -309,108 +432,245 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         return output;
     }
 
-    const double dt = config_.cycle_s;
-    const double max_linear_step = config_.max_linear_speed_m_s * dt;
     const double max_angular_step = config_.max_angular_speed_rad_s * dt;
-    if (std::abs(force.z()) >= config_.contact_threshold_n) {
-        contact_latched_ = true;
-    }
-    const bool in_contact = contact_latched_;
-    if (intent.sequence != active_correction_sequence_) {
-        active_correction_sequence_ = intent.sequence;
-        remaining_model_y_m_ = config_.model_y_gain * intent.model_y_m;
+    if (intent.sequence != active_rz_sequence_) {
+        active_rz_sequence_ = intent.sequence;
+        // RZ remains a finite correction: a new command replaces any
+        // unfinished rotation and a repeated sequence only drains it.
         remaining_model_rz_rad_ =
             config_.model_rz_gain * intent.model_rz_deg * M_PI / 180.0;
     }
     double delta_z = 0.0;
-    const double requested_force = std::isfinite(intent.desired_force_n)
-        ? intent.desired_force_n
-        : config_.desired_force_n;
     if (in_contact) {
-        const double acceleration =
-            (force.z() - requested_force
-             - config_.force_virtual_damping * force_axis_velocity_m_s_)
-            / config_.force_virtual_mass;
-        force_axis_velocity_m_s_ = Clamp(
-            force_axis_velocity_m_s_ + acceleration * dt,
-            -config_.max_force_axis_speed_m_s,
-            config_.max_force_axis_speed_m_s);
+        if (target_force_unloading_) {
+            if (target_force_release_pending_) {
+                // Do not let a sensor sample crossing -3 N flip directly
+                // from retreat to positive admittance velocity. Brake to zero
+                // first; ordinary admittance starts on a later cycle.
+                force_axis_velocity_m_s_ = MoveToward(
+                    force_axis_velocity_m_s_, 0.0,
+                    config_.target_force_unload_stop_acceleration_m_s2 * dt);
+                if (std::abs(force_axis_velocity_m_s_) <= 1e-12) {
+                    force_axis_velocity_m_s_ = 0.0;
+                    target_force_unloading_ = false;
+                    target_force_release_pending_ = false;
+                    if (intent.action_enabled && !intent.terminate) {
+                        target_force_recovering_ = true;
+                        target_force_contact_reacquired_ = false;
+                        target_force_recovery_stable_time_s_ = 0.0;
+                    } else {
+                        // The overload has been released and braking reached
+                        // zero. Idle now takes effect immediately: cancel all
+                        // recovery memory and never issue a +Tool-Z step.
+                        output.state = Rm75SupervisorState::kArmed;
+                        output.completed = intent.terminate;
+                        if (intent.terminate) {
+                            output.completion_reason = "terminate_requested";
+                        }
+                        contact_latched_ = false;
+                        ResetMotionState(false);
+                        return output;
+                    }
+                }
+            } else {
+                // Approach is +Tool-Z on this installation, therefore
+                // unloading is -Tool-Z. Scale the maximum 0.5 cm/s retreat
+                // linearly down as the force approaches the requested target.
+                const double compressive_error_n =
+                    std::max(0.0, requested_force - force.z());
+                const double speed_scale = Clamp(
+                    compressive_error_n
+                        / config_.target_force_unload_deceleration_band_n,
+                    0.0, 1.0);
+                force_axis_velocity_m_s_ =
+                    -config_.target_force_unload_speed_m_s * speed_scale;
+            }
+        } else if (target_force_recovering_) {
+            if (std::abs(force.z()) < config_.contact_threshold_n) {
+                // The retreat detached the probe. Reacquire contact quickly
+                // with pure +Tool-Z; X/Y/RZ remain suppressed.
+                force_axis_velocity_m_s_ =
+                    config_.target_force_reacquire_speed_m_s;
+                target_force_contact_reacquired_ = false;
+                target_force_recovery_stable_time_s_ = 0.0;
+            } else {
+                // Contact is present again. Restore -3 N with the ordinary
+                // low-speed admittance and its acceleration limit.
+                if (!target_force_contact_reacquired_) {
+                    force_axis_velocity_m_s_ = 0.0;
+                    target_force_contact_reacquired_ = true;
+                }
+                const double acceleration =
+                    (force.z() - requested_force
+                     - config_.force_virtual_damping
+                           * force_axis_velocity_m_s_)
+                    / config_.force_virtual_mass;
+                const double desired_admittance_velocity_m_s = Clamp(
+                    force_axis_velocity_m_s_ + acceleration * dt,
+                    -config_.max_force_axis_speed_m_s,
+                    config_.max_force_axis_speed_m_s);
+                force_axis_velocity_m_s_ = MoveToward(
+                    force_axis_velocity_m_s_,
+                    desired_admittance_velocity_m_s,
+                    config_.max_force_axis_acceleration_m_s2 * dt);
+
+                const bool force_recovered =
+                    std::abs(force.z() - requested_force)
+                        <= config_.scan_force_tolerance_n;
+                target_force_recovery_stable_time_s_ = force_recovered
+                    ? target_force_recovery_stable_time_s_ + dt : 0.0;
+                if (target_force_recovery_stable_time_s_ + 1e-12
+                    >= config_.target_force_recovery_stable_duration_s) {
+                    target_force_recovering_ = false;
+                    target_force_contact_reacquired_ = false;
+                    target_force_recovery_stable_time_s_ = 0.0;
+                }
+            }
+        } else {
+            const double acceleration =
+                (force.z() - requested_force
+                 - config_.force_virtual_damping * force_axis_velocity_m_s_)
+                / config_.force_virtual_mass;
+            const double desired_admittance_velocity_m_s = Clamp(
+                force_axis_velocity_m_s_ + acceleration * dt,
+                -config_.max_force_axis_speed_m_s,
+                config_.max_force_axis_speed_m_s);
+            force_axis_velocity_m_s_ = MoveToward(
+                force_axis_velocity_m_s_, desired_admittance_velocity_m_s,
+                config_.max_force_axis_acceleration_m_s2 * dt);
+        }
         delta_z = force_axis_velocity_m_s_ * dt;
     } else {
+        target_force_unloading_ = false;
+        target_force_release_pending_ = false;
+        target_force_recovering_ = false;
+        target_force_contact_reacquired_ = false;
+        target_force_recovery_stable_time_s_ = 0.0;
         force_axis_velocity_m_s_ = 0.0;
         delta_z = config_.approach_direction_tool_z
             * config_.approach_speed_m_s * dt;
     }
 
-    double delta_x = 0.0;
     const bool scan_phase = intent.phase_index == 0 || intent.phase_index == 2;
-    if (!scan_phase) {
-        scan_distance_m_ = 0.0;
-        scan_force_stable_time_s_ = 0.0;
-        scan_latched_ = false;
-        active_scan_phase_ = -1;
-    } else {
-        if (active_scan_phase_ != intent.phase_index) {
-            active_scan_phase_ = intent.phase_index;
-            scan_distance_m_ = 0.0;
-            scan_force_stable_time_s_ = 0.0;
-            scan_latched_ = false;
+    const bool scan_alignment_ready =
+        std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m;
+    const bool visual_y_force_ready_sample = in_contact
+        && force.z() <= -config_.visual_y_enable_force_n;
+    if (target_force_transition_active) {
+        // Do not count force samples collected during retreat or zero-speed
+        // braking toward the next visual-Y enable window.
+        visual_y_enabled_ = false;
+        visual_y_force_stable_time_s_ = 0.0;
+    } else if (in_contact && !visual_y_enabled_) {
+        visual_y_force_stable_time_s_ = visual_y_force_ready_sample
+            ? visual_y_force_stable_time_s_ + dt : 0.0;
+        if (visual_y_force_stable_time_s_ + 1e-12
+            >= config_.visual_y_force_stable_duration_s) {
+            visual_y_enabled_ = true;
         }
-
-        const bool scan_alignment_ready =
-            std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m;
-        const bool scan_force_in_band = in_contact
-            && std::abs(force.z()) >= config_.scan_start_force_n
-            && std::abs(force.z() - requested_force)
-                   <= config_.scan_force_tolerance_n;
-        if (!scan_latched_) {
-            scan_force_stable_time_s_ = scan_alignment_ready
-                    && scan_force_in_band
-                ? scan_force_stable_time_s_ + dt : 0.0;
-            if (scan_force_stable_time_s_ + 1e-12
-                >= config_.scan_force_stable_duration_s) {
-                scan_latched_ = true;
-            }
-        }
-
-        // Once the force-settle gate has opened, keep scanning through small
-        // force fluctuations instead of alternating between X+Z and Z-only.
-        if (scan_latched_ && in_contact && scan_alignment_ready) {
-            double scan_step = config_.scan_speed_m_s * dt;
-            if (config_.maximum_scan_distance_m > 0.0) {
-                const double remaining = std::max(
-                    0.0, config_.maximum_scan_distance_m - scan_distance_m_);
-                constexpr double kScanCompletionToleranceM = 1e-12;
-                scan_step = remaining > kScanCompletionToleranceM
-                    ? std::min(scan_step, remaining) : 0.0;
-            }
-            delta_x = config_.scan_direction_tool_x * scan_step;
+    }
+    const bool force_in_settle_band = in_contact
+        && !target_force_transition_active
+        && std::abs(force.z()) >= config_.scan_start_force_n
+        && std::abs(force.z() - requested_force)
+               <= config_.scan_force_tolerance_n;
+    if (in_contact && !force_settled_) {
+        scan_force_stable_time_s_ = force_in_settle_band
+            ? scan_force_stable_time_s_ + dt : 0.0;
+        if (scan_force_stable_time_s_ + 1e-12
+            >= config_.scan_force_stable_duration_s) {
+            force_settled_ = true;
         }
     }
 
-    const double model_y_step = Clamp(remaining_model_y_m_,
-                                      -max_linear_step,
-                                      max_linear_step);
+    Rm75SupervisorState control_state = Rm75SupervisorState::kApproach;
+    if (in_contact) {
+        control_state = Rm75SupervisorState::kForceSettle;
+        if (force_settled_ && !target_force_transition_active) {
+            if (rotation_latched_) {
+                control_state = Rm75SupervisorState::kRotateAlign;
+            } else if (intent.phase_index == 1) {
+                trigger_alignment_stable_time_s_ =
+                    std::abs(intent.model_y_m)
+                            < config_.trigger_alignment_tolerance_m
+                    ? trigger_alignment_stable_time_s_ + dt : 0.0;
+                if (trigger_alignment_stable_time_s_ + 1e-12
+                    >= config_.trigger_alignment_stable_duration_s) {
+                    rotation_latched_ = true;
+                    control_state = Rm75SupervisorState::kRotateAlign;
+                } else {
+                    control_state = Rm75SupervisorState::kTriggerAlign;
+                }
+            } else {
+                trigger_alignment_stable_time_s_ = 0.0;
+                if (scan_phase && scan_alignment_ready) {
+                    control_state = Rm75SupervisorState::kScan;
+                }
+            }
+        }
+    } else {
+        visual_y_force_stable_time_s_ = 0.0;
+        scan_force_stable_time_s_ = 0.0;
+        trigger_alignment_stable_time_s_ = 0.0;
+        force_settled_ = false;
+        visual_y_enabled_ = false;
+        scan_latched_ = false;
+        rotation_latched_ = false;
+        active_scan_phase_ = -1;
+    }
+
+    scan_latched_ = control_state == Rm75SupervisorState::kScan;
+    active_scan_phase_ = scan_latched_ ? intent.phase_index : -1;
+    double delta_x = 0.0;
+    if (scan_latched_) {
+        double scan_step = config_.scan_speed_m_s * dt;
+        if (config_.maximum_scan_distance_m > 0.0) {
+            const double remaining = std::max(
+                0.0, config_.maximum_scan_distance_m - scan_distance_m_);
+            constexpr double kScanCompletionToleranceM = 1e-12;
+            scan_step = remaining > kScanCompletionToleranceM
+                ? std::min(scan_step, remaining) : 0.0;
+        }
+        delta_x = config_.scan_direction_tool_x * scan_step;
+    }
+
+    // Treat the visual Y value as the current alignment error, not as a
+    // displacement to accumulate once per Redis sequence. The proportional
+    // controller produces a velocity and integrates it over this cycle.
+    const double rotation_y_scale = rotation_latched_
+        ? config_.rotate_align_y_scale : 1.0;
+    const double model_y_velocity_m_s = config_.model_y_direction
+        * config_.model_y_velocity_gain_per_s
+        * rotation_y_scale * intent.model_y_m;
+    if (input.robot_model_position_error_m
+            >= config_.visual_y_tracking_pause_error_m) {
+        visual_y_tracking_paused_ = true;
+    } else if (input.robot_model_position_error_m
+                   <= config_.visual_y_tracking_resume_error_m) {
+        visual_y_tracking_paused_ = false;
+    }
+    output.visual_y_tracking_paused = visual_y_tracking_paused_;
+    const double model_y_step = visual_y_enabled_
+            && !target_force_transition_active
+            && !visual_y_tracking_paused_
+        ? model_y_velocity_m_s * dt
+        : 0.0;
     Eigen::Vector3d translation_delta;
     translation_delta << delta_x,
         model_y_step,
         delta_z;
-    if (translation_delta.norm() > max_linear_step) {
-        translation_delta *= max_linear_step / translation_delta.norm();
-    }
     if (in_contact) {
-        // Keep the admittance damping state consistent with the XYZ step that
-        // survives the combined Cartesian speed limit.
+        // Keep the admittance damping state consistent with the applied
+        // Tool-Z step.
         force_axis_velocity_m_s_ = translation_delta.z() / dt;
     }
-    remaining_model_y_m_ -= translation_delta.y();
-    if (scan_latched_ && in_contact
-        && std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m) {
+    if (scan_latched_) {
         scan_distance_m_ += std::abs(translation_delta.x());
     }
 
     double delta_roll = 0.0;
-    if (config_.legacy_contact_roll_enabled) {
+    if (config_.legacy_contact_roll_enabled
+        && !target_force_transition_active) {
         const double contact_y_m = output.filtered_contact_point_probe_m.y();
         if (contact_y_m == 0.0) {
             contact_roll_velocity_rad_s_ = 0.0;
@@ -436,15 +696,17 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         contact_roll_velocity_rad_s_ = 0.0;
     }
     double delta_pitch = 0.0;
-    if (input.contact_valid && std::isfinite(input.contact_point_probe_m.y())) {
+    if (!target_force_transition_active
+        && input.contact_valid
+        && std::isfinite(input.contact_point_probe_m.y())) {
         delta_pitch = Clamp(
             -config_.contact_pitch_gain_rad_per_m * input.contact_point_probe_m.y(),
             -max_angular_step,
             max_angular_step);
     }
-    double delta_rz = Clamp(remaining_model_rz_rad_,
-                            -max_angular_step,
-                            max_angular_step);
+    double delta_rz = control_state == Rm75SupervisorState::kRotateAlign
+        ? Clamp(remaining_model_rz_rad_, -max_angular_step, max_angular_step)
+        : 0.0;
     // Keep the ordinary pitch/RZ envelope available even when the explicitly
     // selected legacy contact-roll path is unbounded.
     const double combined_angular_step = std::sqrt(
@@ -490,10 +752,10 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     output.desired_pose.tail<3>() =
         EulerFromRotation(desired_rotation_base_from_pose);
     output.command_motion = output.requested_delta.cwiseAbs().maxCoeff() > 0.0;
-    output.state = in_contact
-        ? (scan_latched_ ? Rm75SupervisorState::kScan
-                         : Rm75SupervisorState::kContact)
-        : Rm75SupervisorState::kApproach;
+    output.target_force_unloading = target_force_unloading_;
+    output.target_force_recovering = target_force_recovering_
+        || (target_force_transition_active && !target_force_unloading_);
+    output.state = control_state;
     return output;
 }
 
