@@ -25,10 +25,17 @@ struct RedisBridgeConfig {
 
 struct RedisCommandSnapshot {
     ControlIntent intent;
+    // Redis v1 视觉协议的生产者身份与时间信息。入口日志和状态确认依赖
+    // 这些字段；旧协议消息保持 version=0、session 为空。
+    int protocol_version = 0;
+    std::string session_id;
     // Optional sequence supplied by a new producer. intent.sequence is
     // replaced by a bridge-local monotonic receive sequence before the
     // snapshot is published to the control loop.
     std::uint64_t producer_sequence = 0;
+    std::int64_t producer_timestamp_unix_ms = 0;
+    bool has_phase_confidence = false;
+    double phase_confidence = 0.0;
     std::uint64_t connection_generation = 0;
     std::int64_t received_timestamp_ns = 0;
     bool has_desired_force = false;
@@ -38,6 +45,15 @@ struct RedisCommandSnapshot {
     bool subscriber_connected = false;
     bool valid = false;
     std::string error;
+};
+
+struct RedisStatusContext {
+    std::string session_id;
+    std::uint64_t producer_sequence = 0;
+    int phase_index = -1;
+    double model_y_m = 0.0;
+    double model_rz_deg = 0.0;
+    double command_age_ms = 0.0;
 };
 
 struct RedisCommandDecision {
@@ -97,7 +113,8 @@ public:
                        const std::string& status,
                        const std::string& message,
                        const std::string& error_code,
-                       std::uint64_t command_sequence);
+                       std::uint64_t command_sequence,
+                       const RedisStatusContext& context = {});
 
     static bool ParseCommandJson(const std::string& payload,
                                  RedisCommandSnapshot& output,
@@ -116,7 +133,8 @@ public:
                                        const std::string& status,
                                        const std::string& message,
                                        const std::string& error_code,
-                                       std::uint64_t command_sequence);
+                                       std::uint64_t command_sequence,
+                                       const RedisStatusContext& context = {});
 
 private:
     struct PendingStatus {
@@ -125,6 +143,7 @@ private:
         std::string message;
         std::string error_code;
         std::uint64_t command_sequence = 0;
+        RedisStatusContext context;
     };
 
     void SubscriberLoop();

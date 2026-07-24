@@ -35,7 +35,8 @@ ServoJ planning in `rm75_control.cpp`, and Redis ownership in the final
 
 The original `main`/`main_nomove` and `robot_control` files are retained
 unchanged and are not used as the RM75 production entry. See
-[RM75 七轴系统迁移总进度](docs/rm75_progress.md) before any
+[RM75 七轴系统迁移总进度](docs/rm75_progress.md) and
+[RM75 学习路径](docs/rm75_learning_path.md) before any
 hardware run; use a current RM75 calibration and keep the physical emergency
 stop available for every command carrying `--execute`.
 

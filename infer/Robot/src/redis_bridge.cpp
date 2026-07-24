@@ -252,7 +252,8 @@ void RedisBridge::PublishStatus(Rm75SupervisorState state,
                                 const std::string& status,
                                 const std::string& message,
                                 const std::string& error_code,
-                                std::uint64_t command_sequence) {
+                                std::uint64_t command_sequence,
+                                const RedisStatusContext& context) {
     if (!config_.enabled) return;
     std::lock_guard<std::mutex> lock(publish_mutex_);
     if (!running_.load()) return;
@@ -260,7 +261,7 @@ void RedisBridge::PublishStatus(Rm75SupervisorState state,
         pending_statuses_.pop_front();
     }
     pending_statuses_.push_back(
-        {state, status, message, error_code, command_sequence});
+        {state, status, message, error_code, command_sequence, context});
     NotifyPublisherLocked();
 }
 
@@ -274,6 +275,41 @@ bool RedisBridge::ParseCommandJson(const std::string& payload,
         return false;
     }
     try {
+        if (input.contains("version")) {
+            if (!input["version"].is_number_integer()
+                || input["version"].get<int>() != 1) {
+                SetError(error, "unsupported command protocol version");
+                return false;
+            }
+            output.protocol_version = 1;
+            if (!input.contains("session_id") || !input["session_id"].is_string()
+                || input["session_id"].get<std::string>().empty()) {
+                SetError(error, "version-1 command requires session_id");
+                return false;
+            }
+            output.session_id = input["session_id"].get<std::string>();
+            if (!input.contains("timestamp_unix_ms")
+                || !input["timestamp_unix_ms"].is_number_integer()) {
+                SetError(error, "version-1 command requires timestamp_unix_ms");
+                return false;
+            }
+            output.producer_timestamp_unix_ms =
+                input["timestamp_unix_ms"].get<std::int64_t>();
+            if (input.contains("phase_confidence")) {
+                if (!input["phase_confidence"].is_number()) {
+                    SetError(error, "phase_confidence must be numeric");
+                    return false;
+                }
+                output.phase_confidence = input["phase_confidence"].get<double>();
+                if (!std::isfinite(output.phase_confidence)
+                    || output.phase_confidence < 0.0
+                    || output.phase_confidence > 1.0) {
+                    SetError(error, "phase_confidence is outside 0..1");
+                    return false;
+                }
+                output.has_phase_confidence = true;
+            }
+        }
         if (!input.contains("parameters") || !input["parameters"].is_object()) {
             SetError(error, "command has no parameters object");
             return false;
@@ -359,6 +395,10 @@ bool RedisBridge::ParseCommandJson(const std::string& payload,
                 }
                 intent.sequence = static_cast<std::uint64_t>(sequence);
             }
+        }
+        if (output.protocol_version == 1 && intent.sequence == 0) {
+            SetError(error, "version-1 command sequence must be positive");
+            return false;
         }
         output.intent = intent;
         output.producer_sequence = intent.sequence;
@@ -450,7 +490,8 @@ std::string RedisBridge::BuildStatusJson(Rm75SupervisorState state,
                                          const std::string& status,
                                          const std::string& message,
                                          const std::string& error_code,
-                                         std::uint64_t command_sequence) {
+                                         std::uint64_t command_sequence,
+                                         const RedisStatusContext& context) {
     json output;
     output["version"] = 1;
     output["status"] = status;
@@ -458,6 +499,12 @@ std::string RedisBridge::BuildStatusJson(Rm75SupervisorState state,
     output["state"] = ToString(state);
     output["error_code"] = error_code.empty() ? json(nullptr) : json(error_code);
     output["command_sequence"] = command_sequence;
+    output["session_id"] = context.session_id.empty()
+        ? json(nullptr) : json(context.session_id);
+    output["producer_sequence"] = context.producer_sequence;
+    output["phase_idx"] = context.phase_index;
+    output["parameters"] = {{"y", context.model_y_m}, {"rz", context.model_rz_deg}};
+    output["command_age_ms"] = context.command_age_ms;
     output["timestamp_unix_ms"] = UnixNowMs();
     return output.dump();
 }
@@ -654,7 +701,8 @@ void RedisBridge::PublisherLoop() {
                                 status.status,
                                 status.message,
                                 status.error_code,
-                                status.command_sequence));
+                                status.command_sequence,
+                                status.context));
         } else if (has_sensor) {
             items.emplace_back(config_.legacy_sensor_channel,
                                BuildLegacySensorJson(sensor));

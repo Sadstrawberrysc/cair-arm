@@ -99,6 +99,9 @@ struct Rm75ControlConfig {
     double approach_direction_tool_z = 0.0;
     // Contact-admittance Tool-Z speed limit.
     double max_force_axis_speed_m_s = 0.005;
+    // 视觉 rotate-align 的 Tool-RZ 使用独立速度上限，不与接触点驱动的
+    // Roll/Pitch 共用公共角速度包络。
+    double max_model_rz_speed_rad_s = 10.0 * M_PI / 180.0;
     double max_angular_speed_rad_s = 2.0 * M_PI / 180.0;
 
     // The current RM75 Tool-Y axis is opposite to the visual model's trained
@@ -128,7 +131,7 @@ struct Rm75ControlConfig {
     // this band around desired_force_n for scan_force_stable_duration_s.
     double scan_force_tolerance_n = 0.3;
     double scan_force_stable_duration_s = 0.5;
-    double scan_speed_m_s = 0.001;
+    double scan_speed_m_s = 1;
     double maximum_scan_distance_m = 0.005;
     double scan_alignment_tolerance_m = 0.0008;
     double scan_direction_tool_x = -1.0;

@@ -433,6 +433,8 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     }
 
     const double max_angular_step = config_.max_angular_speed_rad_s * dt;
+    const double max_model_rz_step =
+        config_.max_model_rz_speed_rad_s * dt;
     if (intent.sequence != active_rz_sequence_) {
         active_rz_sequence_ = intent.sequence;
         // RZ remains a finite correction: a new command replaces any
@@ -554,20 +556,15 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     const bool scan_phase = intent.phase_index == 0 || intent.phase_index == 2;
     const bool scan_alignment_ready =
         std::abs(intent.model_y_m) <= config_.scan_alignment_tolerance_m;
-    const bool visual_y_force_ready_sample = in_contact
-        && force.z() <= -config_.visual_y_enable_force_n;
     if (target_force_transition_active) {
-        // Do not count force samples collected during retreat or zero-speed
-        // braking toward the next visual-Y enable window.
+        // 超力卸载、制动和重新接触期间不允许横向视觉修正。
         visual_y_enabled_ = false;
         visual_y_force_stable_time_s_ = 0.0;
-    } else if (in_contact && !visual_y_enabled_) {
-        visual_y_force_stable_time_s_ = visual_y_force_ready_sample
-            ? visual_y_force_stable_time_s_ + dt : 0.0;
-        if (visual_y_force_stable_time_s_ + 1e-12
-            >= config_.visual_y_force_stable_duration_s) {
-            visual_y_enabled_ = true;
-        }
+    } else if (in_contact) {
+        // Tool-Y 居中不再等待 Fz<=-2 N 持续 0.5 s。接触判定一成立，
+        // 视觉 Y 就可立即开始校正；Tool-X 仍使用独立的稳定力启动门。
+        visual_y_enabled_ = true;
+        visual_y_force_stable_time_s_ = 0.0;
     }
     const bool force_in_settle_band = in_contact
         && !target_force_transition_active
@@ -705,19 +702,18 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
             max_angular_step);
     }
     double delta_rz = control_state == Rm75SupervisorState::kRotateAlign
-        ? Clamp(remaining_model_rz_rad_, -max_angular_step, max_angular_step)
+        ? Clamp(remaining_model_rz_rad_, -max_model_rz_step, max_model_rz_step)
         : 0.0;
-    // Keep the ordinary pitch/RZ envelope available even when the explicitly
-    // selected legacy contact-roll path is unbounded.
+    // 公共包络只约束接触点 Roll/Pitch；视觉 RZ 使用独立限速，避免较慢的
+    // 接触姿态修正把 rotate-align 的绕 Tool-Z 对齐一并拖慢。
     const double combined_angular_step = std::sqrt(
         (config_.legacy_contact_roll_limits_enabled
              ? delta_roll * delta_roll : 0.0)
-        + delta_pitch * delta_pitch + delta_rz * delta_rz);
+        + delta_pitch * delta_pitch);
     if (combined_angular_step > max_angular_step) {
         const double scale = max_angular_step / combined_angular_step;
         if (config_.legacy_contact_roll_limits_enabled) delta_roll *= scale;
         delta_pitch *= scale;
-        delta_rz *= scale;
     }
     remaining_model_rz_rad_ -= delta_rz;
 

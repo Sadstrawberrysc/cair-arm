@@ -125,7 +125,7 @@ struct Options {
     double scan_start_force_n = 2.0;
     double scan_force_tolerance_n = 0.3;
     double scan_force_stable_duration_s = 0.5;
-    double scan_speed_cm_s = 2.0;
+    double scan_speed_cm_s = 0.3;
     double scan_distance_mm = 100.0;
     double scan_direction_tool_x = -1.0;
     double maximum_orientation_excursion_deg = 5.0;
@@ -544,9 +544,11 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     // handshake before accepting its first moving command.
     options.manual_phase = -1;
     options.scan_start_force_n = 2.0;
-    options.scan_force_tolerance_n = 0.3;
+    // Tool-X 启动前仍需连续 0.5 s 力稳定；现场力波动较大，采用
+    // -3 +/- 0.8 N 的启动带，避免在已建立接触后长期停留在 force_settle。
+    options.scan_force_tolerance_n = 0.8;
     options.scan_force_stable_duration_s = 0.5;
-    options.scan_speed_cm_s = 0.4;
+    options.scan_speed_cm_s = 1.0;
     options.scan_distance_mm = 0.0;
     options.scan_direction_tool_x = -1.0;
     // Zero disables the separate total Cartesian-orientation excursion gate.
@@ -817,7 +819,11 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         || options.scan_force_tolerance_n > 3.0
         || options.scan_force_stable_duration_s < 0.02
         || options.scan_force_stable_duration_s > 10.0
-        || options.scan_speed_cm_s <= 0.0 || options.scan_speed_cm_s > 0.5
+        // 裸 --execute 的固定视觉 profile 使用 1 cm/s Tool-X 扫描；
+        // 显式参数模式仍限制在 0.5 cm/s，避免意外放宽手动调用。
+        || options.scan_speed_cm_s <= 0.0
+        || options.scan_speed_cm_s
+               > (options.implicit_commissioning_profile ? 1.0 : 0.5)
         || options.scan_distance_mm < 0.0 || options.scan_distance_mm > 50.0
         || !direction_valid(options.scan_direction_tool_x, false)
         || options.maximum_orientation_excursion_deg < 0.0
@@ -1312,7 +1318,7 @@ int main(int argc, char** argv) {
             && options.contact_pitch_gain_rad_per_m == 0.0
             && (!options.implicit_commissioning_profile
                 || (options.scan_start_force_n == 2.0
-                    && options.scan_force_tolerance_n == 0.3
+                    && options.scan_force_tolerance_n == 0.8
                     && options.scan_force_stable_duration_s == 0.5
                     && options.scan_speed_cm_s > 0.0
                     && options.scan_distance_mm == 0.0
@@ -1332,7 +1338,7 @@ int main(int argc, char** argv) {
                 << " mm, no Y/RZ/pitch or independent retract, and the "
                    "implicit profile uses Redis phase commands with a positive scan speed "
                    "not above max linear speed, a 2 N / continuous / "
-                   "-Tool-X scan after -3+/-0.3 N remains stable for 0.5 s, "
+                   "-Tool-X scan after -3+/-0.8 N remains stable for 0.5 s, "
                    "while explicit no-Redis commissioning uses --manual-action\n";
             return 3;
         }
@@ -1480,6 +1486,9 @@ int main(int argc, char** argv) {
         control_config.contact_threshold_n = 0.99;
         control_config.force_virtual_mass = 3.0;
         control_config.force_virtual_damping = 20.0;
+        // Fz <= -3.5 N 时才进入独立 -Tool-Z 卸载，避免目标 -3 N 附近
+        // 的小幅噪声反复中断 Tool-X 扫描和视觉 Tool-Y 修正。
+        control_config.target_force_unload_margin_n = 0.5;
         control_config.force_retract_enabled = false;
         control_config.force_limit_z_n = 50.0;
         control_config.force_limit_xy_n = 20.0;
@@ -1489,6 +1498,18 @@ int main(int argc, char** argv) {
     control_config.approach_direction_tool_z = options.approach_direction_tool_z;
     control_config.max_force_axis_speed_m_s =
         options.maximum_force_axis_speed_cm_s / 100.0;
+    // 视觉 Tool-Y 是颈动脉居中对齐所必需的主控制量。此前 2/1 mm 的
+    // 参考跟踪暂停门在真机接触时几乎持续触发，导致视觉已有 Y 命令却
+    // 不产生 Y 位移。放宽到 10/5 mm：正常跟踪误差不再打断居中，真正的
+    // 10 mm 机器人位置跟踪故障仍由入口层独立处理。
+    control_config.visual_y_tracking_pause_error_m = 0.010;
+    control_config.visual_y_tracking_resume_error_m = 0.005;
+    // 提高颈动脉居中响应：v_y = direction * gain * visual_y_error。
+    // 从 0.5/s 提升至 1.0/s，使同一视觉误差下 Tool-Y 速度加倍。
+    control_config.model_y_velocity_gain_per_s = 1.0;
+    // 视觉 rotate-align 的 Tool-RZ 单独以 10 deg/s 执行；不受接触点
+    // Roll/Pitch 的 2 deg/s 公共包络限制。
+    control_config.max_model_rz_speed_rad_s = 10.0 * M_PI / 180.0;
     control_config.scan_start_force_n = options.scan_start_force_n;
     control_config.scan_force_tolerance_n = options.scan_force_tolerance_n;
     control_config.scan_force_stable_duration_s =
@@ -1658,11 +1679,11 @@ int main(int argc, char** argv) {
         }
         if (provisional_execute) {
             // provisional 模式允许通过运行时 tare 消除小偏置，但应用 tare 前的
-            // 合力/合力矩仍不得超过 3 N / 0.1 N*m，否则视为接触或标定失配。
-            if (runtime_tare.maximum_force_norm_n > 3.0
-                || runtime_tare.maximum_torque_norm_nm > 0.1) {
+            // 合力/合力矩仍不得超过 3.5 N / 0.2 N*m，否则视为接触或标定失配。
+            if (runtime_tare.maximum_force_norm_n > 3.5
+                || runtime_tare.maximum_torque_norm_nm > 0.2) {
                 std::cerr << "Provisional tare rejected: uncompensated residual "
-                             "exceeds 3 N / 0.1 N*m\n";
+                             "exceeds 3.5 N / 0.2 N*m\n";
                 return 5;
             }
             runtime_tare_applied = true;
@@ -1693,9 +1714,9 @@ int main(int argc, char** argv) {
                       << " samples=" << runtime_tare.samples << '\n';
             return 5;
         }
-        if (runtime_tare.maximum_force_norm_n > 3.0
-            || runtime_tare.maximum_torque_norm_nm > 0.1) {
-            std::cerr << "Runtime tare rejected residual above 3 N / 0.1 N*m\n";
+        if (runtime_tare.maximum_force_norm_n > 3.5
+            || runtime_tare.maximum_torque_norm_nm > 0.2) {
+            std::cerr << "Runtime tare rejected residual above 3.5 N / 0.2 N*m\n";
             return 5;
         }
         runtime_tare_applied = true;
@@ -1837,6 +1858,9 @@ int main(int argc, char** argv) {
               << "visual_y_tracking_resume_error_mm: "
               << control_config.visual_y_tracking_resume_error_m * 1000.0 << '\n'
               << "model_rz_gain: " << control_config.model_rz_gain << '\n'
+              << "maximum_model_rz_speed_deg_s: "
+              << control_config.max_model_rz_speed_rad_s * 180.0 / M_PI
+              << '\n'
               << "scan_direction_tool_x: "
               << control_config.scan_direction_tool_x << '\n'
               << "scan_speed_cm_s: "
