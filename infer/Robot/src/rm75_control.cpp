@@ -49,11 +49,16 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.approach_speed_m_s,
         config.approach_direction_tool_z,
         config.max_force_axis_speed_m_s,
+        config.max_model_rz_speed_rad_s,
+        config.maximum_total_model_rz_rotation_rad,
         config.max_angular_speed_rad_s,
         config.model_y_direction,
         config.model_y_velocity_gain_per_s,
+        config.maximum_model_y_step_m,
         config.visual_y_tracking_pause_error_m,
         config.visual_y_tracking_resume_error_m,
+        config.visual_y_tracking_rebase_error_m,
+        config.visual_y_tracking_rebase_dominance_ratio,
         config.rotate_align_y_scale,
         config.model_rz_gain,
         config.contact_pitch_gain_rad_per_m,
@@ -123,12 +128,18 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.approach_speed_m_s >= 0.0
         && std::abs(config.approach_direction_tool_z) <= 1.0
         && config.max_force_axis_speed_m_s > 0.0
+        && config.max_model_rz_speed_rad_s > 0.0
+        && config.maximum_total_model_rz_rotation_rad > 0.0
         && config.max_angular_speed_rad_s > 0.0
         && std::abs(std::abs(config.model_y_direction) - 1.0) <= 1e-12
+        && config.maximum_model_y_step_m > 0.0
         && config.visual_y_tracking_pause_error_m > 0.0
         && config.visual_y_tracking_resume_error_m >= 0.0
         && config.visual_y_tracking_resume_error_m
                < config.visual_y_tracking_pause_error_m
+        && config.visual_y_tracking_rebase_error_m > 0.0
+        && config.visual_y_tracking_rebase_dominance_ratio > 0.0
+        && config.visual_y_tracking_rebase_dominance_ratio <= 1.0
         && config.rotate_align_y_scale >= 0.0
         && config.rotate_align_y_scale <= 1.0
         && config.visual_y_enable_force_n >= config.contact_threshold_n
@@ -223,6 +234,7 @@ void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     rotation_latched_ = false;
     active_scan_phase_ = -1;
     remaining_model_rz_rad_ = 0.0;
+    accumulated_model_rz_rotation_rad_ = 0.0;
     if (clear_command_memory) {
         active_rz_sequence_ =
             std::numeric_limits<std::uint64_t>::max();
@@ -308,7 +320,9 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         return output;
     }
     if (!std::isfinite(input.robot_model_position_error_m)
-        || input.robot_model_position_error_m < 0.0) {
+        || input.robot_model_position_error_m < 0.0
+        || !std::isfinite(input.robot_model_tool_y_error_m)
+        || input.robot_model_tool_y_error_m < 0.0) {
         output.state = Rm75SupervisorState::kFault;
         output.fault = "robot_tracking_error_invalid";
         ResetMotionState(false);
@@ -340,11 +354,20 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
 
     output.control_wrench_tool = FilterWrench(input.compensated_wrench_tool);
     const Eigen::Vector3d force = output.control_wrench_tool.head<3>();
-    const Eigen::Vector3d contact_measurement = input.contact_valid
-        ? input.contact_point_probe_m
-        : Eigen::Vector3d::Zero();
-    output.filtered_contact_point_probe_m =
-        FilterContactPoint(contact_measurement);
+    if (input.contact_valid) {
+        // 仅将真实有效的 STL 接触点送入 Kalman。新接触的第一帧会在
+        // FilterContactPoint 中直接初始化状态，避免继承上一接触面的坐标。
+        output.filtered_contact_point_probe_m =
+            FilterContactPoint(input.contact_point_probe_m);
+    } else {
+        // 无接触不是“接触点位于原点”。若把 [0,0,0] 作为测量值连续更新，
+        // 滤波状态会被错误拉向零，下一次接触时会产生很长的恢复滞后。
+        // 因此无有效接触时清除滤波器；输出零只表示“当前没有有效接触点”。
+        contact_filter_initialized_ = false;
+        filtered_contact_point_.setZero();
+        contact_filter_covariance_.setZero();
+        output.filtered_contact_point_probe_m.setZero();
+    }
 
     if (!motion_armed) {
         output.state = Rm75SupervisorState::kObserve;
@@ -561,9 +584,10 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         visual_y_enabled_ = false;
         visual_y_force_stable_time_s_ = 0.0;
     } else if (in_contact) {
-        // Tool-Y 居中不再等待 Fz<=-2 N 持续 0.5 s。接触判定一成立，
-        // 视觉 Y 就可立即开始校正；Tool-X 仍使用独立的稳定力启动门。
-        visual_y_enabled_ = true;
+        // 复现旧六轴的即时 Tool-Y 门：只有 |Fz|>2 N 才允许视觉Y。
+        // 不增加连续稳定计时；力降到门限及以下时立即关闭Y。
+        visual_y_enabled_ =
+            std::abs(force.z()) > config_.visual_y_enable_force_n;
         visual_y_force_stable_time_s_ = 0.0;
     }
     const bool force_in_settle_band = in_contact
@@ -594,6 +618,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
                 if (trigger_alignment_stable_time_s_ + 1e-12
                     >= config_.trigger_alignment_stable_duration_s) {
                     rotation_latched_ = true;
+                    accumulated_model_rz_rotation_rad_ = 0.0;
                     control_state = Rm75SupervisorState::kRotateAlign;
                 } else {
                     control_state = Rm75SupervisorState::kTriggerAlign;
@@ -614,6 +639,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         scan_latched_ = false;
         rotation_latched_ = false;
         active_scan_phase_ = -1;
+        accumulated_model_rz_rotation_rad_ = 0.0;
     }
 
     scan_latched_ = control_state == Rm75SupervisorState::kScan;
@@ -639,19 +665,38 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     const double model_y_velocity_m_s = config_.model_y_direction
         * config_.model_y_velocity_gain_per_s
         * rotation_y_scale * intent.model_y_m;
-    if (input.robot_model_position_error_m
+    if (input.robot_model_tool_y_error_m
             >= config_.visual_y_tracking_pause_error_m) {
         visual_y_tracking_paused_ = true;
-    } else if (input.robot_model_position_error_m
+    } else if (input.robot_model_tool_y_error_m
                    <= config_.visual_y_tracking_resume_error_m) {
         visual_y_tracking_paused_ = false;
     }
+    double model_y_step = 0.0;
+    if (visual_y_enabled_
+        && !target_force_transition_active
+        && !visual_y_tracking_paused_) {
+        const double requested_model_y_step = Clamp(
+            model_y_velocity_m_s * dt,
+            -config_.maximum_model_y_step_m,
+            config_.maximum_model_y_step_m);
+        // 预测式 Tool-Y 跟踪门控：不能只在上一周期的误差已经越界后
+        // 才暂停。若本周期候选步长会让实际 TCP 与 ServoJ 模型目标的
+        // Tool-Y 误差超过暂停门，只走完剩余裕量并立即锁存暂停。这样
+        // 持久参考轨迹不会因一个较大的视觉误差在单周期内跨过门限。
+        const double remaining_tracking_margin_m = std::max(
+            0.0,
+            config_.visual_y_tracking_pause_error_m
+                - input.robot_model_tool_y_error_m);
+        if (std::abs(requested_model_y_step) > remaining_tracking_margin_m) {
+            model_y_step = std::copysign(
+                remaining_tracking_margin_m, requested_model_y_step);
+            visual_y_tracking_paused_ = true;
+        } else {
+            model_y_step = requested_model_y_step;
+        }
+    }
     output.visual_y_tracking_paused = visual_y_tracking_paused_;
-    const double model_y_step = visual_y_enabled_
-            && !target_force_transition_active
-            && !visual_y_tracking_paused_
-        ? model_y_velocity_m_s * dt
-        : 0.0;
     Eigen::Vector3d translation_delta;
     translation_delta << delta_x,
         model_y_step,
@@ -695,15 +740,28 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     double delta_pitch = 0.0;
     if (!target_force_transition_active
         && input.contact_valid
-        && std::isfinite(input.contact_point_probe_m.y())) {
+        && std::isfinite(output.filtered_contact_point_probe_m.y())) {
+        // Roll 与 Pitch 必须使用同一份 Kalman 后接触点，避免原始接触点
+        // 的瞬时噪声绕过滤波器而直接形成 Pitch 姿态指令。
         delta_pitch = Clamp(
-            -config_.contact_pitch_gain_rad_per_m * input.contact_point_probe_m.y(),
+            -config_.contact_pitch_gain_rad_per_m
+                * output.filtered_contact_point_probe_m.y(),
             -max_angular_step,
             max_angular_step);
     }
     double delta_rz = control_state == Rm75SupervisorState::kRotateAlign
         ? Clamp(remaining_model_rz_rad_, -max_model_rz_step, max_model_rz_step)
         : 0.0;
+    if (control_state == Rm75SupervisorState::kRotateAlign) {
+        const double remaining_rotation_budget_rad = std::max(
+            0.0,
+            config_.maximum_total_model_rz_rotation_rad
+                - accumulated_model_rz_rotation_rad_);
+        if (std::abs(delta_rz) > remaining_rotation_budget_rad) {
+            delta_rz = std::copysign(remaining_rotation_budget_rad, delta_rz);
+        }
+        accumulated_model_rz_rotation_rad_ += std::abs(delta_rz);
+    }
     // 公共包络只约束接触点 Roll/Pitch；视觉 RZ 使用独立限速，避免较慢的
     // 接触姿态修正把 rotate-align 的绕 Tool-Z 对齐一并拖慢。
     const double combined_angular_step = std::sqrt(
@@ -716,6 +774,8 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         delta_pitch *= scale;
     }
     remaining_model_rz_rad_ -= delta_rz;
+    output.accumulated_model_rz_rotation_rad =
+        accumulated_model_rz_rotation_rad_;
 
     output.requested_delta << translation_delta.x(),
         translation_delta.y(), translation_delta.z(),

@@ -9,16 +9,21 @@
 
 #include <realman_kinematics.hpp>
 
+// 控制状态机：由 Rm75ControlLaw::Step 在每个 20 ms 周期更新。
 enum class Rm75SupervisorState {
+    // 初始化/仅观测/已握手但静止。
     kInitializing,
     kObserve,
     kArmed,
+    // 悬空接近、已检测到接触、将轴向力稳定到目标附近。
     kApproach,
     kContact,
     kForceSettle,
+    // Tool-X 扫描、Trigger 横向对齐、锁存后的 RZ 旋转对齐。
     kScan,
     kTriggerAlign,
     kRotateAlign,
+    // Redis 命令失效时保持、固定阈值回退、不可恢复故障。
     kHold,
     kRetreat,
     kFault,
@@ -27,141 +32,159 @@ enum class Rm75SupervisorState {
 const char* ToString(Rm75SupervisorState state);
 
 struct ControlIntent {
+    // 视觉端预测的横向误差（m）和绕 Tool-Z 的角误差（deg）。
     double model_y_m = 0.0;
     double model_rz_deg = 0.0;
+    // 本周期目标轴向力，压向组织的约定符号为负。
     double desired_force_n = -1.0;
+    // 视觉阶段：-1 未指定，0 Scan，1 Trigger，2 Action。
     int phase_index = -1;
+    // true 允许接近/力控；terminate 仅结束本轮，回到 Armed，不退出进程。
     bool action_enabled = false;
     bool terminate = false;
+    // Redis 的单调命令序号，用于避免重复累计 RZ 命令。
     std::uint64_t sequence = 0;
 };
 
 struct Rm75ControlConfig {
-    double cycle_s = 0.020;
-    double desired_force_n = -1.0;
-    double contact_threshold_n = 0.8;
-    double force_limit_xy_n = 20.0;
-    // Optional RM75 commissioning retreat. Disabled for the legacy six-axis
-    // axial-admittance path, where overload unloading comes from the same
-    // force-error equation as normal contact motion.
-    bool force_retract_enabled = false;
-    // Enter a controlled tool-Z unloading retreat at this axial magnitude.
-    // force_limit_z_n remains the independent hard-stop threshold.
-    double force_retract_threshold_z_n = 20.0;
-    // Return from the dedicated retreat to normal admittance control after
-    // unloading below this magnitude. It must remain above the force target
-    // and below force_retract_threshold_z_n to provide hysteresis.
-    double force_retract_release_z_n = 1.2;
-    double force_limit_z_n = 20.0;
-    double torque_limit_nm = 4.0;
+    // RM75 生产闭环的控制参数集中在本结构中。main_rm75 只注入本次
+    // 标定得到的 Tool/TCP 坐标关系，不再逐项覆盖这些算法参数。
+    // ===== 1. 控制周期、接触门与 wrench 安全门 =====
+    double cycle_s = 0.020;                 // 主控制周期（s）
+    // 目标 Tool-Z 力（N）；负号表示压向组织。
+    double desired_force_n = -3.0;
+    // |Fz| 达到该值后锁存“已接触”（N）。
+    double contact_threshold_n = 0.99;
+    // 补偿后 Tool-X/Y 与 Tool-Z 的独立力门（N）。
+    double force_limit_xy_n = 50.0;
+    // 旧式固定阈值回退。当前生产力控使用下方“相对目标力卸载”，默认关闭。
+    bool force_retract_enabled = false;     // 是否启用旧式固定阈值回退
+    // 轴向力达到此值时进入固定阈值卸载；独立硬门仍由 force_limit_z_n 控制。
+    double force_retract_threshold_z_n = 20.0; // 固定阈值回退进入力（N）
+    // 卸载至该值以下回到普通导纳；应高于目标力且低于进入阈值，形成滞回。
+    double force_retract_release_z_n = 1.2; // 固定阈值回退释放力（N）
+    double force_limit_z_n = 50.0;          // 补偿后 Tool-Z 硬门（N）
+    double torque_limit_nm = 5.0;           // 补偿后 Tx/Ty/Tz 硬门（N·m）
 
+    // ===== 2. Tool-Z 导纳、超力卸载与重新接触 =====
+    // 导纳模型 M*a + D*v = F_target - F_measured 的虚拟质量/阻尼。
     double force_virtual_mass = 3.0;
-    double force_virtual_damping = 20.0;
-    // Target-relative overload unloading. When the signed Tool-Z force is
-    // more compressive than desired_force_n by this margin, suspend lateral
-    // and angular motion and command a force-dependent -Tool-Z retreat.
-    bool target_force_unload_enabled = true;
-    double target_force_unload_margin_n = 0.1;
-    // Maximum overload-unloading speed. It is reached when the compressive
-    // force error is at least target_force_unload_deceleration_band_n and
-    // decreases linearly to zero as the force returns to its target.
-    double target_force_unload_speed_m_s = 0.005;
-    double target_force_unload_deceleration_band_n = 1.0;
-    // After the measured force reaches the target, brake the remaining
-    // negative Tool-Z velocity to zero before ordinary admittance resumes.
-    double target_force_unload_stop_acceleration_m_s2 = 0.025;
-    // After braking, reacquire lost contact with pure +Tool-Z motion only while
-    // action remains enabled. Idle cancels recovery at zero Z velocity; when
-    // moving, lateral motion stays disabled while admittance restores force.
-    double target_force_reacquire_speed_m_s = 0.005;
-    double target_force_recovery_stable_duration_s = 0.5;
-    // Limit normal admittance velocity changes so recovery from zero cannot
-    // reverse direction at the full force-axis speed in one 20 ms cycle.
-    double max_force_axis_acceleration_m_s2 = 0.005;
-    // Optional legacy six-axis filters. Hard wrench limits are always checked
-    // against the unfiltered input before these values are used for control.
-    bool legacy_wrench_filter_enabled = false;
-    double legacy_wrench_filter_measurement_noise = 0.0002;
-    double legacy_wrench_filter_process_noise = 0.000001;
-    bool legacy_contact_filter_enabled = false;
-    double legacy_contact_filter_measurement_noise = 0.0002;
-    double legacy_contact_filter_process_noise = 0.0000005;
+    double force_virtual_damping = 10.0;
+    // 相对目标力的超力卸载：额外压入超过该裕量时，暂停横向/角运动并执行 -Tool-Z。
+    bool target_force_unload_enabled = true; // 是否启用相对目标力的卸载层
+    // Fz 比目标力额外压入该值时启动 -Tool-Z 卸载（N）。
+    double target_force_unload_margin_n = 0.5;
+    // 超力误差达到减速力带时的最大卸载速度；回到目标力时线性降至零。
+    double target_force_unload_speed_m_s = 0.01; // 最大卸载速度（m/s）
+    double target_force_unload_deceleration_band_n = 1.0; // 卸载减速力带（N）
+    // 力回到目标后，先将残余 -Tool-Z 速度制动至零，再恢复普通导纳。
+    double target_force_unload_stop_acceleration_m_s2 = 0.05; // 卸载制动加速度（m/s²）
+    // 制动后仅在 action 仍开启时，以纯 +Tool-Z 重接触；idle 时取消恢复并保持 Z 零速。
+    double target_force_reacquire_speed_m_s = 0.005; // 失去接触后的 +Tool-Z 重接近速度
+    double target_force_recovery_stable_duration_s = 0.5; // 恢复普通导纳前稳定时间
+    // 限制普通导纳的速度变化，避免恢复时在单周期内以最大速度直接反向。
+    double max_force_axis_acceleration_m_s2 = 0.01; // 普通导纳 Tool-Z 速度变化上限
 
-    // The legacy variable named delta_ry was composed as a tool-X rotation.
-    // Preserve that effective behavior rather than the misleading old name.
-    bool legacy_contact_roll_enabled = false;
-    double legacy_contact_roll_virtual_mass = 2.0;
-    double legacy_contact_roll_virtual_damping = 10.0;
-    double legacy_contact_roll_scale = 1.5;
-    double legacy_contact_roll_max_velocity_rad_s = 1.0;
-    bool legacy_contact_roll_limits_enabled = true;
-    double approach_speed_m_s = 0.0;
-    double approach_direction_tool_z = 0.0;
-    // Contact-admittance Tool-Z speed limit.
-    double max_force_axis_speed_m_s = 0.005;
+    // ===== 3. wrench/contact Kalman 与接触点驱动姿态 =====
+    // 旧六轴滤波器。硬 wrench 门始终先检查未滤波输入，再将结果用于控制。
+    bool legacy_wrench_filter_enabled = true; // 对补偿 wrench 做 Kalman 平滑
+    double legacy_wrench_filter_measurement_noise = 0.0002; // wrench Kalman 测量噪声 R
+    double legacy_wrench_filter_process_noise = 0.000001;   // wrench Kalman 过程噪声 Q
+    bool legacy_contact_filter_enabled = true; // 对 STL 接触点做 Kalman 平滑
+    double legacy_contact_filter_measurement_noise = 0.0002; // contact Kalman 测量噪声 R
+    double legacy_contact_filter_process_noise = 0.0000005;  // contact Kalman 过程噪声 Q
+
+    // 旧变量 delta_ry 实际合成为 Tool-X/Roll 旋转，沿用其有效物理含义。
+    bool legacy_contact_roll_enabled = true; // 接触点偏移驱动 Tool-X/Roll 姿态导纳
+    double legacy_contact_roll_virtual_mass = 2.0; // 接触 Roll 导纳虚拟质量
+    double legacy_contact_roll_virtual_damping = 10.0; // 接触 Roll 导纳阻尼
+    double legacy_contact_roll_scale = 1.5; // 旧 delta_ry 到 Tool-X/Roll 的比例
+    double legacy_contact_roll_max_velocity_rad_s = 1.0; // Roll 导纳速度上限
+    bool legacy_contact_roll_limits_enabled = true; // 是否再受公共角速度限制
+
+    // ===== 4. 悬空接近、接触后 Tool-Z 与角速度 =====
+    // 悬空接近使用 +Tool-Z 1 cm/s；接触后切换到下方的导纳速度上限。
+    double approach_speed_m_s = 0.020;
+    double approach_direction_tool_z = 1.0;
+    // 接触导纳的 Tool-Z 速度上限。
+    double max_force_axis_speed_m_s = 0.002; // 普通接触导纳 Tool-Z 最大速度
     // 视觉 rotate-align 的 Tool-RZ 使用独立速度上限，不与接触点驱动的
     // Roll/Pitch 共用公共角速度包络。
-    double max_model_rz_speed_rad_s = 10.0 * M_PI / 180.0;
-    double max_angular_speed_rad_s = 2.0 * M_PI / 180.0;
+    double max_model_rz_speed_rad_s = 10.0 * M_PI / 180.0; // 视觉 Tool-RZ 最大速度
+    // Trigger 锁存 rotate-align 后，按每周期实际执行的 |delta_rz| 累计。
+    // 达到该额度后只停止 Tool-RZ，其他平移和力控维度继续运行。
+    double maximum_total_model_rz_rotation_rad = 120.0 * M_PI / 180.0; // Trigger 后累计 RZ 额度
+    double max_angular_speed_rad_s = 2.0 * M_PI / 180.0; // 接触 Roll/Pitch 公共角速度上限
 
-    // The current RM75 Tool-Y axis is opposite to the visual model's trained
-    // Y convention. Keep this sign explicit without changing raw Redis data.
-    double model_y_direction = -1.0;
-    // Proportional visual-error velocity gain: v_y = direction * gain * y.
-    // Units are 1/s, so the control-cycle displacement is v_y * cycle_s.
-    double model_y_velocity_gain_per_s = 0.5;
-    // Pause only Tool-Y reference integration when the real probe TCP falls
-    // behind the latest realized joint-model target. Hysteresis lets the arm
-    // catch up without repeatedly toggling at one threshold.
-    double visual_y_tracking_pause_error_m = 0.002;
-    double visual_y_tracking_resume_error_m = 0.001;
-    // The legacy rotation stage first scaled visual Y by 0.3. With the
-    // 0.5/s velocity gain this gives an effective 0.15/s in rotate-align.
-    double rotate_align_y_scale = 0.3;
-    double model_rz_gain = 0.05;
-    double contact_pitch_gain_rad_per_m = 0.0;
-    // Visual Tool-Y alignment remains blocked until the signed Tool-Z force
-    // has stayed at or below -visual_y_enable_force_n for the configured
-    // duration. This is independent from the tighter scan-ready force band.
-    double visual_y_enable_force_n = 2.0;
-    double visual_y_force_stable_duration_s = 0.5;
-    // Coarse contact-force floor for allowing the scan-ready timer to run.
-    double scan_start_force_n = 2.0;
-    // Tool-X scanning starts only after the signed axial force remains within
-    // this band around desired_force_n for scan_force_stable_duration_s.
-    double scan_force_tolerance_n = 0.3;
-    double scan_force_stable_duration_s = 0.5;
-    double scan_speed_m_s = 1;
-    double maximum_scan_distance_m = 0.005;
-    double scan_alignment_tolerance_m = 0.0008;
-    double scan_direction_tool_x = -1.0;
-    double trigger_alignment_tolerance_m = 0.008;
-    double trigger_alignment_stable_duration_s = 0.4;
+    // ===== 5. 视觉 Tool-Y 居中 =====
+    // 当前 RM75 Tool-Y 与视觉模型训练时的 Y 方向相反；用此符号显式转换。
+    double model_y_direction = -1.0; // 视觉 y 到实际 Tool-Y 的符号映射
+    // 比例速度律：v_y = direction × gain × y；每周期位移为 v_y × cycle_s。
+    // 旧六轴 Tool-Y 速度的 2/25：
+    // v_y = (2/25 * 0.5 / 0.02) * visual_y_error = 2 /s * error。
+    double model_y_velocity_gain_per_s = 2.0;
+    // 旧六轴横向单周期步长上限，转换为当前速度控制形式后仍保留。
+    double maximum_model_y_step_m = 0.0016; // 单周期 Tool-Y 最大步长（m）
+    // 实际探头 TCP 沿 Tool-Y 落后于最新 ServoJ 模型目标时，仅暂停 Y 参考积分；
+    // 暂停/恢复使用滞回，给机械臂追赶时间并避免阈值附近反复切换。
+    double visual_y_tracking_pause_error_m = 0.020; // 实际 TCP 落后该 Tool-Y 误差时暂停积分
+    double visual_y_tracking_resume_error_m = 0.010; // 落后回到该值以下时恢复积分
+    // 若跟踪丢失主要来自 Tool-Y，可在达到全局故障前按实际反馈重置笛卡尔/关节参考；
+    // 其他方向的跟踪故障仍会终止运行。
+    double visual_y_tracking_rebase_error_m = 0.015; // Tool-Y 主导误差达到该值时重置参考
+    double visual_y_tracking_rebase_dominance_ratio = 0.8; // Tool-Y 在总误差中的最小占比
+    // 旧六轴旋转阶段先将视觉 Y 修正缩放为 0.3 倍。
+    double rotate_align_y_scale = 0.3; // rotate-align 阶段的 Tool-Y 速度缩放
+    double model_rz_gain = 0.05; // 视觉 rz（deg）到本周期 RZ 修正的比例
+    double contact_pitch_gain_rad_per_m = 0.0; // 保留的接触点 Pitch 增益，0 为关闭
+    // 视觉 Tool-Y 使用旧六轴的瞬时力门：|Fz| 必须超过设定值。
+    double visual_y_enable_force_n = 2.0; // |Fz| 超过该值后允许视觉 Tool-Y
+    // 为配置/日志兼容保留；当前瞬时 Tool-Y 力门不累计该时长。
+    double visual_y_force_stable_duration_s = 0.5; // 仅保留给日志/兼容，不参与当前门控
 
-    // The controller pose describes Base -> Arm_Tip. Control increments use
-    // the physical Tool frame, which is coincident with the force-sensor axes
-    // on the current installation. This fixed rotation maps Tool vectors into
-    // Arm_Tip coordinates before composing a controller pose target.
+    // ===== 6. Tool-X 扫描与 Trigger/RZ 对齐状态机 =====
+    // 扫描准备计时可启动的最低接触力。
+    double scan_start_force_n = 2.0; // 扫描稳定计时的最低 |Fz|（N）
+    // 轴向力在目标力附近的该误差带内连续保持设定时间后，才开始 Tool-X 扫描。
+    double scan_force_tolerance_n = 0.8; // 相对目标力的扫描允许误差带（N）
+    double scan_force_stable_duration_s = 0.5; // 力需连续稳定的时间（s）
+    double scan_speed_m_s = 0.010; // Tool-X 扫描速度（m/s）
+    // 0 表示 Tool-X 扫描连续运行，终止由视觉 terminate、Ctrl+C 或故障决定。
+    double maximum_scan_distance_m = 0.0;
+    double scan_alignment_tolerance_m = 0.0008; // 允许扫描的 |视觉 Y| 阈值（m）
+    double scan_direction_tool_x = -1.0; // 扫描方向，通常为 -Tool-X
+    double trigger_alignment_tolerance_m = 0.008; // Trigger 阶段允许的 |视觉 Y| 阈值
+    double trigger_alignment_stable_duration_s = 0.4; // Trigger 对齐锁存前稳定时间
+
+    // ===== 7. Base → Arm_Tip → Tool/Sensor → Probe TCP 坐标链 =====
+    // 控制器位姿表示 Base → Arm_Tip；控制增量定义在当前与传感器重合的 Tool 坐标。
+    // 该固定旋转把 Tool 向量映射到 Arm_Tip 后，再合成控制器目标位姿。
     Eigen::Matrix3d rotation_pose_from_tool = Eigen::Matrix3d::Identity();
-    // Position of the configured probe TCP expressed in physical Tool axes.
-    // The current installation assumes coincident Arm_Tip/Tool origins; their
-    // axes may differ by rotation_pose_from_tool.
+    // 探头 TCP 在物理 Tool 坐标中的位置。当前假定 Arm_Tip 与 Tool 原点重合，
+    // 坐标轴差异由 rotation_pose_from_tool 表示。
     Eigen::Vector3d probe_tcp_tool_m = Eigen::Vector3d::Zero();
 };
 
 struct Rm75ControlInput {
+    // 当前“理想笛卡尔参考”位姿，格式 [x,y,z,rx,ry,rz]，位置 m、角度 rad。
     Eigen::Matrix<double, 6, 1> current_pose =
         Eigen::Matrix<double, 6, 1>::Zero();
+    // 已完成偏置、重力、质心和 tare 补偿，并表达在 Tool/Sensor 的 wrench。
     Eigen::Matrix<double, 6, 1> compensated_wrench_tool =
         Eigen::Matrix<double, 6, 1>::Zero();
+    // STL 估计的接触点，相对 Probe TCP 的 Tool/Sensor 坐标（m）。
     Eigen::Vector3d contact_point_probe_m = Eigen::Vector3d::Zero();
     double robot_model_position_error_m = 0.0;
-    bool robot_valid = false;
-    bool wrench_valid = false;
-    bool contact_valid = false;
+    // 实际 TCP 对模型目标的 Tool-Y 投影误差；X/Z 误差不会阻塞 Y 对齐。
+    double robot_model_tool_y_error_m = 0.0;
+    bool robot_valid = false;   // 最新机器人状态是否可用
+    bool wrench_valid = false;  // 最新补偿 wrench 是否可用
+    bool contact_valid = false; // 本周期接触点估计是否有效
 };
 
 struct Rm75ControlOutput {
+    // `desired_pose` 是送往 IK 的 Base→Arm_Tip 绝对目标；`requested_delta`
+    // 是本周期在 Tool 坐标下请求的 [dx,dy,dz,droll,dpitch,drz]。
     Eigen::Matrix<double, 6, 1> desired_pose =
         Eigen::Matrix<double, 6, 1>::Zero();
     Eigen::Matrix<double, 6, 1> requested_delta =
@@ -170,18 +193,19 @@ struct Rm75ControlOutput {
         Eigen::Matrix<double, 6, 1>::Zero();
     Eigen::Vector3d filtered_contact_point_probe_m = Eigen::Vector3d::Zero();
     Rm75SupervisorState state = Rm75SupervisorState::kInitializing;
-    bool command_motion = false;
-    bool request_retract = false;
-    bool target_force_unloading = false;
-    bool target_force_recovering = false;
-    bool visual_y_tracking_paused = false;
-    bool completed = false;
+    bool command_motion = false; // 是否需要规划并提交新的 ServoJ 目标
+    bool request_retract = false; // 请求旧式固定阈值回退
+    bool target_force_unloading = false; // 当前是否在超力卸载
+    bool target_force_recovering = false; // 当前是否在卸载后的制动/重新接触
+    bool visual_y_tracking_paused = false; // Tool-Y 是否因实际落后而暂停
+    double accumulated_model_rz_rotation_rad = 0.0; // Trigger 后已执行的累计 RZ
+    bool completed = false; // 本轮是否正常结束（terminate 或扫描里程结束）
     std::string completion_reason;
     std::string fault;
 };
 
-// Deterministic Cartesian control law. It never communicates with hardware;
-// its output must still pass through the RM75 joint/singularity safety layer.
+// 确定性的笛卡尔控制律：不直接访问硬件，只输出状态机与笛卡尔目标；输出仍须
+// 经过 Rm75ServoPlanner 的关节限位、速度和奇异性检查后才能发送 ServoJ。
 class Rm75ControlLaw {
 public:
     explicit Rm75ControlLaw(Rm75ControlConfig config = {});
@@ -199,15 +223,14 @@ private:
     Eigen::Vector3d FilterContactPoint(const Eigen::Vector3d& point);
 
     Rm75ControlConfig config_;
-    bool config_valid_ = false;
-    // Once force contact is detected, remain in admittance control until the
-    // action is explicitly disarmed/reset. Dropping below the entry threshold
-    // must not restart fixed-speed approach into the same surface.
+    bool config_valid_ = false; // 构造时检查参数范围后的结果
+    // 一旦检测到力接触，保持导纳状态直至显式 idle/reset；力暂时低于接触门时，
+    // 不得重新以固定速度撞向同一表面。
     bool contact_latched_ = false;
-    bool target_force_unloading_ = false;
-    bool target_force_release_pending_ = false;
-    bool target_force_recovering_ = false;
-    bool target_force_contact_reacquired_ = false;
+    bool target_force_unloading_ = false; // 相对目标力卸载状态
+    bool target_force_release_pending_ = false; // 达到释放力后等待制动完成
+    bool target_force_recovering_ = false; // 制动/重新接触阶段
+    bool target_force_contact_reacquired_ = false; // 重新满足接触门
     bool wrench_filter_initialized_ = false;
     Eigen::Matrix<double, 6, 1> filtered_wrench_ =
         Eigen::Matrix<double, 6, 1>::Zero();
@@ -216,28 +239,28 @@ private:
     bool contact_filter_initialized_ = false;
     Eigen::Vector3d filtered_contact_point_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d contact_filter_covariance_ = Eigen::Vector3d::Zero();
-    double force_axis_velocity_m_s_ = 0.0;
+    double force_axis_velocity_m_s_ = 0.0; // Tool-Z 导纳当前内部速度
     double target_force_recovery_stable_time_s_ = 0.0;
     double contact_roll_velocity_rad_s_ = 0.0;
-    double scan_distance_m_ = 0.0;
+    double scan_distance_m_ = 0.0; // 已累计的 Tool-X 扫描距离
     double visual_y_force_stable_time_s_ = 0.0;
     double scan_force_stable_time_s_ = 0.0;
     double trigger_alignment_stable_time_s_ = 0.0;
-    bool force_settled_ = false;
-    bool visual_y_enabled_ = false;
-    bool visual_y_tracking_paused_ = false;
-    bool scan_latched_ = false;
-    bool rotation_latched_ = false;
+    bool force_settled_ = false; // 是否已满足扫描前力稳定带
+    bool visual_y_enabled_ = false; // 当前是否允许视觉 Tool-Y
+    bool visual_y_tracking_paused_ = false; // Tool-Y 跟踪滞后暂停锁存
+    bool scan_latched_ = false; // 扫描阶段锁存
+    bool rotation_latched_ = false; // Trigger 后 rotate-align 锁存
     int active_scan_phase_ = -1;
     std::uint64_t active_rz_sequence_ =
         std::numeric_limits<std::uint64_t>::max();
     double remaining_model_rz_rad_ = 0.0;
+    double accumulated_model_rz_rotation_rad_ = 0.0;
 };
 
-// Seven-axis Cartesian-to-joint planner. It shares this module with the
-// deterministic control law, matching the original robot_control boundary:
-// control produces a Cartesian target and the planner applies RM75 joint,
-// acceleration and singularity constraints before any ServoJ submission.
+// ===== 七轴数值 IK 与 ServoJ 规划模块 =====
+// 七轴笛卡尔到关节规划器：控制律产生笛卡尔目标，规划器在提交 ServoJ 前执行
+// RM75 关节限位、速度/加速度与奇异性约束。
 enum class Rm75PlanError {
     kNone,
     kNonFiniteInput,
@@ -251,34 +274,48 @@ enum class Rm75PlanError {
 const char* Rm75PlanErrorString(Rm75PlanError error);
 
 struct Rm75ServoPlannerConfig {
-    int period_ms = 20;
-    double damping = 0.001;
-    double joint_limit_warning_deg = 10.0;
-    double joint_limit_stop_deg = 3.0;
-    double singularity_warning_deg = 5.0;
-    double minimum_task_singular_value = 1e-5;
-    // The default 20 ms loop reserves half of the official speed. In general,
-    // joint_speed_scale * period_ms must not exceed minimum_dispatch_gap_ms.
-    // The square of the scale is also applied to acceleration changes.
-    double minimum_dispatch_gap_ms = 10.0;
-    double joint_speed_scale = 0.5;
-    double max_joint_accel_deg_s2 = 90.0;
-    bool allow_near_singularity = false;
+    // 关节规划参数属于 ServoJ/IK 模块；main_rm75 不再覆盖这些值。
+    int period_ms = 20; // ServoJ 规划周期（ms）
+    double damping = 0.001; // 阻尼最小二乘 IK 的 λ
+    double joint_limit_warning_deg = 10.0; // 距关节限位该角度内记录预警
+    double joint_limit_stop_deg = 3.0; // 距关节限位该角度内拒绝规划
+    double singularity_warning_deg = 5.0; // 奇异性预警角度裕量
+    double minimum_task_singular_value = 1e-5; // Jacobian 最小奇异值门
+    // 每个 20 ms 周期允许使用官方最大关节速度的 100%。
+    // 速度比例乘周期不得超过最小下发间隔。
+    double minimum_dispatch_gap_ms = 20.0; // 相邻 ServoJ 下发的最小时间间隔
+    double joint_speed_scale = 1.0; // 官方最大关节速度比例
+    double max_joint_accel_deg_s2 = 90.0; // 相邻周期关节速度变化上限
+    bool allow_near_singularity = false; // true 仅用于诊断，生产入口保持 false
+};
+
+// 运行循环使用的硬件量程与跟踪故障门。它们不属于控制律公式，也不属于
+// main_rm75 的启动职责，因此与控制/规划配置一起集中在本模块定义。
+struct Rm75RuntimeSafetyConfig {
+    // 未补偿传感器读数的量程门；在 Kalman/标定补偿前检查。
+    double raw_force_limit_n = 50.0;
+    double raw_torque_limit_nm = 5.0;
+    // 实际反馈相对 ServoJ 模型目标的跟踪故障门。
+    double max_tracking_joint_error_deg = 5.0;
+    double max_tracking_position_error_mm = 25.0;
+    // 0 表示不单独以笛卡尔姿态残差终止；关节与位置误差仍受监督。
+    double max_tracking_orientation_error_deg = 0.0;
 };
 
 struct Rm75ServoPlan {
+    // 规划成功后提交给 ServoJ 的关节目标、其 FK 模型位姿和本周期关节增量。
     Eigen::Matrix<double, 7, 1> target_joints =
         Eigen::Matrix<double, 7, 1>::Zero();
     Eigen::Matrix<double, 6, 1> model_pose =
         Eigen::Matrix<double, 6, 1>::Zero();
     Eigen::Matrix<double, 7, 1> joint_delta =
         Eigen::Matrix<double, 7, 1>::Zero();
-    Rm75PlanError error = Rm75PlanError::kNone;
-    bool valid = false;
-    bool near_joint_limit = false;
-    bool near_singularity = false;
-    double minimum_joint_margin_deg = 0.0;
-    std::string detail;
+    Rm75PlanError error = Rm75PlanError::kNone; // 失败类型
+    bool valid = false; // 是否可安全下发
+    bool near_joint_limit = false; // 是否进入关节限位预警区
+    bool near_singularity = false; // 是否进入奇异预警区
+    double minimum_joint_margin_deg = 0.0; // 至最近关节限位的裕量
+    std::string detail; // 面向日志的补充诊断
 };
 
 class Rm75ServoPlanner {

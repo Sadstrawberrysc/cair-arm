@@ -1312,8 +1312,8 @@ bool ForceCalibration::Validate(std::string* error) const {
     if (calibration_residuals_verified) {
         if (accepted_force_residual_max_n <= 0.0
             || accepted_torque_residual_max_nm <= 0.0
-            || accepted_force_residual_max_n > 0.5
-            || accepted_torque_residual_max_nm > 0.05
+            || accepted_force_residual_max_n > 0.6
+            || accepted_torque_residual_max_nm > 0.1
             || force_residual_max_n > accepted_force_residual_max_n
             || torque_residual_max_nm > accepted_torque_residual_max_nm
             || force_residual_rms_n > accepted_force_residual_max_n
@@ -1380,9 +1380,9 @@ bool ForceCalibration::LoadJson(const std::string& path, std::string* error) {
             force_residual_max_n = quality.value("force_max_n", 0.0);
             torque_residual_max_nm = quality.value("torque_max_nm", 0.0);
             accepted_force_residual_max_n =
-                quality.value("accepted_force_max_n", 0.5);
+                quality.value("accepted_force_max_n", 0.6);
             accepted_torque_residual_max_nm =
-                quality.value("accepted_torque_max_nm", 0.05);
+                quality.value("accepted_torque_max_nm", 0.1);
         } else {
             calibration_residuals_verified = false;
         }

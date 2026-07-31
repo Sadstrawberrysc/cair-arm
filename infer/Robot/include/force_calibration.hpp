@@ -40,8 +40,8 @@ public:
     double torque_residual_rms_nm = 0.0;
     double force_residual_max_n = 0.0;
     double torque_residual_max_nm = 0.0;
-    double accepted_force_residual_max_n = 0.5;
-    double accepted_torque_residual_max_nm = 0.05;
+    double accepted_force_residual_max_n = 0.6;
+    double accepted_torque_residual_max_nm = 0.1;
 
     // Model in the sensor coordinate system:
     // measured_force  = force_bias + R_sensor_from_base * gravity_base

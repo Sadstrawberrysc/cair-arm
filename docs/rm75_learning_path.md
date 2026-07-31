@@ -2,19 +2,47 @@
 
 本手册用于从零理解当前 RM75 七轴、Haptron 六维力传感器和超声视觉闭环。学习顺序固定为：**源码阅读 → 日志观察 → 真机验证**。完成一个模块的检查项后，再进入下一模块。
 
+首先检查 Redis 是否已经在本机 `7777` 端口运行：
+
+```bash
+redis-cli -p 7777 ping
+```
+
+返回 `PONG` 时不需要重复启动；连接失败时，在后台启动 Redis：
+
+```bash
+redis-server --bind 127.0.0.1 --port 7777 --daemonize yes
+```
+
+电脑重启或 Redis 被停止后需要重新启动一次。不要重复启动多个占用同一端口的
+Redis 实例。
+
 生产机械臂入口：
 
 ```bash
 cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
-./main_rm75 --execute
+./main_rm75
 ```
 
 视觉入口：
 
 ```bash
+conda activate carotid
 cd /home/cair-jacen/uspilot_ctrl-main/intergrate_infer
-/home/cair-jacen/anaconda3/envs/carotid/bin/python \
-  main_redis_seg_newphase_recovery_mode.py
+python main_redis_seg_newphase_recovery_mode.py
+```
+
+应先激活 `carotid` 环境，再进入视觉目录。该环境提供 PyTorch、OpenCV、
+模型推理与 Redis Python 客户端等运行依赖。
+
+完整启动顺序为：
+
+```text
+确认或启动 Redis 127.0.0.1:7777
+  → 启动 ./main_rm75
+  → 启动视觉程序
+  → 按 b 开始接近与 Tool-Y
+  → 按 m 开始 Tool-X 扫描
 ```
 
 真实运动前必须确认探头悬空、运动方向、现场急停和可用标定。本文说明软件学习与验证路径，不替代现场安全流程。
@@ -55,8 +83,8 @@ RM75 状态反馈 ────────────────────�
 
 检查项：
 
-- [ ] 能说明裸 `./main_rm75 --execute` 为什么能得到机器人 IP、串口、标定文件、Redis、目标力与速度。
-- [ ] 能说明 `rm75_control.hpp` 是算法默认值，而 `main_rm75.cpp` 的生产 profile 会覆盖实际运行值。
+- [ ] 能说明无参数 `./main_rm75` 为什么能得到机器人 IP、串口、标定文件、Redis、目标力与速度。
+- [ ] 能说明 `rm75_control.hpp` 是当前控制、规划和安全参数的唯一调参来源；`main_rm75.cpp` 只负责启动、硬件 I/O、标定坐标链注入和日志。
 - [ ] 能在终端输出中找到 `configuration_profile`、`desired_force_n`、`approach_speed_cm_s` 和 `runtime_log`。
 
 ## 2. RM75 通信、状态与七轴运动学
@@ -65,7 +93,7 @@ RM75 状态反馈 ────────────────────�
 
 1. `infer/Robot/include/realman_command.hpp` 与 `src/realman_command.cpp`：TCP 建连、状态读取、ServoJ 和 Stop。
 2. `include/realman_kinematics.hpp` 与 `src/realman_kinematics.cpp`：七轴 FK、6×7 Jacobian、数值 IK。
-3. `src/arm_read_state.cpp` 与 `src/arm_preset_pose.cpp`：维护工具示例。
+3. `tests/tools/arm_read_state.cpp` 与 `tests/tools/arm_preset_pose.cpp`：维护工具示例。
 
 维护工具不在默认构建中。需要时先配置并编译：
 
@@ -99,7 +127,7 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 阅读顺序：
 
 1. `include/force_sensor.hpp`、`src/force_sensor.cpp`、`include/haptron_modbus.hpp`：Modbus RTU 和线程安全采样快照。
-2. `include/force_calibration.hpp`、`src/force_sensor_calibrate.cpp`：偏置、质量、质心和重力补偿。
+2. `include/force_calibration.hpp`、`tests/tools/force_sensor_calibrate.cpp`：偏置、质量、质心和重力补偿。
 3. `include/contact_sensing.hpp`、`src/contact_sensing.cpp`：从 wrench 与 STL 表面估计接触点。
 
 数据链：
@@ -113,7 +141,7 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 
 其中 force 的单位为 N，torque 的单位为 N·m。`tare` 是探头完全悬空、静止时采集的现场零点；它只能消除当前姿态和安装条件下的静态偏置，不能替代正式多姿态重力标定。
 
-真机观察：生产入口启动时会执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。若被残差门拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
+真机观察：生产入口启动时会执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。当前静止门为关节跨度 `0.02°`、TCP 跨度 `0.35 mm`、姿态跨度 `0.10°`；临时标定残差门为 `5 N / 0.5 N·m`。若被拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
 
 检查项：
 
@@ -151,18 +179,23 @@ Base → Arm_Tip → Tool/Sensor → Probe TCP
 
 1. `rm75_control.hpp`：目标力、接触阈值、虚拟质量/阻尼、卸载和恢复参数。
 2. `rm75_control.cpp`：接触判定、Z 导纳、`target_force_unloading`、制动、重新接触和恢复分支。
-3. `main_rm75.cpp`：写入 `control_config` 的生产参数。
+3. `main_rm75.cpp`：查看它如何创建 `control_config`，并只注入标定给出的 Tool/Arm_Tip 坐标变换与 TCP。
 
-当前 production profile 的关键值：
+当前配置的关键值：
 
 ```text
 目标力：-3 N
 接触门：|Fz| ≥ 0.99 N
 虚拟质量 M：3
-虚拟阻尼 D：20
-普通 Tool-Z 力控上限：0.05 cm/s
+虚拟阻尼 D：10
+普通 Tool-Z 力控上限：0.20 cm/s
 超力开始卸载：Fz ≤ -3.5 N
 ```
+
+wrench Kalman 和接触点 Kalman 当前均开启。前者平滑补偿后的六个 wrench 分量，
+但硬 wrench 门始终先检查未滤波数据；后者只在接触点有效时更新，并在失去接触后重置。
+因此新的接触会从真实接触点重新初始化，而不会被“无接触零点”拖向错误位置。接触姿态
+模块使用过滤后的接触点驱动 Tool-X/Roll；Pitch 同样接入过滤结果，但默认 Pitch 增益为 0。
 
 控制含义：未接触时沿 `+Tool-Z` 接近；接触后导纳使 Fz 向 -3 N 收敛；压得更深、Fz 更负时请求 `-Tool-Z` 卸载。卸载与恢复期间 X/Y/RZ 会被抑制，避免横向或旋转与卸载相互干扰。
 
@@ -180,7 +213,7 @@ Base → Arm_Tip → Tool/Sensor → Probe TCP
 
 1. `rm75_control.cpp` 中 `visual_y_enabled_`、`model_y_velocity_m_s` 和 `model_y_step`。
 2. 同文件的 `force_settle`、`scan`、`trigger_align` 和 `rotate_align` 状态转换。
-3. `main_rm75.cpp` 中 Y 增益、扫描稳定力带、X 扫描速度和 RZ 参数。
+3. `rm75_control.hpp` 中 Y 增益、扫描稳定力带、X 扫描速度和 RZ 参数。
 
 当前键控行为：
 
@@ -198,7 +231,17 @@ v_y = model_y_direction × model_y_velocity_gain_per_s × visual_y_error
 Δy = v_y × 0.02 s
 ```
 
-当前生产 profile 中符号为 `-1`，增益为 `1.0 s⁻¹`。Y 只有在传感器已接触、视觉命令 fresh、处于 moving、且不在卸载/恢复/跟踪暂停时才会真正形成 Tool-Y 请求。
+当前配置中符号为 `-1`，速度为旧六轴的 `2/25`，等效增益为
+`2.0 s⁻¹`，单周期 Tool-Y 步长上限为 `1.6 mm`。Y 只有在传感器已接触、
+视觉命令 fresh、处于 moving、且不在卸载/恢复/跟踪暂停时才会真正形成
+Tool-Y 请求。
+
+当前 Tool-Y 实际 TCP 跟踪暂停/恢复滞回为 `20 mm / 10 mm`；这与全局
+`25 mm` 机器人位置跟踪故障门独立，后者仍可能先触发故障。
+每周期先检查候选 Tool-Y 步长；若该步会跨过 `20 mm` 暂停门，只使用
+剩余裕量并立即暂停，避免参考轨迹先越界再冻结。
+当 Tool-Y 误差达到 `15 mm`、且占总 TCP 跟踪误差至少 `80%` 时，控制器会以
+最新实际关节反馈重建模型和笛卡尔参考后继续；其他方向的跟踪故障仍进入 Stop。
 
 检查项：
 
@@ -253,8 +296,8 @@ phase 含义：`0=Scan`、`1=Trigger`、`2=Action`。按 `b` 的 phase 为 -1，
 
 修改顺序：
 
-1. 只调生产参数时，改 `main_rm75.cpp` 的 implicit profile 或 `control_config` 赋值。
-2. 要改变公式、状态转换或门控时，才改 `rm75_control.cpp/.hpp`。
+1. 调控制、规划或安全参数时，改 `rm75_control.hpp` 对应配置结构体的默认值。
+2. 要改变公式、状态转换或门控时，改 `rm75_control.cpp/.hpp`；不要在 `main_rm75.cpp` 重新覆盖这些参数。
 3. 每次只改一个控制维度或一个条件；构建后保存对应日志；确认结果再进行下一项。
 4. 修改后构建唯一生产目标：
 

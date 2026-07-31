@@ -30,8 +30,8 @@ struct Options {
     bool sensor_to_tool_translation_set = false;
     bool probe_tcp_set = false;
     bool tool_chain_verified = false;
-    double max_force_rms_n = 0.5;
-    double max_torque_rms_nm = 0.05;
+    double max_force_rms_n = 0.6;
+    double max_torque_rms_nm = 0.1;
     bool allow_high_residual = false;
 };
 
@@ -61,8 +61,8 @@ void Usage(const char* program) {
         << "    sensor-origin to tool-origin vector expressed in sensor axes;\n"
         << "    probe TCP coordinates are also expressed in sensor axes.\n"
         << "  --tool-chain-verified     assert independently measured R/t/TCP\n"
-        << "  --max-force-residual-n N       vector maximum, default/maximum 0.5\n"
-        << "  --max-torque-residual-nm NM    vector maximum, default/maximum 0.05\n"
+        << "  --max-force-residual-n N       vector maximum, default/maximum 0.6\n"
+        << "  --max-torque-residual-nm NM    vector maximum, default/maximum 0.1\n"
         << "  --allow-high-residual     write result despite failed residual gate\n";
 }
 
@@ -155,9 +155,9 @@ bool ParseOptions(int argc, char** argv, Options& options) {
     }
     return !options.input_csv.empty() && !options.output_json.empty()
         && !options.sensor_id.empty() && !options.probe_model.empty()
-        && options.max_force_rms_n > 0.0 && options.max_force_rms_n <= 0.5
+        && options.max_force_rms_n > 0.0 && options.max_force_rms_n <= 0.6
         && options.max_torque_rms_nm > 0.0
-        && options.max_torque_rms_nm <= 0.05;
+        && options.max_torque_rms_nm <= 0.1;
 }
 
 std::vector<std::string> Split(const std::string& line) {

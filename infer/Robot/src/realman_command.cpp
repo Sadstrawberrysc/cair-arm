@@ -16,8 +16,19 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// 本文件实现 RM75 的 TCP 传输层，分为五部分：
+// 1) JSON 报文与单位转换；2) 同步维护命令；3) 20 ms 控制所用的异步
+// 状态读取；4) 无锁 ServoJ 邮箱；5) Stop 的优先级与确认机制。
+// 上层 main_rm75/rm75_control 只通过 realman_command.hpp 的接口调用，不应
+// 依赖这里的 socket、报文拆包或线程同步细节。
+
 namespace {
 
+// -------------------------------------------------------------------------
+// 模块一：协议单位、时间与 JSON 辅助函数
+// -------------------------------------------------------------------------
+
+// RM75 协议的关节角使用毫度；位置使用微米，姿态使用毫弧度。
 constexpr double kMilliDegreeToRad = M_PI / 180000.0;
 constexpr double kRadToMilliDegree = 180000.0 / M_PI;
 constexpr std::int64_t kMinimumAsyncServoSendGapNs = 10'000'000;
@@ -103,6 +114,10 @@ RMResult RobotRejection(const char* label, const nlohmann::json& response) {
 
 }  // namespace
 
+// -------------------------------------------------------------------------
+// 模块二：统一结果、TCP 行分帧与机器人状态解析
+// -------------------------------------------------------------------------
+
 RMResult RMResult::Success() {
     return {};
 }
@@ -118,6 +133,7 @@ RMJsonLineFramer::RMJsonLineFramer(std::size_t max_buffer_bytes)
     : max_buffer_bytes_(std::max<std::size_t>(1, max_buffer_bytes)) {}
 
 void RMJsonLineFramer::Feed(const char* data, std::size_t size) {
+    // TCP 是字节流，不保证一次 recv 对应一条 JSON；这里累积数据，直到遇到换行。
     if (data == nullptr || size == 0) return;
     buffer_.append(data, size);
     if (buffer_.size() > max_buffer_bytes_) {
@@ -163,6 +179,7 @@ bool RobotStateSnapshot::IsStale(
 
 RMResult ParseRobotStateMessage(const nlohmann::json& message,
                                 RobotStateSnapshot& state) {
+    // 只接受完整的 7 关节 + 6D 位姿状态，避免半截/错类型报文污染控制快照。
     if (!message.is_object() || !message.contains("arm_state")
         || !message["arm_state"].is_object()) {
         return RMResult::Failure(RMErrorCode::kProtocol,
@@ -263,7 +280,12 @@ RMCommand::~RMCommand() {
     CloseTCPSocket();
 }
 
+// -------------------------------------------------------------------------
+// 模块三：连接生命周期与底层 JSON 收发
+// -------------------------------------------------------------------------
+
 RMResult RMCommand::TryConnectTCPSocket(int timeout_ms) {
+    // 状态读取线程拥有 socket 接收权期间禁止重连，避免两个读取者消费同一响应。
     if (timeout_ms < 0) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kInvalidArgument, "connect timeout must be non-negative");
@@ -307,6 +329,7 @@ RMResult RMCommand::TryConnectTCPSocket(int timeout_ms) {
         return result;
     }
 
+    // 用非阻塞 connect + select 实现可控的连接超时；成功后恢复原 socket 模式。
     const int original_flags = fcntl(socket_fd, F_GETFL, 0);
     if (original_flags < 0 || fcntl(socket_fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
         const std::string error = std::strerror(errno);
@@ -416,6 +439,8 @@ RMResult RMCommand::TryConnectTCPSocket(int timeout_ms) {
 RMResult RMCommand::SendJson(const nlohmann::json& request,
                              const char* label,
                              bool low_priority) {
+    // ServoJ 的发送优先级最高。低优先级状态查询拿不到发送锁时会直接让步，
+    // 而不是阻塞控制链路。
     std::unique_lock<std::mutex> lock(send_mutex_, std::defer_lock);
     if (low_priority) {
         if (!lock.try_lock()) {
@@ -466,6 +491,7 @@ RMResult RMCommand::SendJson(const nlohmann::json& request,
 }
 
 RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) {
+    // 调用者必须持有 receive_mutex_：所有同步请求与异步接收线程共用同一 TCP 流。
     if (!connected_.load() || rlm_socket < 0) {
         return RMResult::Failure(RMErrorCode::kNotConnected,
                                  "robot is not connected");
@@ -552,6 +578,7 @@ RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) 
 }
 
 RMResult RMCommand::DrainInputLocked() {
+    // 同步请求前丢弃遗留帧，避免把上一条命令的响应误认为当前请求的响应。
     receive_framer_.Reset();
     if (!connected_.load() || rlm_socket < 0) {
         return RMResult::Failure(RMErrorCode::kNotConnected,
@@ -596,6 +623,10 @@ RMResult RMCommand::DrainInputLocked() {
     receive_framer_.Reset();
     return RMResult::Success();
 }
+
+// -------------------------------------------------------------------------
+// 模块四：同步维护接口（仅供诊断、标定或非实时操作）
+// -------------------------------------------------------------------------
 
 RMResult RMCommand::TrySetHighSpeedEth(int timeout_ms) {
     if (async_receiver_active_.load()) {
@@ -643,6 +674,7 @@ RMResult RMCommand::TrySetHighSpeedEth(int timeout_ms) {
 
 RMResult RMCommand::TryReadJ(Eigen::Matrix<double, 7, 1>& joints,
                              int timeout_ms) {
+    // 异步状态读取启动后，禁止同步 ReadJ 抢占接收流。
     if (async_receiver_active_.load()) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kBusy,
@@ -797,6 +829,7 @@ RMResult RMCommand::TryReadL(Eigen::Matrix<double, 6, 1>& pose,
 
 RMResult RMCommand::WaitTrajectoryResponseLocked(const char* label,
                                                  int timeout_ms) {
+    // MoveJ/MoveL/MoveJ_P 需要等待轨迹完成确认；ServoJ 不走这个阻塞路径。
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
@@ -942,6 +975,10 @@ RMResult RMCommand::TryMoveJP(const Eigen::Matrix<double, 6, 1>& pose,
     return result;
 }
 
+// -------------------------------------------------------------------------
+// 模块五：ServoJ、保持与停止
+// -------------------------------------------------------------------------
+
 RMResult RMCommand::TryServoJ(const Eigen::Matrix<double, 7, 1>& joints,
                               bool follow) {
     const bool asynchronous =
@@ -1058,6 +1095,8 @@ RMResult RMCommand::TryHoldMotion(bool follow) {
 }
 
 RMResult RMCommand::TryStopMotion(int timeout_ms) {
+    // StopMotion 一旦开始即锁住 ServoJ。异步模式下由 I/O 线程发送 Stop 并接收
+    // ACK；调用线程只等待完成快照，避免与 socket 读取竞争。
     if (timeout_ms < 0) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kInvalidArgument,
@@ -1269,6 +1308,12 @@ RobotStateSnapshot RMCommand::CachedRobotState(
     snapshot.stale = snapshot.IsStale(stale_after);
     return snapshot;
 }
+
+// -------------------------------------------------------------------------
+// 模块六：异步 ServoJ 邮箱（控制线程 -> I/O 线程）
+// -------------------------------------------------------------------------
+// 控制线程在 20 ms 周期中只发布固定大小的关节目标；I/O 线程负责 JSON 序列化、
+// socket 发送和结果记录。邮箱最多保留一个待发或在途目标，防止 I/O 卡顿后积压旧轨迹。
 
 bool RMCommand::TryPublishServoTarget(
     const Eigen::Matrix<double, 7, 1>& joints,
@@ -1492,6 +1537,10 @@ void RMCommand::CompleteStopRequest(std::uint64_t sequence,
     }
 }
 
+// -------------------------------------------------------------------------
+// 模块七：异步接收权、共享快照和旧接口兼容层
+// -------------------------------------------------------------------------
+
 RMResult RMCommand::AcquireAsyncReceiver() {
     if (!IsConnected()) {
         return RMResult::Failure(RMErrorCode::kNotConnected,
@@ -1528,6 +1577,7 @@ void RMCommand::StoreLastResult(const RMResult& result) {
 }
 
 void RMCommand::StoreRobotState(const RobotStateSnapshot& state) {
+    // 除缓存状态外，同时更新 Hold 的安全关节目标，供通信异常后的保持使用。
     std::lock_guard<std::mutex> lock(state_mutex_);
     cached_state_ = state;
     cmd_joints = state.joints;
@@ -1555,6 +1605,7 @@ void RMCommand::ReportLegacyFailure(const char* operation,
 }
 
 void RMCommand::ConnectTCPSocket() {
+    // 以下无返回值接口保留给旧六轴代码；新 RM75 主线应使用 Try* 接口并检查 RMResult。
     const RMResult result = TryConnectTCPSocket();
     ReportLegacyFailure("ConnectTCPSocket", result);
 }
@@ -1631,6 +1682,12 @@ void RMCommand::StopMotion() {
     const RMResult result = TryStopMotion();
     ReportLegacyFailure("StopMotion", result);
 }
+
+// -------------------------------------------------------------------------
+// 模块八：RMStateReader 异步状态与 I/O 线程
+// -------------------------------------------------------------------------
+// 该线程是 socket 接收的唯一所有者：周期性请求 arm_state、发送最新 ServoJ、
+// 优先处理 Stop ACK，并将最新机器人状态发布为线程安全快照。
 
 RMStateReader::RMStateReader(RMCommand& command,
                              std::chrono::milliseconds poll_period,
@@ -1775,6 +1832,8 @@ void RMStateReader::ThreadMain() {
         }
 
         if (now >= next_request) {
+            // 状态查询是低优先级发送：ServoJ 正在占用发送锁时，本周期直接跳过，
+            // 下一个 poll 周期再请求，不能阻塞 ServoJ。
             const RMResult send_result = command_.SendJson(
                 {{"command", "get_current_arm_state"}},
                 "RMStateReader",
@@ -1837,6 +1896,7 @@ void RMStateReader::ThreadMain() {
         }
 
         if (response.contains("arm_state")) {
+            // 正常状态帧：解析、分配递增序号并原子发布，供 20 ms 控制循环读取。
             RobotStateSnapshot parsed;
             const RMResult parse_result = ParseRobotStateMessage(response, parsed);
             if (!parse_result) {

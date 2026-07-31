@@ -9,7 +9,7 @@ mkdir -p "$(dirname "${output}")"
 g++ -std=c++17 -O2 -pthread \
     -I"${robot_dir}/include" \
     -I/usr/include/eigen3 \
-    "${robot_dir}/src/arm_preset_pose.cpp" \
+    "${robot_dir}/tests/tools/arm_preset_pose.cpp" \
     "${robot_dir}/src/realman_command.cpp" \
     -o "${output}"
 

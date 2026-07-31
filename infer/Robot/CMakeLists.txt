@@ -8,14 +8,14 @@ find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_library(HIREDIS_LIB hiredis REQUIRED)
 
 option(BUILD_LEGACY_MAIN_NOMOVE
-       "Deprecated: main_nomove is retained as six-axis reference source only"
+       "Deprecated: legacy six-axis sources are retained as references only"
        OFF)
 option(BUILD_MAINTENANCE_TOOLS
        "Build retained robot diagnostics and sensor calibration utilities"
        OFF)
 if(BUILD_LEGACY_MAIN_NOMOVE)
     message(WARNING
-        "main_nomove is retained unchanged as an original six-axis reference; "
+        "tests/legacy/six_axis is retained as an original six-axis reference; "
         "it is not built against the RM75 seven-axis libraries.")
 endif()
 
@@ -66,25 +66,32 @@ target_link_libraries(robot_sensor PUBLIC
 )
 
 if(BUILD_MAINTENANCE_TOOLS)
-    # Original RM75 diagnostic programs are retained unchanged.
-    add_executable(arm_read_state src/arm_read_state.cpp)
+    # Diagnostics and calibration utilities are separated from production src.
+    add_executable(arm_read_state tests/tools/arm_read_state.cpp)
     target_link_libraries(arm_read_state PRIVATE realman_transport)
 
-    add_executable(arm_preset_pose src/arm_preset_pose.cpp)
+    add_executable(arm_preset_pose tests/tools/arm_preset_pose.cpp)
     target_link_libraries(arm_preset_pose PRIVATE realman_transport)
 
-    add_executable(rm75_servoj_diagnostic src/arm_servoj_line_test.cpp)
+    add_executable(rm75_servoj_diagnostic
+        tests/tools/arm_servoj_line_test.cpp
+    )
     target_link_libraries(rm75_servoj_diagnostic PRIVATE
         realman_transport
         rm75_motion
     )
 
     # Sensor calibration utilities retained for future physical re-calibration.
-    add_executable(force_sensor_calibrate src/force_sensor_calibrate.cpp)
+    add_executable(force_sensor_calibrate
+        tests/tools/force_sensor_calibrate.cpp
+    )
     target_link_libraries(force_sensor_calibrate PRIVATE robot_sensor)
 
     add_executable(force_sensor_calibration_capture
-        src/force_sensor_calibration_capture.cpp
+        tests/tools/force_sensor_calibration_capture.cpp
+    )
+    target_include_directories(force_sensor_calibration_capture PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools
     )
     target_link_libraries(force_sensor_calibration_capture PRIVATE
         realman_transport
