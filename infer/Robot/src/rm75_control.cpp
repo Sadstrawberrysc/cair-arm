@@ -32,6 +32,7 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.force_virtual_mass,
         config.force_virtual_damping,
         config.target_force_unload_margin_n,
+        config.target_force_unload_entry_duration_s,
         config.target_force_unload_speed_m_s,
         config.target_force_unload_deceleration_band_n,
         config.target_force_unload_stop_acceleration_m_s2,
@@ -55,6 +56,7 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.model_y_direction,
         config.model_y_velocity_gain_per_s,
         config.maximum_model_y_step_m,
+        config.scan_y_scale,
         config.visual_y_tracking_pause_error_m,
         config.visual_y_tracking_resume_error_m,
         config.visual_y_tracking_rebase_error_m,
@@ -110,6 +112,7 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.force_virtual_damping >= 0.0
         && config.target_force_unload_margin_n >= 0.0
         && config.target_force_unload_margin_n < config.force_limit_z_n
+        && config.target_force_unload_entry_duration_s >= 0.0
         && config.target_force_unload_speed_m_s > 0.0
         && config.target_force_unload_deceleration_band_n
                >= config.target_force_unload_margin_n
@@ -133,6 +136,8 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.max_angular_speed_rad_s > 0.0
         && std::abs(std::abs(config.model_y_direction) - 1.0) <= 1e-12
         && config.maximum_model_y_step_m > 0.0
+        && config.scan_y_scale >= 0.0
+        && config.scan_y_scale <= 1.0
         && config.visual_y_tracking_pause_error_m > 0.0
         && config.visual_y_tracking_resume_error_m >= 0.0
         && config.visual_y_tracking_resume_error_m
@@ -206,6 +211,7 @@ void Rm75ControlLaw::Reset() {
     target_force_release_pending_ = false;
     target_force_recovering_ = false;
     target_force_contact_reacquired_ = false;
+    target_force_unload_overload_time_s_ = 0.0;
     wrench_filter_initialized_ = false;
     filtered_wrench_.setZero();
     wrench_filter_covariance_.setZero();
@@ -222,6 +228,7 @@ void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     target_force_recovering_ = false;
     target_force_contact_reacquired_ = false;
     target_force_recovery_stable_time_s_ = 0.0;
+    target_force_unload_overload_time_s_ = 0.0;
     contact_roll_velocity_rad_s_ = 0.0;
     scan_distance_m_ = 0.0;
     visual_y_force_stable_time_s_ = 0.0;
@@ -392,11 +399,20 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     // Target-relative unloading is an independent axial safety layer. It is
     // evaluated before visual action/terminate gates so an idle or stale Redis
     // command cannot prevent unloading a valid excessive contact force.
-    if (in_contact && config_.target_force_unload_enabled
-        && !target_force_unloading_
-        && force.z() <= requested_force
-                - config_.target_force_unload_margin_n) {
+    const bool target_force_overloaded = in_contact
+        && config_.target_force_unload_enabled
+        && force.z() <= requested_force - config_.target_force_unload_margin_n;
+    if (!target_force_unloading_) {
+        target_force_unload_overload_time_s_ = target_force_overloaded
+            ? target_force_unload_overload_time_s_ + dt : 0.0;
+    } else {
+        target_force_unload_overload_time_s_ = 0.0;
+    }
+    if (!target_force_unloading_
+        && target_force_unload_overload_time_s_ + 1e-12
+            >= config_.target_force_unload_entry_duration_s) {
         target_force_unloading_ = true;
+        target_force_unload_overload_time_s_ = 0.0;
         target_force_release_pending_ = false;
         target_force_recovering_ = false;
         target_force_contact_reacquired_ = false;
@@ -409,10 +425,8 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         visual_y_force_stable_time_s_ = 0.0;
         visual_y_tracking_paused_ = true;
         scan_force_stable_time_s_ = 0.0;
-        trigger_alignment_stable_time_s_ = 0.0;
     } else if (target_force_unloading_) {
-        if (force.z() <= requested_force
-                - config_.target_force_unload_margin_n) {
+        if (target_force_overloaded) {
             // A renewed overload during braking returns directly to the
             // force-dependent unloading profile.
             target_force_release_pending_ = false;
@@ -660,11 +674,14 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     // Treat the visual Y value as the current alignment error, not as a
     // displacement to accumulate once per Redis sequence. The proportional
     // controller produces a velocity and integrates it over this cycle.
-    const double rotation_y_scale = rotation_latched_
-        ? config_.rotate_align_y_scale : 1.0;
+    // 按 m 后 phase=0/2；在扫描阶段降低 Tool-Y 速度，保证 Tool-X 是主运动。
+    // Trigger 锁存旋转模式时，继续沿用独立的旧六轴 0.3 缩放。
+    const double model_y_scale = rotation_latched_
+        ? config_.rotate_align_y_scale
+        : (scan_phase ? config_.scan_y_scale : 1.0);
     const double model_y_velocity_m_s = config_.model_y_direction
         * config_.model_y_velocity_gain_per_s
-        * rotation_y_scale * intent.model_y_m;
+        * model_y_scale * intent.model_y_m;
     if (input.robot_model_tool_y_error_m
             >= config_.visual_y_tracking_pause_error_m) {
         visual_y_tracking_paused_ = true;

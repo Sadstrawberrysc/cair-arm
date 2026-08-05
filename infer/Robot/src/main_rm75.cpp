@@ -46,7 +46,6 @@ namespace {
 
 std::atomic<bool> g_stop_requested{false};
 // ServoJ 由异步发送线程执行；这里限制相邻两次真实 socket 写入的最小间隔。
-constexpr std::chrono::milliseconds kMinimumAsyncServoSendGap{10};
 constexpr const char* kImplicitProfileName =
     "rm75_v6_redis_visual_closed_loop_3n_tcp188";
 constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
@@ -109,7 +108,7 @@ struct Options {
     std::string probe_model_path = "../model/Lprobe-IFS.STL";
     std::string redis_host = "127.0.0.1";
     int redis_port = 7777;
-    int period_ms = 20;
+    int period_ms = 10;
     int duration_s = 0;
     int publish_every = 5;
     int execute_warmup_s = 2;
@@ -132,7 +131,7 @@ struct Options {
     double scan_distance_mm = 100.0;
     double scan_direction_tool_x = -1.0;
     double maximum_orientation_excursion_deg = 5.0;
-    double max_tracking_joint_error_deg = 5.0;
+    double max_tracking_joint_error_deg = 20.0;
     double max_tracking_position_error_mm = 3.0;
     double max_tracking_orientation_error_deg = 2.0;
     double manual_y_m = 0.0;
@@ -159,7 +158,7 @@ struct Options {
 // -------------------------------------------------------------------------
 
 struct RuntimeLogRow {
-    // 一个 20 ms 控制周期的完整快照。结构体只保存数据，实际磁盘写入由
+    // 一个 10 ms 控制周期的完整快照。结构体只保存数据，实际磁盘写入由
     // AsyncRuntimeLogger 的后台线程执行，避免格式化和文件 I/O 阻塞控制周期。
     std::uint64_t cycle = 0;
     std::int64_t monotonic_ns = 0;
@@ -562,7 +561,7 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
     options.scan_direction_tool_x = -1.0;
     // Zero disables the separate total Cartesian-orientation excursion gate.
     options.maximum_orientation_excursion_deg = 0.0;
-    options.max_tracking_joint_error_deg = 5.0;
+    options.max_tracking_joint_error_deg = 20.0;
     options.max_tracking_position_error_mm = 25.0;
     // Zero disables Cartesian orientation tracking-error supervision for the
     // current force-contact commissioning profile. Joint and position
@@ -852,7 +851,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         return false;
     }
     if (options.mode == ControllerMode::kExecute && options.simulate) return false;
-    if (options.mode == ControllerMode::kExecute && options.period_ms != 20) {
+    if (options.mode == ControllerMode::kExecute && options.period_ms != 10) {
         return false;
     }
     return true;
@@ -1246,7 +1245,7 @@ void ExpressWrenchInSensorAlignedToolFrame(
 }  // namespace
 
 // -------------------------------------------------------------------------
-// 模块四：进程编排——配置校验 -> 启动 I/O -> 20 ms 控制 -> 停止与报告
+// 模块四：进程编排——配置校验 -> 启动 I/O -> 10 ms 控制 -> 停止与报告
 // -------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -1462,6 +1461,7 @@ int main(int argc, char** argv) {
     // 只注入运行时标定得到的坐标关系，不再逐项覆盖模块默认参数。
     Rm75ControlConfig control_config;
     Rm75RuntimeSafetyConfig safety_config;
+    control_config.cycle_s = options.period_ms / 1000.0;
     // RMState pose is Base -> Arm_Tip. The current hardware Tool frame is
     // coincident with Sensor, while Arm_Tip and Tool differ by the calibrated
     // fixed 30-degree Z mount rotation. Keep control deltas in Tool/Sensor.
@@ -1477,6 +1477,8 @@ int main(int argc, char** argv) {
     // 规划器把每周期的 6D 笛卡尔目标转换为七关节 ServoJ 目标，并统一执行
     // 关节限位、速度/加速度约束及奇异性检查。
     Rm75ServoPlannerConfig planner_config;
+    planner_config.period_ms = options.period_ms;
+    planner_config.minimum_dispatch_gap_ms = options.period_ms;
     Rm75ServoPlanner planner(planner_config);
 
     // RedisBridge 自己拥有收发线程；控制循环只读取最新命令快照，不做阻塞 I/O。
@@ -1493,10 +1495,11 @@ int main(int argc, char** argv) {
     }
 
     // 4.4 启动传感器与机械臂 I/O 所有者。
-    // 两类读取均在独立线程中进行，20 ms 主循环只消费线程安全快照。
+    // 两类读取均在独立线程中进行，10 ms 主循环只消费线程安全快照。
     ForceSensorConfig sensor_config;
     sensor_config.device = options.sensor_device;
     sensor_config.baud_rate = options.sensor_baud;
+    sensor_config.query_period = std::chrono::milliseconds(options.period_ms);
     sensor_config.stale_after = std::chrono::milliseconds(options.sensor_stale_ms);
     std::unique_ptr<ForceSensorReader> force_reader;
     if (!options.simulate) {
@@ -1904,6 +1907,10 @@ int main(int argc, char** argv) {
     std::uint64_t robot_state_stale_hold_cycles = 0;
     std::uint64_t robot_state_recoveries = 0;
     bool waiting_for_fresh_robot_state = false;
+    bool waiting_for_new_command_after_recoverable_hold = false;
+    std::string recoverable_hold_command_session_id;
+    std::uint64_t recoverable_hold_command_sequence = 0;
+    bool servo_mailbox_stall_latched = false;
     bool target_force_unloading_last_cycle = false;
     bool target_force_recovering_last_cycle = false;
     Rm75SupervisorState previous_state = Rm75SupervisorState::kInitializing;
@@ -1921,15 +1928,19 @@ int main(int argc, char** argv) {
     int retreat_cycles = 0;
     auto previous_cycle_started = started_at;
     ServoSendSnapshot servo_status;
-    std::uint64_t last_servo_sent_sequence = 0;
-    auto last_servo_progress_at = started_at;
+    std::uint64_t last_servo_submitted_sequence = 0;
+    auto servo_outstanding_since =
+        std::chrono::steady_clock::time_point{};
     if (options.mode == ControllerMode::kExecute) {
         servo_status = command.ServoStatus();
-        last_servo_sent_sequence = servo_status.sent_sequence;
+        last_servo_submitted_sequence = servo_status.submitted_sequence;
+        if (ServoOutstanding(servo_status)) {
+            servo_outstanding_since = started_at;
+        }
     }
 
     // ---------------------------------------------------------------------
-    // 模块五：20 ms 实时控制循环
+    // 模块五：10 ms 实时控制循环
     // 每周期顺序固定为：读取快照 -> 校验 -> wrench 补偿 -> Redis 意图 ->
     // 状态机/力控 -> IK 规划 -> ServoJ/Hold -> 发布与日志 -> 周期调度。
     // ---------------------------------------------------------------------
@@ -1967,11 +1978,18 @@ int main(int argc, char** argv) {
             && robot_state.arm_err == 0 && robot_state.sys_err == 0
             && static_cast<bool>(asynchronous_robot_result);
         bool robot_feedback_recovered_this_cycle = false;
+        bool robot_feedback_hold_started_this_cycle = false;
         if (!robot_valid && options.mode == ControllerMode::kExecute) {
             if (robot_feedback_stale_only) {
                 // 状态年龄超过 robot_stale_ms 时不再终止长期运行程序。
                 // 在没有新反馈期间冻结参考轨迹，并暂停发布新的 ServoJ/Hold
                 // 目标；收到新状态后再从实测关节重新建立控制参考。
+                if (!waiting_for_fresh_robot_state) {
+                    robot_feedback_hold_started_this_cycle = true;
+                    if (options.redis_enabled) {
+                        waiting_for_new_command_after_recoverable_hold = true;
+                    }
+                }
                 waiting_for_fresh_robot_state = true;
                 ++robot_state_stale_hold_cycles;
             } else {
@@ -2225,6 +2243,75 @@ int main(int argc, char** argv) {
         latest_status_context.model_y_m = intent.model_y_m;
         latest_status_context.model_rz_deg = intent.model_rz_deg;
         latest_status_context.command_age_ms = command_decision.age_ms;
+
+        // A stale-feedback episode establishes a command barrier from the
+        // snapshot observed in that cycle.  Once feedback returns, do not
+        // continue an old visual command: remain in Hold until the producer
+        // publishes a newer valid command (or starts a new session).
+        if (robot_feedback_hold_started_this_cycle
+            && options.redis_enabled) {
+            recoverable_hold_command_session_id = redis_command.session_id;
+            recoverable_hold_command_sequence =
+                redis_command.producer_sequence;
+        }
+
+        // A ServoJ target may legitimately remain in the single-slot mailbox
+        // while robot feedback is temporarily unavailable.  Time the target
+        // from its own submission, rather than from the last socket write.
+        // If it really remains pending for 100 ms, keep the process alive and
+        // require a fresh producer command before motion is allowed again.
+        bool servo_mailbox_stalled_this_cycle = false;
+        if (options.mode == ControllerMode::kExecute) {
+            servo_status = command.ServoStatus();
+            if (servo_status.submitted_sequence
+                    > last_servo_submitted_sequence) {
+                last_servo_submitted_sequence =
+                    servo_status.submitted_sequence;
+                servo_outstanding_since = cycle_started;
+            }
+            if (!ServoOutstanding(servo_status)) {
+                servo_outstanding_since =
+                    std::chrono::steady_clock::time_point{};
+                if (!waiting_for_new_command_after_recoverable_hold) {
+                    servo_mailbox_stall_latched = false;
+                }
+            } else if (servo_outstanding_since
+                           == std::chrono::steady_clock::time_point{}) {
+                servo_outstanding_since = cycle_started;
+            } else if (cycle_started - servo_outstanding_since
+                           > std::chrono::milliseconds(100)) {
+                servo_mailbox_stalled_this_cycle = true;
+                if (!servo_mailbox_stall_latched) {
+                    servo_mailbox_stall_latched = true;
+                    if (options.redis_enabled) {
+                        waiting_for_new_command_after_recoverable_hold = true;
+                        recoverable_hold_command_session_id =
+                            redis_command.session_id;
+                        recoverable_hold_command_sequence =
+                            redis_command.producer_sequence;
+                    }
+                }
+            }
+        }
+
+        bool recoverable_hold_released_this_cycle = false;
+        if (waiting_for_new_command_after_recoverable_hold
+            && robot_valid && command_decision.valid
+            && !ServoOutstanding(servo_status)
+            && (redis_command.session_id
+                    != recoverable_hold_command_session_id
+                || redis_command.producer_sequence
+                       > recoverable_hold_command_sequence)) {
+            // Rebase once more at release so the first command after Hold is
+            // integrated from the latest measured pose, not a stale model.
+            model_joints = robot_state.joints;
+            model_pose = planner.PoseFromJoints(model_joints);
+            cartesian_reference_pose = model_pose;
+            previous_joint_delta.setZero();
+            waiting_for_new_command_after_recoverable_hold = false;
+            servo_mailbox_stall_latched = false;
+            recoverable_hold_released_this_cycle = true;
+        }
         if (options.mode == ControllerMode::kExecute
             && wrench_valid
             && std::abs(compensated.tool.z())
@@ -2261,6 +2348,10 @@ int main(int argc, char** argv) {
         const bool arm_control = options.mode != ControllerMode::kObserve;
         const bool pause_for_robot_feedback =
             robot_feedback_stale_only || robot_feedback_recovered_this_cycle;
+        const bool recoverable_command_hold =
+            waiting_for_new_command_after_recoverable_hold
+            || recoverable_hold_released_this_cycle
+            || servo_mailbox_stalled_this_cycle;
         Rm75ControlOutput control_output;
         if (robot_feedback_stale_only) {
             // 反馈陈旧时只保留上一个已发送目标，不继续积分 X/Y/Z/RZ，
@@ -2275,12 +2366,24 @@ int main(int argc, char** argv) {
             control_output = control_law.Step(
                 control_input,
                 intent,
-                arm_control && !robot_feedback_recovered_this_cycle);
+                arm_control && !robot_feedback_recovered_this_cycle
+                    && !recoverable_command_hold);
             if (robot_feedback_recovered_this_cycle) {
                 control_output.state = Rm75SupervisorState::kHold;
                 control_output.desired_pose = cartesian_reference_pose;
                 control_output.fault =
-                    "robot_state_feedback_recovered_reference_rebased";
+                    waiting_for_new_command_after_recoverable_hold
+                    ? "robot_state_recovered_waiting_for_new_command"
+                    : "robot_state_feedback_recovered_reference_rebased";
+            } else if (recoverable_command_hold) {
+                control_output.state = Rm75SupervisorState::kHold;
+                control_output.command_motion = false;
+                control_output.desired_pose = cartesian_reference_pose;
+                control_output.fault = servo_mailbox_stalled_this_cycle
+                    ? "servoj_mailbox_stalled_waiting_for_new_command"
+                    : (recoverable_hold_released_this_cycle
+                           ? "new_command_received_reference_rebased"
+                           : "waiting_for_new_command_after_recoverable_hold");
             }
         }
         bool target_force_reference_rebased = false;
@@ -2288,7 +2391,8 @@ int main(int argc, char** argv) {
               && !target_force_unloading_last_cycle)
              || (control_output.target_force_recovering
                  && !target_force_recovering_last_cycle))
-            && robot_valid) {
+            && robot_valid && !recoverable_command_hold
+            && !robot_feedback_stale_only) {
             // 超力卸载或恢复刚开始时，理想目标可能领先真实机械臂。这里用实测关节
             // 重建 FK 并重置参考，使第一步回退从真实位置出发，避免“参考已回退、
             // 实体仍继续压入”的方向错觉。
@@ -2494,8 +2598,10 @@ int main(int argc, char** argv) {
         }
 
         // 5.7 异步 ServoJ 发送门。
-        // 新目标不能排在尚未写完的旧目标后，相邻真实 socket 写入至少间隔
-        // 10 ms；否则宁可 Fault/Stop，也不让 20 ms 目标在通信队列中堆积。
+        // 新目标不能排在尚未写完的旧目标后；门关闭时跳过本周期发送，不让
+        // 10 ms 目标在通信队列中堆积。真实 socket 的 10 ms 最小发送间隔由
+        // RMCommand I/O 所有者精确执行，主循环不提前阻止下一目标发布。
+        bool servo_mailbox_available = true;
         if (!fatal_fault && options.mode == ControllerMode::kExecute) {
             if (g_stop_requested.load()) {
                 fatal_fault = true;
@@ -2510,25 +2616,17 @@ int main(int argc, char** argv) {
                 fatal_fault_code = "servoj_async_failed";
                 control_output.fault = servo_status.result.message;
             } else if (!fatal_fault && ServoOutstanding(servo_status)) {
-                fatal_fault = true;
-                fatal_fault_code = "servoj_previous_target_outstanding";
-                control_output.fault =
-                    "previous ServoJ target is still pending or in flight";
-            } else if (!fatal_fault
-                       && servo_status.sent_sequence != 0
-                       && servo_status.sent_at
-                              != std::chrono::steady_clock::time_point{}
-                       && cycle_started - servo_status.sent_at
-                              < kMinimumAsyncServoSendGap) {
-                fatal_fault = true;
-                fatal_fault_code = "servoj_dispatch_cadence_unsafe";
-                control_output.fault =
-                    "previous ServoJ socket write was less than 10 ms ago";
+                // The mailbox is single-slot.  Do not queue another target;
+                // keep the program alive and let the previous finite ServoJ
+                // finish while continuing to consume the latest Redis input.
+                servo_mailbox_available = false;
             }
         }
 
         if (!fatal_fault && servo_plan.valid
-            && (control_output.command_motion || retreat_step_planned)) {
+            && (control_output.command_motion || retreat_step_planned)
+            && (options.mode != ControllerMode::kExecute
+                || servo_mailbox_available)) {
             // 发送前再次检查“规划结果”本身的姿态和未接触行程。实际反馈门与
             // 规划目标门同时存在，分别防止真实跟踪越界和参考轨迹越界。
             const Eigen::Matrix3d planned_rotation =
@@ -2577,7 +2675,8 @@ int main(int argc, char** argv) {
                 }
             }
         } else if (!fatal_fault && options.mode == ControllerMode::kExecute
-                   && !pause_for_robot_feedback) {
+                   && !pause_for_robot_feedback
+                   && servo_mailbox_available) {
             // 无运动意图时持续发送当前七关节 Hold 目标，而不是退出程序。
             // 这正是 Redis idle/超时/断线状态下保持位置的执行方式。
             const RMResult hold_result = command.TryHoldMotion(model_joints, false);
@@ -2594,21 +2693,20 @@ int main(int argc, char** argv) {
 
         if (!fatal_fault && options.mode == ControllerMode::kExecute) {
             servo_status = command.ServoStatus();
-            if (servo_status.sent_sequence > last_servo_sent_sequence) {
-                last_servo_sent_sequence = servo_status.sent_sequence;
-                last_servo_progress_at = cycle_started;
+            if (servo_status.submitted_sequence
+                    > last_servo_submitted_sequence) {
+                last_servo_submitted_sequence =
+                    servo_status.submitted_sequence;
+                servo_outstanding_since = cycle_started;
+            }
+            if (!ServoOutstanding(servo_status)) {
+                servo_outstanding_since =
+                    std::chrono::steady_clock::time_point{};
             }
             if (servo_status.result_sequence != 0 && !servo_status.result) {
                 fatal_fault = true;
                 fatal_fault_code = "servoj_async_failed";
                 control_output.fault = servo_status.result.message;
-            } else if (ServoOutstanding(servo_status)
-                       && cycle_started - last_servo_progress_at
-                              > std::chrono::milliseconds(100)) {
-                fatal_fault = true;
-                fatal_fault_code = "servoj_mailbox_stalled";
-                control_output.fault =
-                    "ServoJ target remained unsent for more than 100 ms";
             }
         }
 
@@ -2633,7 +2731,7 @@ int main(int argc, char** argv) {
         }
 
         // 5.9 Redis 输出：状态变化、故障变化或新命令确认时立即发布状态；
-        // 传感器消息按 publish_every 降频发布，避免占用 20 ms 控制预算。
+        // 传感器消息按 publish_every 降频发布，避免占用 10 ms 控制预算。
         const bool command_acknowledgement_due = options.redis_enabled
             && intent.sequence != 0
             && intent.sequence != previous_reported_command_sequence;

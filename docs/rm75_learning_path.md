@@ -53,7 +53,7 @@ python main_redis_seg_newphase_recovery_mode.py
 超声图像
   → main_redis_seg_newphase_recovery_mode.py
   → Redis command JSON（Y、RZ、phase、action）
-  → main_rm75（20 ms 控制循环）
+  → main_rm75（10 ms 控制循环）
   → rm75_control（状态机、力控、Tool-X/Y/Z/RZ 增量）
   → 七轴 IK / ServoJ
   → RM75
@@ -70,7 +70,7 @@ RM75 状态反馈 ────────────────────�
 
 1. [RM75 迁移进度](rm75_progress.md)：当前硬件、标定、运行边界和已知问题。
 2. [`infer/Robot/CMakeLists.txt`](../infer/Robot/CMakeLists.txt)：构建目标与库的依赖。
-3. [`infer/Robot/src/main_rm75.cpp`](../infer/Robot/src/main_rm75.cpp)：只看 `Options`、`ApplyImplicitCommissioningProfile`、启动检查、20 ms 主循环和运行摘要。
+3. [`infer/Robot/src/main_rm75.cpp`](../infer/Robot/src/main_rm75.cpp)：只看 `Options`、`ApplyImplicitCommissioningProfile`、启动检查、10 ms 主循环和运行摘要。
 
 模块职责：
 
@@ -187,9 +187,9 @@ Base → Arm_Tip → Tool/Sensor → Probe TCP
 目标力：-3 N
 接触门：|Fz| ≥ 0.99 N
 虚拟质量 M：3
-虚拟阻尼 D：10
+虚拟阻尼 D：20
 普通 Tool-Z 力控上限：0.20 cm/s
-超力开始卸载：Fz ≤ -3.5 N
+超力开始卸载：Fz ≤ -4 N 且连续 0.50 s
 ```
 
 wrench Kalman 和接触点 Kalman 当前均开启。前者平滑补偿后的六个 wrench 分量，
@@ -204,7 +204,7 @@ wrench Kalman 和接触点 Kalman 当前均开启。前者平滑补偿后的六�
 检查项：
 
 - [ ] 能从 CSV/summary 判断普通导纳、卸载、恢复哪个分支正在运行。
-- [ ] 能解释 Tool-X 卡顿常来自 `force_settle`、卸载或恢复，而不一定是 20 ms 调度问题。
+- [ ] 能解释 Tool-X 卡顿常来自 `force_settle`、卸载或恢复，而不一定是 10 ms 调度问题。
 - [ ] 能说明增大 `target_force_unload_margin_n` 会让卸载更晚发生。
 
 ## 6. Tool-Y 居中、Tool-X 扫描与 RZ
@@ -235,6 +235,15 @@ v_y = model_y_direction × model_y_velocity_gain_per_s × visual_y_error
 `2.0 s⁻¹`，单周期 Tool-Y 步长上限为 `1.6 mm`。Y 只有在传感器已接触、
 视觉命令 fresh、处于 moving、且不在卸载/恢复/跟踪暂停时才会真正形成
 Tool-Y 请求。
+
+按 `m` 发布 Scan phase 后，Tool-Y 速度额外乘 `scan_y_scale=0.3`，因此扫描
+阶段等效增益为 `0.6 s⁻¹`；Tool-X 是该阶段的主运动。Trigger 锁存 rotate-align
+后也使用独立的 `rotate_align_y_scale=0.3`。接近和 force_settle 阶段保持完整
+Tool-Y 增益，视觉端负责先滤除横向误差抖动。
+
+当前视觉端在发布 Redis 前执行 Y 调理：`±0.3 mm` 死区直接发布零；新方向需连续
+3 帧确认才发布，确认后以 EMA `alpha=0.25` 低通。按 `b` 开始/停止时会重置该状态，
+避免上一轮扫描的横向误差带入下一轮。
 
 当前 Tool-Y 实际 TCP 跟踪暂停/恢复滞回为 `20 mm / 10 mm`；这与全局
 `25 mm` 机器人位置跟踪故障门独立，后者仍可能先触发故障。

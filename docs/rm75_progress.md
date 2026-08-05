@@ -9,7 +9,7 @@
 ## 当前系统结论
 
 RM75 已具备一条可运行的闭环链路：超声视觉程序通过 Redis 发布 Y、RZ、phase 与 action；
-`main_rm75` 在 20 ms 周期内读取 RM75 与 Haptron 状态，经补偿、力控状态机、七轴数值 IK
+`main_rm75` 在 10 ms 周期内读取 RM75 与 Haptron 状态，经补偿、力控状态机、七轴数值 IK
 和 ServoJ 驱动机器人。当前属于**临时标定下的工程调试系统**，不是已经完成全量计量验收的
 生产系统。
 
@@ -28,7 +28,7 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 超声图像
   → main_redis_seg_newphase_recovery_mode.py
   → Redis 127.0.0.1:7777
-  → main_rm75（20 ms）
+  → main_rm75（10 ms）
   → rm75_control（状态机、Tool-X/Y/Z/RZ 请求）
   → 七轴数值 IK / ServoJ
   → RM75
@@ -42,7 +42,7 @@ RM75 实际关节与 TCP 状态 ────────────────
 | RM75 | `192.168.50.254:8080` |
 | Haptron 串口 | `/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0`，`115200/8N1` |
 | Redis | `127.0.0.1:7777`；视觉端每 200 ms 发布心跳，命令陈旧门为 500 ms |
-| 控制周期 | 20 ms |
+| 控制周期 | 10 ms |
 | 标定文件 | `build/rm75_force_calibration_v6_provisional.json`，当前运行时临时标定 |
 | 最新采样 | `build/calibration_samples_v8.csv` 已采集，尚未拟合并替换当前 v6 JSON |
 | Tool/TCP | Tool 与传感器坐标重合；当前 TCP 为 `0,0,0.188 m`；Arm_Tip 与 Tool 的固定旋转来自标定 |
@@ -74,10 +74,10 @@ idle 握手。只有视觉端发布 fresh 的 moving 命令才开始接近。Red
 | --- | --- |
 | 目标轴向力 | `Fz = -3 N` |
 | 接触门 | `|Fz| >= 0.99 N` |
-| Tool-Z 导纳 | 虚拟质量 `M=3`，阻尼 `D=10`，普通接触速度上限 `0.2 cm/s` |
+| Tool-Z 导纳 | 虚拟质量 `M=3`，阻尼 `D=20`，普通接触速度上限 `0.2 cm/s` |
 | 悬空接近 | `+Tool-Z`，`2 cm/s` |
-| 超力卸载 | 相对目标额外压入 `0.5 N` 即卸载；最大 `-Tool-Z` 速度 `1 cm/s`；卸载/制动/恢复期间禁用 X/Y/RZ |
-| Tool-Y | `v_y = -1 × 2.0 s⁻¹ × y_error`，单周期不超过 `1.6 mm`；`|Fz|>2 N` 才允许 |
+| 超力卸载 | 相对目标额外压入 `1.0 N` 且持续 `0.50 s` 才卸载（当前低于 `-4 N`）；最大 `-Tool-Z` 速度 `1 cm/s`；卸载/制动/恢复期间禁用 X/Y/RZ |
+| Tool-Y | 接近/force_settle 阶段：`v_y = -1 × 2.0 s⁻¹ × y_error`；按 m 的 Scan phase 与 rotate-align 均缩放为 `0.3` 倍，单周期不超过 `1.6 mm`；视觉端先经过死区、低通和连续帧确认；`|Fz|>2 N` 才允许 |
 | Tool-X | 力连续 `0.5 s` 位于 `-3±0.8 N` 后，沿 `-Tool-X` 连续扫描 `1 cm/s` |
 | Tool-RZ | Trigger 后按有符号视觉 RZ 修正；最大 `10°/s`，累计 RZ 额度 `120°` |
 | wrench 硬门 | 补偿后 Fx/Fy/Fz `50 N`，力矩 `5 N·m`；原始数据门同为 `50 N / 5 N·m` |
@@ -97,7 +97,7 @@ idle 握手。只有视觉端发布 fresh 的 moving 命令才开始接近。Red
 | 接触姿态调整 | 已开启 | 过滤后的接触点驱动 Tool-X/Roll；Pitch 接线同样使用过滤结果，但默认增益为 0，因此当前不产生 Pitch 修正。 |
 | Z 力控、超力卸载与恢复 | 已实现，需持续调参验收 | 超力时独立于 Redis Hold 也可纯轴向卸载；idle 下制动结束后不自动重新接近。 |
 | Tool-Y 居中 | 已实现，真机量化待完成 | 视觉误差转比例速度；有接触、fresh moving、非卸载/恢复且实际 TCP 可跟上时生效。 |
-| Tool-X 扫描与 Trigger/RZ | 已实现，端到端验收待完成 | `b` 接近和 Y；`m` 请求 scan phase；视觉稳定 phase=1 才进入 Trigger/RZ。 |
+| Tool-X 扫描与 Trigger/RZ | 已实现，端到端验收待完成 | `b` 接近和 Y；`m` 请求 scan phase；视觉稳定 phase=1 后进入 Trigger/RZ。 |
 | Redis session、sequence、Hold、状态发布 | 已实现 | 新 session 先 idle，序号只增不重复累计；过期命令进入 Hold。 |
 | CSV/summary 运行记录 | 已实现 | 包括 state、视觉命令、Tool 增量、力、接触、卸载/恢复、跟踪门和时序。 |
 | 自动测试 / 回放验证 | 未完成 | 当前 CTest 没有已注册测试；需建立 Redis/状态机回放与离线控制测试。 |
@@ -118,7 +118,7 @@ terminate / t → Armed；Ctrl+C 或真实故障 → Stop 并退出
 
 无接触、超力卸载、制动和恢复均会压制横向/旋转，因而 X 或 Y 的“停顿”首先应结合 CSV 中的
 `state`、`target_force_unloading`、`target_force_recovering` 与 `command_fresh` 判断，而不是先归因于
-20 ms 周期。
+10 ms 周期。
 
 ## 日志与故障定位
 

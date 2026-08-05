@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 // 本文件实现 RM75 的 TCP 传输层，分为五部分：
-// 1) JSON 报文与单位转换；2) 同步维护命令；3) 20 ms 控制所用的异步
+// 1) JSON 报文与单位转换；2) 同步维护命令；3) 10 ms 控制所用的异步
 // 状态读取；4) 无锁 ServoJ 邮箱；5) Stop 的优先级与确认机制。
 // 上层 main_rm75/rm75_control 只通过 realman_command.hpp 的接口调用，不应
 // 依赖这里的 socket、报文拆包或线程同步细节。
@@ -1312,7 +1312,7 @@ RobotStateSnapshot RMCommand::CachedRobotState(
 // -------------------------------------------------------------------------
 // 模块六：异步 ServoJ 邮箱（控制线程 -> I/O 线程）
 // -------------------------------------------------------------------------
-// 控制线程在 20 ms 周期中只发布固定大小的关节目标；I/O 线程负责 JSON 序列化、
+// 控制线程在 10 ms 周期中只发布固定大小的关节目标；I/O 线程负责 JSON 序列化、
 // socket 发送和结果记录。邮箱最多保留一个待发或在途目标，防止 I/O 卡顿后积压旧轨迹。
 
 bool RMCommand::TryPublishServoTarget(
@@ -1896,7 +1896,7 @@ void RMStateReader::ThreadMain() {
         }
 
         if (response.contains("arm_state")) {
-            // 正常状态帧：解析、分配递增序号并原子发布，供 20 ms 控制循环读取。
+            // 正常状态帧：解析、分配递增序号并原子发布，供 10 ms 控制循环读取。
             RobotStateSnapshot parsed;
             const RMResult parse_result = ParseRobotStateMessage(response, parsed);
             if (!parse_result) {

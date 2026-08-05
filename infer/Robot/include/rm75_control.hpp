@@ -9,7 +9,7 @@
 
 #include <realman_kinematics.hpp>
 
-// 控制状态机：由 Rm75ControlLaw::Step 在每个 20 ms 周期更新。
+// 控制状态机：由 Rm75ControlLaw::Step 在每个 10 ms 周期更新。
 enum class Rm75SupervisorState {
     // 初始化/仅观测/已握手但静止。
     kInitializing,
@@ -50,9 +50,9 @@ struct Rm75ControlConfig {
     // RM75 生产闭环的控制参数集中在本结构中。main_rm75 只注入本次
     // 标定得到的 Tool/TCP 坐标关系，不再逐项覆盖这些算法参数。
     // ===== 1. 控制周期、接触门与 wrench 安全门 =====
-    double cycle_s = 0.020;                 // 主控制周期（s）
+    double cycle_s = 0.010;                 // 主控制周期（s）
     // 目标 Tool-Z 力（N）；负号表示压向组织。
-    double desired_force_n = -3.0;
+    double desired_force_n = -2.5;
     // |Fz| 达到该值后锁存“已接触”（N）。
     double contact_threshold_n = 0.99;
     // 补偿后 Tool-X/Y 与 Tool-Z 的独立力门（N）。
@@ -69,11 +69,14 @@ struct Rm75ControlConfig {
     // ===== 2. Tool-Z 导纳、超力卸载与重新接触 =====
     // 导纳模型 M*a + D*v = F_target - F_measured 的虚拟质量/阻尼。
     double force_virtual_mass = 3.0;
-    double force_virtual_damping = 10.0;
+    double force_virtual_damping = 20.0;
     // 相对目标力的超力卸载：额外压入超过该裕量时，暂停横向/角运动并执行 -Tool-Z。
     bool target_force_unload_enabled = true; // 是否启用相对目标力的卸载层
-    // Fz 比目标力额外压入该值时启动 -Tool-Z 卸载（N）。
-    double target_force_unload_margin_n = 0.5;
+    // Fz 比目标力额外压入该值时启动 -Tool-Z 卸载（N）。当前 -3 N
+    // 目标下，须低于 -4 N 才进入卸载，避免正常力控波动频繁触发。
+    double target_force_unload_margin_n = 1.0;
+    // 力连续超过卸载门的最短时间（s）。短暂噪声或接触瞬态不会触发卸载。
+    double target_force_unload_entry_duration_s = 0.50;
     // 超力误差达到减速力带时的最大卸载速度；回到目标力时线性降至零。
     double target_force_unload_speed_m_s = 0.01; // 最大卸载速度（m/s）
     double target_force_unload_deceleration_band_n = 1.0; // 卸载减速力带（N）
@@ -110,7 +113,7 @@ struct Rm75ControlConfig {
     double max_force_axis_speed_m_s = 0.002; // 普通接触导纳 Tool-Z 最大速度
     // 视觉 rotate-align 的 Tool-RZ 使用独立速度上限，不与接触点驱动的
     // Roll/Pitch 共用公共角速度包络。
-    double max_model_rz_speed_rad_s = 10.0 * M_PI / 180.0; // 视觉 Tool-RZ 最大速度
+    double max_model_rz_speed_rad_s = 5.0 * M_PI / 180.0; // 视觉 Tool-RZ 最大速度
     // Trigger 锁存 rotate-align 后，按每周期实际执行的 |delta_rz| 累计。
     // 达到该额度后只停止 Tool-RZ，其他平移和力控维度继续运行。
     double maximum_total_model_rz_rotation_rad = 120.0 * M_PI / 180.0; // Trigger 后累计 RZ 额度
@@ -122,9 +125,12 @@ struct Rm75ControlConfig {
     // 比例速度律：v_y = direction × gain × y；每周期位移为 v_y × cycle_s。
     // 旧六轴 Tool-Y 速度的 2/25：
     // v_y = (2/25 * 0.5 / 0.02) * visual_y_error = 2 /s * error。
-    double model_y_velocity_gain_per_s = 2.0;
+    double model_y_velocity_gain_per_s = 1.0;
     // 旧六轴横向单周期步长上限，转换为当前速度控制形式后仍保留。
     double maximum_model_y_step_m = 0.0016; // 单周期 Tool-Y 最大步长（m）
+    // 按 m 进入 Scan phase 后的 Tool-Y 速度缩放。接近与 force_settle 阶段
+    // 保持完整居中速度；扫描时降速，避免横向修正抢占 Tool-X 扫描轨迹。
+    double scan_y_scale = 0.5;
     // 实际探头 TCP 沿 Tool-Y 落后于最新 ServoJ 模型目标时，仅暂停 Y 参考积分；
     // 暂停/恢复使用滞回，给机械臂追赶时间并避免阈值附近反复切换。
     double visual_y_tracking_pause_error_m = 0.020; // 实际 TCP 落后该 Tool-Y 误差时暂停积分
@@ -231,6 +237,7 @@ private:
     bool target_force_release_pending_ = false; // 达到释放力后等待制动完成
     bool target_force_recovering_ = false; // 制动/重新接触阶段
     bool target_force_contact_reacquired_ = false; // 重新满足接触门
+    double target_force_unload_overload_time_s_ = 0.0; // 连续超力计时
     bool wrench_filter_initialized_ = false;
     Eigen::Matrix<double, 6, 1> filtered_wrench_ =
         Eigen::Matrix<double, 6, 1>::Zero();
@@ -275,15 +282,15 @@ const char* Rm75PlanErrorString(Rm75PlanError error);
 
 struct Rm75ServoPlannerConfig {
     // 关节规划参数属于 ServoJ/IK 模块；main_rm75 不再覆盖这些值。
-    int period_ms = 20; // ServoJ 规划周期（ms）
+    int period_ms = 10; // ServoJ 规划周期（ms）
     double damping = 0.001; // 阻尼最小二乘 IK 的 λ
     double joint_limit_warning_deg = 10.0; // 距关节限位该角度内记录预警
     double joint_limit_stop_deg = 3.0; // 距关节限位该角度内拒绝规划
     double singularity_warning_deg = 5.0; // 奇异性预警角度裕量
     double minimum_task_singular_value = 1e-5; // Jacobian 最小奇异值门
-    // 每个 20 ms 周期允许使用官方最大关节速度的 100%。
+    // 每个 10 ms 周期允许使用官方最大关节速度的 100%。
     // 速度比例乘周期不得超过最小下发间隔。
-    double minimum_dispatch_gap_ms = 20.0; // 相邻 ServoJ 下发的最小时间间隔
+    double minimum_dispatch_gap_ms = 10.0; // 相邻 ServoJ 下发的最小时间间隔
     double joint_speed_scale = 1.0; // 官方最大关节速度比例
     double max_joint_accel_deg_s2 = 90.0; // 相邻周期关节速度变化上限
     bool allow_near_singularity = false; // true 仅用于诊断，生产入口保持 false
@@ -296,7 +303,7 @@ struct Rm75RuntimeSafetyConfig {
     double raw_force_limit_n = 50.0;
     double raw_torque_limit_nm = 5.0;
     // 实际反馈相对 ServoJ 模型目标的跟踪故障门。
-    double max_tracking_joint_error_deg = 5.0;
+    double max_tracking_joint_error_deg = 20.0;
     double max_tracking_position_error_mm = 25.0;
     // 0 表示不单独以笛卡尔姿态残差终止；关节与位置误差仍受监督。
     double max_tracking_orientation_error_deg = 0.0;

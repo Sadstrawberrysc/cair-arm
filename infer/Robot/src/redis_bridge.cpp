@@ -233,7 +233,7 @@ void RedisBridge::NotifyPublisherLocked() {
     } while (written < 0 && errno == EINTR);
     // EAGAIN means the event counter is already saturated, which is still a
     // pending notification. Other errors are handled by the publisher's
-    // bounded poll/retry path rather than the 20 ms producer path.
+    // bounded poll/retry path rather than the 10 ms producer path.
 }
 
 void RedisBridge::PublishSensor(const RedisSensorMessage& message) {
@@ -241,7 +241,7 @@ void RedisBridge::PublishSensor(const RedisSensorMessage& message) {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     if (!running_.load()) return;
     // Sensor telemetry is latest-value data. Replacing an unpublished sample
-    // prevents backpressure and keeps JSON serialization out of the 20 ms
+    // prevents backpressure and keeps JSON serialization out of the 10 ms
     // control path.
     pending_sensor_message_ = message;
     has_pending_sensor_message_ = true;

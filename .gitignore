@@ -107,3 +107,12 @@ infer/ContactPointShow/model
 # 3D models
 *.stl
 *.obj
+
+# Local RM75 inference assets and generated runtime data. Keep these on the
+# deployment machine; commit the inference source without multi-GB weights.
+Galaxy_camera.tar.gz
+intergrate_infer/weights/
+intergrate_infer/runs_ConvNeXtBase_single/*.pth
+intergrate_infer/output/
+intergrate_infer/dump.rdb
+intergrate_infer/cca.json
