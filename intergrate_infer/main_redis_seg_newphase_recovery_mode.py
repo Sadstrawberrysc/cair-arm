@@ -28,7 +28,7 @@ from utils import (
     build_inv_normalizer_from_dataset,
 )
 from ultralytics import YOLO
-from runs_ConvNeXtBase_single.infer_realtime import (
+from infer_realtime import (
     SingleConvNeXtClassifier,
     build_transform as build_convnext_transform,
     get_state_dict as get_convnext_state_dict,
@@ -52,12 +52,14 @@ CONVNEXT_TO_ROBOT_PHASE = {0: 0, 1: 0, 2: 0, 3: 1, 4: 2}
 COMMAND_CHANNEL = "robot:command:channel"
 STATUS_CHANNEL = "robot:status:channel"
 
-# Match infer/pose_pred/main_fast.py exactly: crop the raw 1920x1080 BGR
-# capture to rows 160:800 and columns 510:1110. The result is 640x600
-# (height x width), with no vertical flip before model inference.
-ULTRASOUND_ROI = (160, 800, 510, 1110)
+# Start from the historical 640x600 ultrasound ROI, then remove its fixed
+# black side bars: 22 pixels on the left and 21 pixels on the right. Express
+# the combined crop directly in raw 1920x1080 capture coordinates so YOLO,
+# segmentation, pose/angle and phase inference all receive the same 640x557
+# image, with no vertical flip.
+ULTRASOUND_ROI = (160, 800, 532, 1089)
 ULTRASOUND_FRAME_HEIGHT = 640
-ULTRASOUND_FRAME_WIDTH = 600
+ULTRASOUND_FRAME_WIDTH = 557
 
 
 def crop_ultrasound_frame(frame_bgr):
@@ -115,13 +117,19 @@ def normal_termination_frame_ready(
     rz_value,
     yolo_valid,
     seg_valid,
+    vessel_pixels,
+    pre_rotation_vessel_pixels,
+    vessel_pixel_growth_ratio,
     rz_tolerance_deg,
 ):
     """Return whether one frame satisfies every automatic finish condition."""
     return bool(
         int(latest_phase_idx) == 4
-        and bool(yolo_valid)
-        and bool(seg_valid)
+        and (bool(yolo_valid) or bool(seg_valid))
+        and int(pre_rotation_vessel_pixels) > 0
+        and int(vessel_pixels)
+            > int(pre_rotation_vessel_pixels)
+                * float(vessel_pixel_growth_ratio)
         and np.isfinite(rz_value)
         and abs(float(rz_value)) < float(rz_tolerance_deg)
     )
@@ -251,7 +259,8 @@ class VisionCommandPublisher:
                 f"confidence: {command_data['phase_confidence']:.3f}, "
                 f"y: {float(y_value):.4f} m, rz: {float(rz_value):.3f} deg, "
                 f"terminate: {bool(terminate_value)}, "
-                f"recovery: {bool(recovery_mode_value)}"
+                f"recovery: {bool(recovery_mode_value)}, "
+                f"mask_side: {int(mask_lr_majority)}"
             )
         return command_data
 
@@ -336,10 +345,10 @@ def check_command_protocol():
     scan_values = gate_visual_command_for_scan(
         0.0012,
         -8.5,
-        0,
+        2,
         0.86,
         True,
-        -1,
+        1,
         True,
     )
     scan = publisher.publish(
@@ -350,7 +359,7 @@ def check_command_protocol():
         phase_idx=scan_values[2],
         phase_confidence=scan_values[3],
         robot_action_state="moving",
-        mask_lr_majority=-1,
+        mask_lr_majority=scan_values[5],
     )
     if idle is None or axial is None or scan is None:
         raise RuntimeError("command protocol self-check failed to publish")
@@ -371,10 +380,10 @@ def check_command_protocol():
     if (
         scan["sequence"] != 3
         or not scan["action_state"]
-        or scan["phase_idx"] != 0
+        or scan["phase_idx"] != 2
         or scan["phase_confidence"] != 0.86
         or not scan["recovery_mode"]
-        or scan["mask_lr_majority"] != -1
+        or scan["mask_lr_majority"] != 1
     ):
         raise RuntimeError("m/scan command fields are invalid")
     if (
@@ -1059,7 +1068,7 @@ def main():
     # RM75 phases as: pre/in/after -> Scan, brench -> Trigger, rota -> Action.
     phase_classifier_ckpt = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        'runs_ConvNeXtBase_single',
+        'weights',
         'runs_ConvNeXtBase_single.pth',
     )
 
@@ -1096,16 +1105,21 @@ def main():
         2: 0.55,
     }
 
-    # Normal completion requires the latest model's raw class 4 (rota), both
-    # vessel detectors, and a stable RZ residual inside this tolerance.
+    # Normal completion requires the latest model's raw class 4 (rota), at
+    # least one vessel detector, and a stable RZ residual inside this tolerance.
     termination_rz_tolerance_deg = 12.0
-    termination_stable_frames = 5
+    termination_stable_frames = 20
     termination_stable_count = 0
+    termination_vessel_pixel_growth_ratio = 3.0
+    pre_rotation_vessel_pixels = 0
+    pre_rotation_vessel_pixels_locked = False
+    auto_terminate_latched = False
+    terminate_command_sequence = 0
 
-    # Tool-Y 视觉误差调理：0.3 mm 内视为已居中；方向连续 3 帧才生效；
-    # 之后使用 EMA（alpha=0.25）平滑逐帧 posehead 抖动。
-    visual_y_deadband_m = 0.0003
-    visual_y_lowpass_alpha = 0.25
+    # Tool-Y 视觉误差调理：0.15 mm 居中死区，方向连续 3 帧确认；
+    # alpha=1.0 表示直接采用当前帧误差，不进行 EMA 低通。
+    visual_y_deadband_m = 0.00001
+    visual_y_lowpass_alpha = 1.0
     visual_y_confirmation_frames = 3
     visual_y_conditioner = VisualYConditioner(
         visual_y_deadband_m,
@@ -1383,7 +1397,43 @@ def main():
 
     while inference_running:
         if is_display_frozen and frozen_display_frame is not None:
-            cv2.imshow('US image', frozen_display_frame)
+            # Keep consuming robot status after freezing the completed US
+            # image, so the operator can see whether the latched terminate
+            # command has actually been acknowledged by this Redis session.
+            latest_robot_status, robot_action_state = poll_redis_messages(
+                redis_pubsub,
+                latest_robot_status,
+                robot_action_state,
+            )
+            frozen_with_ack = frozen_display_frame.copy()
+            status = latest_robot_status or {}
+            session_matches = (
+                status.get("session_id") == command_publisher.session_id
+            )
+            acknowledged_sequence = (
+                status.get("producer_sequence", 0) if session_matches else 0
+            )
+            terminate_acknowledged = (
+                terminate_command_sequence > 0
+                and isinstance(acknowledged_sequence, (int, float))
+                and acknowledged_sequence >= terminate_command_sequence
+            )
+            cv2.rectangle(
+                frozen_with_ack, (0, 395),
+                (frozen_with_ack.shape[1], 445), (0, 0, 0), -1,
+            )
+            cv2.putText(
+                frozen_with_ack,
+                (
+                    f"Terminate latched=True seq={terminate_command_sequence} "
+                    f"ack={terminate_acknowledged} "
+                    f"robot={status.get('state', 'no-status')}"
+                ),
+                (10, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                (0, 255, 0) if terminate_acknowledged else (0, 255, 255),
+                2, cv2.LINE_AA,
+            )
+            cv2.imshow('US image', frozen_with_ack)
             key = cv2.waitKey(1)
             if key == ord('q'):
                 print("[Python] User requested quit")
@@ -1570,6 +1620,10 @@ def main():
             trigger_inference = not trigger_inference
             scan_enabled = False
             termination_stable_count = 0
+            pre_rotation_vessel_pixels = 0
+            pre_rotation_vessel_pixels_locked = False
+            auto_terminate_latched = False
+            terminate_command_sequence = 0
             visual_y_conditioner.reset()
             current_phase_idx = 0
             phase_candidate_idx = 0
@@ -1599,6 +1653,10 @@ def main():
             else:
                 scan_enabled = not scan_enabled
                 termination_stable_count = 0
+                pre_rotation_vessel_pixels = 0
+                pre_rotation_vessel_pixels_locked = False
+                auto_terminate_latched = False
+                terminate_command_sequence = 0
                 current_phase_idx = 0
                 phase_candidate_idx = 0
                 phase_candidate_count = 0
@@ -1709,25 +1767,66 @@ def main():
                         raw_y_value = float(pred_xy_real[0, 0].cpu().numpy())
                         y_value = visual_y_conditioner.update(raw_y_value)
                         rz_value = float(angle[0, 0].cpu().numpy())
+
+                        # Before the first rotation phase of this m/scan run,
+                        # retain the latest non-zero segmentation vessel area.
+                        # Lock it when phase 2 begins; later phase rollback must
+                        # not move the baseline used by the 3x completion gate.
+                        if (
+                            scan_enabled
+                            and not pre_rotation_vessel_pixels_locked
+                        ):
+                            if phase_idx < 2 and vessel_pixels > 0:
+                                pre_rotation_vessel_pixels = int(vessel_pixels)
+                            elif (
+                                phase_idx == 2
+                                and pre_rotation_vessel_pixels > 0
+                            ):
+                                pre_rotation_vessel_pixels_locked = True
+                                print(
+                                    "[AutoTerminate] Pre-rotation vessel "
+                                    "pixel baseline locked: "
+                                    f"{pre_rotation_vessel_pixels}"
+                                )
                         termination_frame_ready = normal_termination_frame_ready(
                             latest_phase_idx=latest_phase_idx,
                             rz_value=rz_value,
                             yolo_valid=yolo_valid,
                             seg_valid=seg_valid,
+                            vessel_pixels=vessel_pixels,
+                            pre_rotation_vessel_pixels=(
+                                pre_rotation_vessel_pixels
+                                if pre_rotation_vessel_pixels_locked else 0
+                            ),
+                            vessel_pixel_growth_ratio=(
+                                termination_vessel_pixel_growth_ratio
+                            ),
                             rz_tolerance_deg=termination_rz_tolerance_deg,
                         )
-                        termination_stable_count = (
-                            termination_stable_count + 1
-                            if termination_frame_ready else 0
-                        )
-                        auto_terminate = (
-                            termination_stable_count
-                            >= termination_stable_frames
-                        )
-                        terminate_value = gate_terminate_for_scan(
-                            auto_terminate=auto_terminate,
-                            manual_terminate=terminate_flag_key,
-                            scan_enabled=scan_enabled,
+                        if scan_enabled:
+                            termination_stable_count = (
+                                termination_stable_count + 1
+                                if termination_frame_ready else 0
+                            )
+                            if (
+                                not auto_terminate_latched
+                                and termination_stable_count
+                                >= termination_stable_frames
+                            ):
+                                auto_terminate_latched = True
+                                print(
+                                    "[AutoTerminate] Completion conditions "
+                                    "stable; terminate latched true"
+                                )
+                        else:
+                            termination_stable_count = 0
+
+                        # Automatic completion is only allowed to latch above
+                        # while m/scan is enabled. Once latched, both the Redis
+                        # command and the US-image UI remain explicitly true.
+                        auto_terminate = auto_terminate_latched
+                        terminate_value = bool(
+                            terminate_flag_key or auto_terminate_latched
                         )
                         # Report/Hold uses exactly the same qualified automatic
                         # completion gate; there is no independent RZ shortcut.
@@ -1766,16 +1865,36 @@ def main():
 
 
                         if phase_idx == 2:
-                            if frame_has_target:
-                                found_vessel_count += 1
-                                lost_vessel_count = 0
-                                if found_vessel_count >= recover_vessel_patience:
-                                    recovery_mode = False
-                            elif frame_lost_target:
-                                lost_vessel_count += 1
+                            if recovery_mode:
+                                # 与原六轴退出语义一致：YOLO 与分割同时有效
+                                # 时累计 found；两者同时丢失才清零 found；
+                                # 只有一个检测器有效时保留计数，既不累加也不清零。
+                                if frame_has_target:
+                                    found_vessel_count += 1
+                                    lost_vessel_count = 0
+                                    if found_vessel_count >= recover_vessel_patience:
+                                        recovery_mode = False
+                                        found_vessel_count = 0
+                                        print(
+                                            "[Recovery] Vessel reacquired; "
+                                            "leave rotation recovery"
+                                        )
+                                elif frame_lost_target:
+                                    lost_vessel_count += 1
+                                    found_vessel_count = 0
+                            else:
+                                # 未进入恢复时，只有 YOLO 与分割连续同时丢失
+                                # 才进入旋转丢失恢复；C++ 在上升沿锁存此时
+                                # mask_lr_majority：左侧驱动 -Tool-Y，右侧驱动
+                                # +Tool-Y，固定速度 0.002 m/s，同时保持 X/RZ 为零。
                                 found_vessel_count = 0
-                                if lost_vessel_count >= lost_vessel_patience:
-                                    recovery_mode = True
+                                if frame_lost_target:
+                                    lost_vessel_count += 1
+                                    if lost_vessel_count >= lost_vessel_patience:
+                                        recovery_mode = True
+                                        lost_vessel_count = 0
+                                else:
+                                    lost_vessel_count = 0
                         else:
                             recovery_mode = False
                             lost_vessel_count = 0
@@ -1811,7 +1930,7 @@ def main():
                         )
 
                         # b 只允许 Z；m 开启后才发布 X/Y/RZ 所需的视觉量。
-                        command_publisher.publish(
+                        published_command = command_publisher.publish(
                             command_y,
                             command_rz,
                             terminate_value,
@@ -1821,6 +1940,14 @@ def main():
                             robot_action_state=robot_action_state,
                             mask_lr_majority=command_mask_lr_majority,
                         )
+                        if (
+                            auto_terminate_latched
+                            and published_command is not None
+                            and terminate_command_sequence == 0
+                        ):
+                            terminate_command_sequence = int(
+                                published_command["sequence"]
+                            )
                     
                     # --- Visualization ---
                     overlay_text = f"y: {y_value:.4f}"
@@ -1835,7 +1962,13 @@ def main():
 
                     cv2.putText(cavana, phase_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, p_color, 2, cv2.LINE_AA)
                     terminate_text = f"Terminate: {terminate_value}"
-                    cv2.putText(cavana, terminate_text, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(
+                        cavana, terminate_text, (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 255, 0) if auto_terminate_latched
+                        else (255, 255, 255),
+                        2, cv2.LINE_AA,
+                    )
                     if y_value > 0.0003:
                         cv2.arrowedLine(cavana, (50, 50), (100, 50), (0, 0, 255), 2)
                         cv2.putText(cavana, overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
@@ -1876,12 +2009,12 @@ def main():
 
         if freeze_request and not is_display_frozen:
             frozen_display_frame = cavana.copy()
-            is_display_frozen = False
+            is_display_frozen = True
             print("[Python] Hold condition met. Display frozen.")
             if (not report_generated_once) and (report_thread is None or not report_thread.is_alive()):
                 print("[AutoReport] Starting report generation...")
                 if command_publisher:
-                    command_publisher.publish(
+                    final_terminate_command = command_publisher.publish(
                         0.0,
                         0.0,
                         True,
@@ -1891,6 +2024,10 @@ def main():
                         robot_action_state="idle",
                         mask_lr_majority=0,
                     )
+                    if final_terminate_command is not None:
+                        terminate_command_sequence = int(
+                            final_terminate_command["sequence"]
+                        )
                 print("[Python] Sent final terminate command")
                 report_generated_once = True
                 report_thread = threading.Thread(target=_report_worker, daemon=True)

@@ -228,21 +228,28 @@ Tool-Y 当前为比例速度控制：
 
 ```text
 v_y = model_y_direction × model_y_velocity_gain_per_s × visual_y_error
-Δy = v_y × 0.02 s
+Δy = v_y × 0.01 s
 ```
 
-当前配置中符号为 `-1`，速度为旧六轴的 `2/25`，等效增益为
-`2.0 s⁻¹`，单周期 Tool-Y 步长上限为 `1.6 mm`。Y 只有在传感器已接触、
+当前配置中符号为 `-1`，等效增益为 `1.0 s⁻¹`，单周期 Tool-Y 步长上限为
+`0.5 mm`（10 ms 周期下等效最高 `5 cm/s`）。Y 只有在传感器已接触、
 视觉命令 fresh、处于 moving、且不在卸载/恢复/跟踪暂停时才会真正形成
 Tool-Y 请求。
 
-按 `m` 发布 Scan phase 后，Tool-Y 速度额外乘 `scan_y_scale=0.3`，因此扫描
-阶段等效增益为 `0.6 s⁻¹`；Tool-X 是该阶段的主运动。Trigger 锁存 rotate-align
-后也使用独立的 `rotate_align_y_scale=0.3`。接近和 force_settle 阶段保持完整
+按 `m` 发布 Scan phase 后，Tool-Y 速度额外乘 `scan_y_scale=0.5`，因此扫描
+阶段等效增益为 `0.5 s⁻¹`；Tool-X 是该阶段的主运动。Trigger 锁存 rotate-align
+后使用独立的 `rotate_align_y_scale=0.3`，等效增益为 `0.3 s⁻¹`。接近和 force_settle 阶段保持完整
 Tool-Y 增益，视觉端负责先滤除横向误差抖动。
 
-当前视觉端在发布 Redis 前执行 Y 调理：`±0.3 mm` 死区直接发布零；新方向需连续
-3 帧确认才发布，确认后以 EMA `alpha=0.25` 低通。按 `b` 开始/停止时会重置该状态，
+Action/phase=2 中若 YOLO/分割连续判定血管丢失，视觉端发布
+`recovery_mode=true` 与最近掩膜多数侧 `mask_lr_majority`（`1=左`、`2=右`）。
+C++ 在进入恢复的上升沿锁存 `mask_lr_majority`：丢失前血管位于图像左侧时
+以 `+Tool-Y`、位于右侧时以 `-Tool-Y` 按固定 `0.002 m/s` 恢复；未知侧别时
+Tool-Y 保持为零。恢复期间 Tool-X/RZ 为零、冻结 Roll/Pitch并保留 Tool-Z
+力控；YOLO 与分割重新连续检测到血管 5 帧后退出恢复。
+
+当前视觉端在发布 Redis 前执行 Y 调理：`±0.15 mm` 死区直接发布零；新方向需连续
+3 帧确认才发布；`alpha=1.0`，不再进行 EMA 低通。按 `b` 开始/停止时会重置该状态，
 避免上一轮扫描的横向误差带入下一轮。
 
 当前 Tool-Y 实际 TCP 跟踪暂停/恢复滞回为 `20 mm / 10 mm`；这与全局
@@ -276,6 +283,8 @@ Tool-Y 增益，视觉端负责先滤除横向误差抖动。
   "sequence": 123,
   "parameters": {"y": 0.0012, "rz": -8.5},
   "phase_idx": 0,
+  "recovery_mode": false,
+  "mask_lr_majority": 0,
   "action_state": true,
   "terminate": false
 }
@@ -283,7 +292,12 @@ Tool-Y 增益，视觉端负责先滤除横向误差抖动。
 
 协议原则：新视觉 session 先发送 idle；同一 session 的 sequence 递增；视觉端每 200 ms 心跳刷新命令。命令超过 500 ms、Redis 断线或 JSON 无效时机器人进入 Hold，不继续累计视觉目标。
 
-phase 含义：`0=Scan`、`1=Trigger`、`2=Action`。按 `b` 的 phase 为 -1，只开始接近与 Tool-Y；按 `m` 将 phase 置为 0，使扫描状态机可进入 Tool-X；视觉稳定发布 phase 1 后才可能进入 Trigger/RZ 对齐。
+phase 含义：`0=Scan`、`1=Trigger`、`2=Action`。按 `b` 的 phase 为 -1，只开始接近与 Tool-Y；按 `m` 将 phase 置为 0，使扫描状态机可进入 Tool-X；视觉稳定发布 phase 1 后进入 Trigger/RZ 对齐；phase 2 中可通过 `recovery_mode` 与 `mask_lr_majority` 请求有方向的重新搜索。
+
+当前 phase 推理直接复用 `intergrate_infer/infer_realtime.py` 的单帧
+ConvNeXt-Base、224×224 Resize 和 ImageNet Normalize，加载
+`intergrate_infer/weights/runs_ConvNeXtBase_single.pth`。模型五分类按
+`0/1/2→Scan(0)、3→Trigger(1)、4→Action(2)` 转换后再进入防抖状态机。
 
 检查项：
 
@@ -291,6 +305,7 @@ phase 含义：`0=Scan`、`1=Trigger`、`2=Action`。按 `b` 的 phase 为 -1，
 - [ ] 按 `b` 后观察 `action_state=true`、`phase=-1`。
 - [ ] 按 `m` 后观察 `phase=0`，命令年龄持续低于 500 ms。
 - [ ] 能判断“不旋转”是视觉未发 phase 1、Trigger 的 Y 条件未满足，还是未进入稳定接触。
+- [ ] 人工让目标丢失，核对 CSV 中 `recovery_search_active=1` 时 `requested_dx_tool_m=0` 且 `requested_drz_tool_rad=0`。
 
 ## 8. 日志驱动调试与修改规范
 

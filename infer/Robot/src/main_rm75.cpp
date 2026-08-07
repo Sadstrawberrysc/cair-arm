@@ -197,6 +197,8 @@ struct RuntimeLogRow {
     double command_age_ms = 0.0;
     bool command_action_enabled = false;
     bool command_terminate = false;
+    bool command_recovery_mode = false;
+    int command_mask_lr_majority = 0;
     int command_phase_index = -1;
     double command_model_y_m = 0.0;
     double command_model_rz_deg = 0.0;
@@ -235,6 +237,11 @@ struct RuntimeLogRow {
     bool target_force_reference_rebased = false;
     bool visual_y_tracking_paused = false;
     bool visual_y_tracking_reference_rebased = false;
+    bool recovery_search_active = false;
+    int recovery_locked_mask_side = 0;
+    double recovery_tool_y_velocity_m_s = 0.0;
+    double recovery_search_distance_m = 0.0;
+    bool recovery_distance_limit_reached = false;
     Eigen::Matrix<double, 7, 1> target_joints =
         Eigen::Matrix<double, 7, 1>::Zero();
     std::string fault;
@@ -280,6 +287,7 @@ public:
                    "command_producer_timestamp_unix_ms,command_phase_confidence,"
                    "command_connection_generation,"
                    "command_age_ms,command_action_enabled,command_terminate,"
+                   "command_recovery_mode,command_mask_lr_majority,"
                    "command_phase_index,command_model_y_m,command_model_rz_deg,"
                    "command_desired_force_n,command_hold_reason,"
                    "servo_submitted_sequence,servo_consumed_sequence,"
@@ -309,6 +317,9 @@ public:
                    "target_force_reference_rebased,"
                    "visual_y_tracking_paused,"
                    "visual_y_tracking_reference_rebased,"
+                   "recovery_search_active,recovery_locked_mask_side,"
+                   "recovery_tool_y_velocity_m_s,recovery_search_distance_m,"
+                   "recovery_distance_limit_reached,"
                    "j1_rad,j2_rad,j3_rad,j4_rad,j5_rad,j6_rad,j7_rad,fault\n";
         queue_.resize(kMaximumRows);
         queue_head_ = 0;
@@ -427,6 +438,8 @@ private:
                     << ',' << row.command_age_ms
                     << ',' << (row.command_action_enabled ? 1 : 0)
                     << ',' << (row.command_terminate ? 1 : 0)
+                    << ',' << (row.command_recovery_mode ? 1 : 0)
+                    << ',' << row.command_mask_lr_majority
                     << ',' << row.command_phase_index
                     << ',' << row.command_model_y_m
                     << ',' << row.command_model_rz_deg
@@ -467,7 +480,12 @@ private:
                     << ',' << (row.target_force_recovering ? 1 : 0)
                     << ',' << (row.target_force_reference_rebased ? 1 : 0)
                     << ',' << (row.visual_y_tracking_paused ? 1 : 0)
-                    << ',' << (row.visual_y_tracking_reference_rebased ? 1 : 0);
+                    << ',' << (row.visual_y_tracking_reference_rebased ? 1 : 0)
+                    << ',' << (row.recovery_search_active ? 1 : 0)
+                    << ',' << row.recovery_locked_mask_side
+                    << ',' << row.recovery_tool_y_velocity_m_s
+                    << ',' << row.recovery_search_distance_m
+                    << ',' << (row.recovery_distance_limit_reached ? 1 : 0);
             for (int i = 0; i < 7; ++i) stream_ << ',' << row.target_joints[i];
             std::string escaped_fault = row.fault;
             std::replace(escaped_fault.begin(), escaped_fault.end(), ',', ';');
@@ -529,7 +547,7 @@ void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
         "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0";
     options.sensor_baud = 115200;
     options.calibration_path =
-        (executable_directory / "rm75_force_calibration_v6_provisional.json").string();
+        (executable_directory / "rm75_force_calibration_v9_provisional.json").string();
     options.expected_sensor_id = "DU0DU5LC";
     options.probe_model_path =
         (executable_directory / "../model/Lprobe-IFS.STL").lexically_normal().string();
@@ -1822,6 +1840,8 @@ int main(int argc, char** argv) {
               << "maximum_model_rz_speed_deg_s: "
               << control_config.max_model_rz_speed_rad_s * 180.0 / M_PI
               << '\n'
+              << "recovery_tool_y_speed_mm_s: "
+              << control_config.recovery_tool_y_speed_m_s * 1000.0 << '\n'
               << "scan_direction_tool_x: "
               << control_config.scan_direction_tool_x << '\n'
               << "scan_speed_cm_s: "
@@ -1900,6 +1920,7 @@ int main(int argc, char** argv) {
     double maximum_robot_model_position_error_mm = 0.0;
     double maximum_robot_model_tool_y_error_mm = 0.0;
     std::uint64_t visual_y_tracking_paused_cycles = 0;
+    std::uint64_t recovery_search_cycles = 0;
     std::uint64_t target_force_unloading_cycles = 0;
     std::uint64_t target_force_recovering_cycles = 0;
     std::uint64_t target_force_reference_rebases = 0;
@@ -1911,6 +1932,7 @@ int main(int argc, char** argv) {
     std::string recoverable_hold_command_session_id;
     std::uint64_t recoverable_hold_command_sequence = 0;
     bool servo_mailbox_stall_latched = false;
+    bool contact_force_sign_hold_latched = false;
     bool target_force_unloading_last_cycle = false;
     bool target_force_recovering_last_cycle = false;
     Rm75SupervisorState previous_state = Rm75SupervisorState::kInitializing;
@@ -2294,10 +2316,33 @@ int main(int argc, char** argv) {
             }
         }
 
+        const bool contact_force_sign_inconsistent =
+            options.mode == ControllerMode::kExecute
+            && wrench_valid
+            && std::abs(compensated.tool.z())
+                   >= control_config.contact_threshold_n
+            && compensated.tool.z() * intent.desired_force_n <= 0.0;
+        if (contact_force_sign_inconsistent) {
+            // A force with the opposite sign must stop Cartesian integration,
+            // but it is recoverable: keep the long-running Redis controller
+            // alive in Hold.  Refresh the command barrier for as long as the
+            // force remains unsafe, so commands produced before force recovery
+            // cannot release the Hold later.
+            contact_force_sign_hold_latched = true;
+            waiting_for_new_command_after_recoverable_hold = true;
+            recoverable_hold_command_session_id = redis_command.session_id;
+            recoverable_hold_command_sequence =
+                redis_command.producer_sequence;
+        }
+        const bool contact_force_safe_for_release =
+            !contact_force_sign_hold_latched
+            || (wrench_valid && !contact_force_sign_inconsistent);
+
         bool recoverable_hold_released_this_cycle = false;
         if (waiting_for_new_command_after_recoverable_hold
             && robot_valid && command_decision.valid
             && !ServoOutstanding(servo_status)
+            && contact_force_safe_for_release
             && (redis_command.session_id
                     != recoverable_hold_command_session_id
                 || redis_command.producer_sequence
@@ -2310,15 +2355,8 @@ int main(int argc, char** argv) {
             previous_joint_delta.setZero();
             waiting_for_new_command_after_recoverable_hold = false;
             servo_mailbox_stall_latched = false;
+            contact_force_sign_hold_latched = false;
             recoverable_hold_released_this_cycle = true;
-        }
-        if (options.mode == ControllerMode::kExecute
-            && wrench_valid
-            && std::abs(compensated.tool.z())
-                   >= control_config.contact_threshold_n
-            && compensated.tool.z() * intent.desired_force_n <= 0.0) {
-            fatal_fault = true;
-            fatal_fault_code = "contact_force_sign_inconsistent";
         }
 
         // 5.5 调用扫描/力控状态机。
@@ -2375,15 +2413,23 @@ int main(int argc, char** argv) {
                     waiting_for_new_command_after_recoverable_hold
                     ? "robot_state_recovered_waiting_for_new_command"
                     : "robot_state_feedback_recovered_reference_rebased";
-            } else if (recoverable_command_hold) {
+            } else if (recoverable_command_hold
+                       && control_output.state
+                              != Rm75SupervisorState::kFault) {
                 control_output.state = Rm75SupervisorState::kHold;
                 control_output.command_motion = false;
                 control_output.desired_pose = cartesian_reference_pose;
-                control_output.fault = servo_mailbox_stalled_this_cycle
-                    ? "servoj_mailbox_stalled_waiting_for_new_command"
-                    : (recoverable_hold_released_this_cycle
-                           ? "new_command_received_reference_rebased"
-                           : "waiting_for_new_command_after_recoverable_hold");
+                if (contact_force_sign_hold_latched) {
+                    control_output.fault = contact_force_sign_inconsistent
+                        ? "contact_force_sign_inconsistent_recoverable_hold"
+                        : "contact_force_sign_safe_waiting_for_new_command";
+                } else {
+                    control_output.fault = servo_mailbox_stalled_this_cycle
+                        ? "servoj_mailbox_stalled_waiting_for_new_command"
+                        : (recoverable_hold_released_this_cycle
+                               ? "new_command_received_reference_rebased"
+                               : "waiting_for_new_command_after_recoverable_hold");
+                }
             }
         }
         bool target_force_reference_rebased = false;
@@ -2429,6 +2475,9 @@ int main(int argc, char** argv) {
             control_output.target_force_recovering;
         if (control_output.visual_y_tracking_paused) {
             ++visual_y_tracking_paused_cycles;
+        }
+        if (control_output.recovery_search_active) {
+            ++recovery_search_cycles;
         }
         if (control_output.target_force_unloading) {
             ++target_force_unloading_cycles;
@@ -2857,6 +2906,8 @@ int main(int argc, char** argv) {
         row.command_age_ms = command_decision.age_ms;
         row.command_action_enabled = intent.action_enabled;
         row.command_terminate = intent.terminate;
+        row.command_recovery_mode = intent.recovery_mode;
+        row.command_mask_lr_majority = intent.mask_lr_majority;
         row.command_phase_index = intent.phase_index;
         row.command_model_y_m = intent.model_y_m;
         row.command_model_rz_deg = intent.model_rz_deg;
@@ -2908,6 +2959,15 @@ int main(int argc, char** argv) {
             control_output.visual_y_tracking_paused;
         row.visual_y_tracking_reference_rebased =
             visual_y_tracking_reference_rebased;
+        row.recovery_search_active = control_output.recovery_search_active;
+        row.recovery_locked_mask_side =
+            control_output.recovery_locked_mask_side;
+        row.recovery_tool_y_velocity_m_s =
+            control_output.recovery_tool_y_velocity_m_s;
+        row.recovery_search_distance_m =
+            control_output.recovery_search_distance_m;
+        row.recovery_distance_limit_reached =
+            control_output.recovery_distance_limit_reached;
         maximum_reference_model_position_error_mm = std::max(
             maximum_reference_model_position_error_mm,
             row.reference_model_position_error_mm);
@@ -3121,6 +3181,11 @@ int main(int argc, char** argv) {
          maximum_robot_model_tool_y_error_mm},
         {"visual_y_tracking_paused_cycles",
          visual_y_tracking_paused_cycles},
+        {"recovery_search_cycles", recovery_search_cycles},
+        {"recovery_tool_y_speed_mm_s",
+         control_config.recovery_tool_y_speed_m_s * 1000.0},
+        {"maximum_recovery_tool_y_distance_mm",
+         control_config.maximum_recovery_tool_y_distance_m * 1000.0},
         {"visual_y_tracking_reference_rebases",
          visual_y_tracking_reference_rebases},
         {"target_force_unloading_cycles",

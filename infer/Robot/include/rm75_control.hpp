@@ -42,6 +42,11 @@ struct ControlIntent {
     // true 允许接近/力控；terminate 仅结束本轮，回到 Armed，不退出进程。
     bool action_enabled = false;
     bool terminate = false;
+    // phase=2 中视觉端确认血管丢失后请求恢复：保持 Tool-X/RZ 为零，
+    // 按丢失前锁存的分割左右方向驱动 Tool-Y 恢复。
+    bool recovery_mode = false;
+    // 分割掩膜最近窗口的左右多数，仅保留用于诊断：-1/0 未知，1 左，2 右。
+    int mask_lr_majority = 0;
     // Redis 的单调命令序号，用于避免重复累计 RZ 命令。
     std::uint64_t sequence = 0;
 };
@@ -52,7 +57,7 @@ struct Rm75ControlConfig {
     // ===== 1. 控制周期、接触门与 wrench 安全门 =====
     double cycle_s = 0.010;                 // 主控制周期（s）
     // 目标 Tool-Z 力（N）；负号表示压向组织。
-    double desired_force_n = -2.5;
+    double desired_force_n = -2.0;
     // |Fz| 达到该值后锁存“已接触”（N）。
     double contact_threshold_n = 0.99;
     // 补偿后 Tool-X/Y 与 Tool-Z 的独立力门（N）。
@@ -117,34 +122,42 @@ struct Rm75ControlConfig {
     // Trigger 锁存 rotate-align 后，按每周期实际执行的 |delta_rz| 累计。
     // 达到该额度后只停止 Tool-RZ，其他平移和力控维度继续运行。
     double maximum_total_model_rz_rotation_rad = 120.0 * M_PI / 180.0; // Trigger 后累计 RZ 额度
+    // 旋转中丢失血管后的固定 Tool-Y 恢复速度：图像左侧对应 -Tool-Y，
+    // 图像右侧对应 +Tool-Y。此 Tool-Y 指进入 RZ 旋转前锁存的方向，
+    // 不随恢复时的当前 RZ 姿态一起旋转。
+    double recovery_tool_y_speed_m_s = 0.0002;
+    // 每次进入 recovery 后的 Tool-Y 累计搜索距离上限。到达上限
+    // 后只停止 Tool-Y，保持 recovery 和 Tool-Z 力控，不恢复 RZ。
+    double maximum_recovery_tool_y_distance_m = 0.020;
     double max_angular_speed_rad_s = 2.0 * M_PI / 180.0; // 接触 Roll/Pitch 公共角速度上限
 
     // ===== 5. 视觉 Tool-Y 居中 =====
     // 当前 RM75 Tool-Y 与视觉模型训练时的 Y 方向相反；用此符号显式转换。
     double model_y_direction = -1.0; // 视觉 y 到实际 Tool-Y 的符号映射
     // 比例速度律：v_y = direction × gain × y；每周期位移为 v_y × cycle_s。
-    // 旧六轴 Tool-Y 速度的 2/25：
-    // v_y = (2/25 * 0.5 / 0.02) * visual_y_error = 2 /s * error。
+    // 比例律在误差较大时移动较快，并在接近中心时自然减速。
     double model_y_velocity_gain_per_s = 1.0;
-    // 旧六轴横向单周期步长上限，转换为当前速度控制形式后仍保留。
-    double maximum_model_y_step_m = 0.0016; // 单周期 Tool-Y 最大步长（m）
+    // 独立限制 Tool-Y 速度：10 ms 周期下 0.5 mm/周期等效 5 cm/s，
+    // 避免视觉异常值在提高增益后形成过大的单周期横移。
+    double maximum_model_y_step_m = 0.0005; // 单周期 Tool-Y 最大步长（m）
     // 按 m 进入 Scan phase 后的 Tool-Y 速度缩放。接近与 force_settle 阶段
     // 保持完整居中速度；扫描时降速，避免横向修正抢占 Tool-X 扫描轨迹。
-    double scan_y_scale = 0.5;
+    double scan_y_scale = 0.8;
     // 实际探头 TCP 沿 Tool-Y 落后于最新 ServoJ 模型目标时，仅暂停 Y 参考积分；
     // 暂停/恢复使用滞回，给机械臂追赶时间并避免阈值附近反复切换。
     double visual_y_tracking_pause_error_m = 0.020; // 实际 TCP 落后该 Tool-Y 误差时暂停积分
     double visual_y_tracking_resume_error_m = 0.010; // 落后回到该值以下时恢复积分
     // 若跟踪丢失主要来自 Tool-Y，可在达到全局故障前按实际反馈重置笛卡尔/关节参考；
     // 其他方向的跟踪故障仍会终止运行。
-    double visual_y_tracking_rebase_error_m = 0.015; // Tool-Y 主导误差达到该值时重置参考
+    double visual_y_tracking_rebase_error_m = 0.005; // Tool-Y 主导误差达到该值时重置参考
     double visual_y_tracking_rebase_dominance_ratio = 0.8; // Tool-Y 在总误差中的最小占比
-    // 旧六轴旋转阶段先将视觉 Y 修正缩放为 0.3 倍。
+    // 旋转阶段仍降低横向速度，但保留足够的实时居中能力。
     double rotate_align_y_scale = 0.3; // rotate-align 阶段的 Tool-Y 速度缩放
     double model_rz_gain = 0.05; // 视觉 rz（deg）到本周期 RZ 修正的比例
     double contact_pitch_gain_rad_per_m = 0.0; // 保留的接触点 Pitch 增益，0 为关闭
     // 视觉 Tool-Y 使用旧六轴的瞬时力门：|Fz| 必须超过设定值。
-    double visual_y_enable_force_n = 2.0; // |Fz| 超过该值后允许视觉 Tool-Y
+    // 当前目标力为 -2 N，门限必须留有裕量，否则目标力附近会反复关闭 Y。
+    double visual_y_enable_force_n = 1.2; // |Fz| 超过该值后允许视觉 Tool-Y
     // 为配置/日志兼容保留；当前瞬时 Tool-Y 力门不累计该时长。
     double visual_y_force_stable_duration_s = 0.5; // 仅保留给日志/兼容，不参与当前门控
 
@@ -204,6 +217,11 @@ struct Rm75ControlOutput {
     bool target_force_unloading = false; // 当前是否在超力卸载
     bool target_force_recovering = false; // 当前是否在卸载后的制动/重新接触
     bool visual_y_tracking_paused = false; // Tool-Y 是否因实际落后而暂停
+    bool recovery_search_active = false; // 是否处于血管丢失恢复状态
+    int recovery_locked_mask_side = 0; // 锁存的丢失前侧别：1 左，2 右
+    double recovery_tool_y_velocity_m_s = 0.0; // 恢复期间固定 Tool-Y 速度
+    double recovery_search_distance_m = 0.0; // 当次 recovery 已积分的 Tool-Y 距离
+    bool recovery_distance_limit_reached = false; // 是否已到达搜索距离上限
     double accumulated_model_rz_rotation_rad = 0.0; // Trigger 后已执行的累计 RZ
     bool completed = false; // 本轮是否正常结束（terminate 或扫描里程结束）
     std::string completion_reason;
@@ -263,6 +281,14 @@ private:
         std::numeric_limits<std::uint64_t>::max();
     double remaining_model_rz_rad_ = 0.0;
     double accumulated_model_rz_rotation_rad_ = 0.0;
+    bool recovery_search_active_ = false;
+    int last_valid_mask_side_ = 0;
+    int recovery_locked_mask_side_ = 0;
+    double recovery_search_distance_m_ = 0.0;
+    // Base 坐标中的“旋转前 Tool-Y”单位向量；在 rotate-align
+    // 从未锁存切换为锁存时记录，专供丢失恢复平移使用。
+    bool pre_rotation_tool_y_valid_ = false;
+    Eigen::Vector3d pre_rotation_tool_y_base_ = Eigen::Vector3d::UnitY();
 };
 
 // ===== 七轴数值 IK 与 ServoJ 规划模块 =====

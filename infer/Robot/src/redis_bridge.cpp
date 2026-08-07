@@ -13,6 +13,7 @@
 #include <sys/select.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include <hiredis/hiredis.h>
@@ -350,6 +351,27 @@ bool RedisBridge::ParseCommandJson(const std::string& payload,
         }
         intent.terminate = terminate;
         intent.action_enabled = action_enabled;
+        if (input.contains("recovery_mode")
+            && !JsonBoolean(input["recovery_mode"], intent.recovery_mode)) {
+            SetError(error,
+                     "command recovery_mode must be bool or 0/1 when present");
+            return false;
+        }
+        if (input.contains("mask_lr_majority")) {
+            if (!input["mask_lr_majority"].is_number_integer()) {
+                SetError(error,
+                         "command mask_lr_majority must be an integer");
+                return false;
+            }
+            const std::int64_t side =
+                input["mask_lr_majority"].get<std::int64_t>();
+            if (side < -1 || side > 2) {
+                SetError(error,
+                         "command mask_lr_majority is outside -1..2");
+                return false;
+            }
+            intent.mask_lr_majority = static_cast<int>(side);
+        }
         intent.phase_index = -1;
         if (input.contains("phase_idx")) {
             if (!input["phase_idx"].is_number_integer()) {
@@ -510,7 +532,12 @@ std::string RedisBridge::BuildStatusJson(Rm75SupervisorState state,
 }
 
 void RedisBridge::SubscriberLoop() {
-    std::uint64_t last_producer_sequence = 0;
+    // Sequence numbers are monotonic within one producer session. A restarted
+    // vision process deliberately creates a new UUID and starts again at 1,
+    // so replay protection must be scoped by session_id rather than shared
+    // across every producer session seen by this robot process.
+    std::unordered_map<std::string, std::uint64_t>
+        last_producer_sequence_by_session;
     while (running_.load()) {
         ContextPtr context = Connect(config_);
         if (!context) {
@@ -573,8 +600,17 @@ void RedisBridge::SubscriberLoop() {
             if (ParseCommandJson(reply->element[2]->str, parsed, &parse_error)) {
                 parsed.connection_generation = connection_generation;
                 parsed.subscriber_connected = true;
+                const std::string producer_session_key =
+                    parsed.protocol_version == 1
+                    ? parsed.session_id : std::string{};
+                const auto previous_sequence =
+                    last_producer_sequence_by_session.find(
+                        producer_session_key);
                 if (parsed.producer_sequence != 0
-                    && parsed.producer_sequence <= last_producer_sequence) {
+                    && previous_sequence
+                           != last_producer_sequence_by_session.end()
+                    && parsed.producer_sequence
+                           <= previous_sequence->second) {
                     parsed.valid = false;
                     parsed.error = "command producer sequence is stale or replayed";
                     parsed.received_timestamp_ns = MonotonicNowNs();
@@ -591,7 +627,8 @@ void RedisBridge::SubscriberLoop() {
                     continue;
                 }
                 if (parsed.producer_sequence != 0) {
-                    last_producer_sequence = parsed.producer_sequence;
+                    last_producer_sequence_by_session[
+                        producer_session_key] = parsed.producer_sequence;
                 }
                 parsed.intent.sequence =
                     received_command_sequence_.fetch_add(1) + 1;

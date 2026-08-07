@@ -52,6 +52,8 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.max_force_axis_speed_m_s,
         config.max_model_rz_speed_rad_s,
         config.maximum_total_model_rz_rotation_rad,
+        config.recovery_tool_y_speed_m_s,
+        config.maximum_recovery_tool_y_distance_m,
         config.max_angular_speed_rad_s,
         config.model_y_direction,
         config.model_y_velocity_gain_per_s,
@@ -133,6 +135,10 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         && config.max_force_axis_speed_m_s > 0.0
         && config.max_model_rz_speed_rad_s > 0.0
         && config.maximum_total_model_rz_rotation_rad > 0.0
+        && config.recovery_tool_y_speed_m_s > 0.0
+        && config.recovery_tool_y_speed_m_s * config.cycle_s
+               <= config.maximum_model_y_step_m
+        && config.maximum_recovery_tool_y_distance_m > 0.0
         && config.max_angular_speed_rad_s > 0.0
         && std::abs(std::abs(config.model_y_direction) - 1.0) <= 1e-12
         && config.maximum_model_y_step_m > 0.0
@@ -242,6 +248,12 @@ void Rm75ControlLaw::ResetMotionState(bool clear_command_memory) {
     active_scan_phase_ = -1;
     remaining_model_rz_rad_ = 0.0;
     accumulated_model_rz_rotation_rad_ = 0.0;
+    recovery_search_active_ = false;
+    last_valid_mask_side_ = 0;
+    recovery_locked_mask_side_ = 0;
+    recovery_search_distance_m_ = 0.0;
+    pre_rotation_tool_y_valid_ = false;
+    pre_rotation_tool_y_base_ = Eigen::Vector3d::UnitY();
     if (clear_command_memory) {
         active_rz_sequence_ =
             std::numeric_limits<std::uint64_t>::max();
@@ -313,7 +325,9 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         || !std::isfinite(intent.desired_force_n)
         || intent.desired_force_n >= 0.0
         || std::abs(intent.desired_force_n) > config_.force_limit_z_n
-        || intent.phase_index < -1 || intent.phase_index > 2) {
+        || intent.phase_index < -1 || intent.phase_index > 2
+        || intent.mask_lr_majority < -1
+        || intent.mask_lr_majority > 2) {
         output.state = Rm75SupervisorState::kFault;
         output.fault = "control_intent_invalid";
         ResetMotionState(false);
@@ -631,6 +645,18 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
                     ? trigger_alignment_stable_time_s_ + dt : 0.0;
                 if (trigger_alignment_stable_time_s_ + 1e-12
                     >= config_.trigger_alignment_stable_duration_s) {
+                    // Capture Tool-Y before applying the first RZ increment.
+                    // Recovery must search along this fixed Base-frame axis,
+                    // rather than along Tool-Y after it has rotated with RZ.
+                    pre_rotation_tool_y_base_ =
+                        RotationFromEuler(input.current_pose.tail<3>())
+                        * config_.rotation_pose_from_tool.col(1);
+                    const double axis_norm = pre_rotation_tool_y_base_.norm();
+                    pre_rotation_tool_y_valid_ =
+                        std::isfinite(axis_norm) && axis_norm > 1e-12;
+                    if (pre_rotation_tool_y_valid_) {
+                        pre_rotation_tool_y_base_ /= axis_norm;
+                    }
                     rotation_latched_ = true;
                     accumulated_model_rz_rotation_rad_ = 0.0;
                     control_state = Rm75SupervisorState::kRotateAlign;
@@ -652,12 +678,45 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         visual_y_enabled_ = false;
         scan_latched_ = false;
         rotation_latched_ = false;
+        pre_rotation_tool_y_valid_ = false;
         active_scan_phase_ = -1;
         accumulated_model_rz_rotation_rad_ = 0.0;
     }
 
     scan_latched_ = control_state == Rm75SupervisorState::kScan;
     active_scan_phase_ = scan_latched_ ? intent.phase_index : -1;
+    const bool recovery_search_requested =
+        control_state == Rm75SupervisorState::kRotateAlign
+        && intent.phase_index == 2 && intent.recovery_mode;
+    if (!recovery_search_requested
+        && (intent.mask_lr_majority == 1 || intent.mask_lr_majority == 2)) {
+        // Continuously remember the last valid pre-loss side. The visual
+        // history may contain many zero votes by the time recovery begins.
+        last_valid_mask_side_ = intent.mask_lr_majority;
+    }
+    if (!recovery_search_requested) {
+        recovery_search_active_ = false;
+        recovery_locked_mask_side_ = 0;
+        recovery_search_distance_m_ = 0.0;
+    } else if (!recovery_search_active_) {
+        recovery_search_active_ = true;
+        recovery_search_distance_m_ = 0.0;
+        recovery_locked_mask_side_ = last_valid_mask_side_;
+        if (recovery_locked_mask_side_ == 0
+            && (intent.mask_lr_majority == 1
+                || intent.mask_lr_majority == 2)) {
+            recovery_locked_mask_side_ = intent.mask_lr_majority;
+        }
+    }
+    output.recovery_search_active = recovery_search_active_;
+    output.recovery_locked_mask_side = recovery_locked_mask_side_;
+    if (recovery_search_requested) {
+        // A lost-target model angle is not a trustworthy correction. Hold
+        // Tool-X/RZ and contact-driven Roll/Pitch until vision confirms the
+        // vessel again. The sign uses the mask side latched at recovery entry;
+        // the physical axis is Tool-Y captured before RZ rotation started.
+        remaining_model_rz_rad_ = 0.0;
+    }
     double delta_x = 0.0;
     if (scan_latched_) {
         double scan_step = config_.scan_speed_m_s * dt;
@@ -682,6 +741,16 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     const double model_y_velocity_m_s = config_.model_y_direction
         * config_.model_y_velocity_gain_per_s
         * model_y_scale * intent.model_y_m;
+    double commanded_y_velocity_m_s = model_y_velocity_m_s;
+    if (recovery_search_requested) {
+        if (recovery_locked_mask_side_ == 1) {
+            commanded_y_velocity_m_s = -config_.recovery_tool_y_speed_m_s;
+        } else if (recovery_locked_mask_side_ == 2) {
+            commanded_y_velocity_m_s = config_.recovery_tool_y_speed_m_s;
+        } else {
+            commanded_y_velocity_m_s = 0.0;
+        }
+    }
     if (input.robot_model_tool_y_error_m
             >= config_.visual_y_tracking_pause_error_m) {
         visual_y_tracking_paused_ = true;
@@ -693,10 +762,22 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     if (visual_y_enabled_
         && !target_force_transition_active
         && !visual_y_tracking_paused_) {
-        const double requested_model_y_step = Clamp(
-            model_y_velocity_m_s * dt,
+        double requested_model_y_step = Clamp(
+            commanded_y_velocity_m_s * dt,
             -config_.maximum_model_y_step_m,
             config_.maximum_model_y_step_m);
+        if (recovery_search_requested) {
+            const double remaining_recovery_distance_m = std::max(
+                0.0,
+                config_.maximum_recovery_tool_y_distance_m
+                    - recovery_search_distance_m_);
+            if (std::abs(requested_model_y_step)
+                > remaining_recovery_distance_m) {
+                requested_model_y_step = std::copysign(
+                    remaining_recovery_distance_m,
+                    requested_model_y_step);
+            }
+        }
         // 预测式 Tool-Y 跟踪门控：不能只在上一周期的误差已经越界后
         // 才暂停。若本周期候选步长会让实际 TCP 与 ServoJ 模型目标的
         // Tool-Y 误差超过暂停门，只走完剩余裕量并立即锁存暂停。这样
@@ -713,6 +794,17 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
             model_y_step = requested_model_y_step;
         }
     }
+    if (recovery_search_requested) {
+        recovery_search_distance_m_ += std::abs(model_y_step);
+    }
+    output.recovery_search_distance_m = recovery_search_distance_m_;
+    output.recovery_distance_limit_reached = recovery_search_requested
+        && recovery_search_distance_m_ + 1e-12
+               >= config_.maximum_recovery_tool_y_distance_m;
+    output.recovery_tool_y_velocity_m_s =
+        recovery_search_requested
+            && !output.recovery_distance_limit_reached
+        ? commanded_y_velocity_m_s : 0.0;
     output.visual_y_tracking_paused = visual_y_tracking_paused_;
     Eigen::Vector3d translation_delta;
     translation_delta << delta_x,
@@ -729,7 +821,8 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
 
     double delta_roll = 0.0;
     if (config_.legacy_contact_roll_enabled
-        && !target_force_transition_active) {
+        && !target_force_transition_active
+        && !recovery_search_requested) {
         const double contact_y_m = output.filtered_contact_point_probe_m.y();
         if (contact_y_m == 0.0) {
             contact_roll_velocity_rad_s_ = 0.0;
@@ -756,6 +849,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     }
     double delta_pitch = 0.0;
     if (!target_force_transition_active
+        && !recovery_search_requested
         && input.contact_valid
         && std::isfinite(output.filtered_contact_point_probe_m.y())) {
         // Roll 与 Pitch 必须使用同一份 Kalman 后接触点，避免原始接触点
@@ -766,9 +860,12 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
             -max_angular_step,
             max_angular_step);
     }
-    double delta_rz = control_state == Rm75SupervisorState::kRotateAlign
-        ? Clamp(remaining_model_rz_rad_, -max_model_rz_step, max_model_rz_step)
-        : 0.0;
+    double delta_rz = 0.0;
+    if (control_state == Rm75SupervisorState::kRotateAlign
+               && !recovery_search_requested) {
+        delta_rz = Clamp(
+            remaining_model_rz_rad_, -max_model_rz_step, max_model_rz_step);
+    }
     if (control_state == Rm75SupervisorState::kRotateAlign) {
         const double remaining_rotation_budget_rad = std::max(
             0.0,
@@ -790,7 +887,9 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         if (config_.legacy_contact_roll_limits_enabled) delta_roll *= scale;
         delta_pitch *= scale;
     }
-    remaining_model_rz_rad_ -= delta_rz;
+    if (!recovery_search_requested) {
+        remaining_model_rz_rad_ -= delta_rz;
+    }
     output.accumulated_model_rz_rotation_rad =
         accumulated_model_rz_rotation_rad_;
 
@@ -818,8 +917,20 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     const Eigen::Vector3d current_probe_tcp_base =
         input.current_pose.head<3>()
         + rotation_base_from_tool * config_.probe_tcp_tool_m;
+    Eigen::Vector3d translation_delta_base =
+        rotation_base_from_tool * translation_delta;
+    if (recovery_search_requested && pre_rotation_tool_y_valid_) {
+        // X is zero during recovery, while Z force control remains expressed
+        // in the current Tool frame. Replace only the Y contribution with the
+        // Tool-Y direction captured before rotate-align began.
+        translation_delta_base =
+            rotation_base_from_tool
+                * Eigen::Vector3d(translation_delta.x(), 0.0,
+                                  translation_delta.z())
+            + pre_rotation_tool_y_base_ * translation_delta.y();
+    }
     const Eigen::Vector3d desired_probe_tcp_base =
-        current_probe_tcp_base + rotation_base_from_tool * translation_delta;
+        current_probe_tcp_base + translation_delta_base;
     output.desired_pose.head<3>() = desired_probe_tcp_base
         - desired_rotation_base_from_tool * config_.probe_tcp_tool_m;
     output.desired_pose.tail<3>() =
