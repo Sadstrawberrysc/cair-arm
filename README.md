@@ -38,7 +38,7 @@ The original `main`/`main_nomove` and `robot_control` files are retained under
 `infer/Robot/tests/legacy/six_axis/` and are not used as the RM75 production
 entry. Diagnostics and calibration CLIs live under `infer/Robot/tests/tools/`.
 See
-[RM75 七轴系统迁移总进度](docs/rm75_progress.md) and
+[RM75 七轴系统迁移总进度](PROGRESS.md) and
 [RM75 学习路径](docs/rm75_learning_path.md) before any
 hardware run; use a current RM75 calibration and keep the physical emergency
 stop available for every `main_rm75` production run. The complete startup

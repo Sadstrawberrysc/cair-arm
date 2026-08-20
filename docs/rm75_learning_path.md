@@ -68,7 +68,7 @@ RM75 状态反馈 ────────────────────�
 
 先阅读：
 
-1. [RM75 迁移进度](rm75_progress.md)：当前硬件、标定、运行边界和已知问题。
+1. [RM75 迁移进度](../PROGRESS.md)：当前硬件、标定、运行边界和已知问题。
 2. [`infer/Robot/CMakeLists.txt`](../infer/Robot/CMakeLists.txt)：构建目标与库的依赖。
 3. [`infer/Robot/src/main_rm75.cpp`](../infer/Robot/src/main_rm75.cpp)：只看 `Options`、`ApplyImplicitCommissioningProfile`、启动检查、10 ms 主循环和运行摘要。
 
