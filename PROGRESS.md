@@ -14,19 +14,23 @@ recovery 意图；`main_rm75` 在 10 ms 周期内融合 RM75 与 Haptron 快照�
 检查、标定/tare 补偿、接触估计、状态机、七轴数值 IK、安全规划和异步 ServoJ 下发。
 
 当前仍是**使用 provisional 标定的工程调试系统**，不是完成计量与端到端验收的生产系统。
-自动测试/回放 harness 尚未建立，CTest 当前没有已注册测试。
+已建立第一批纯离线 CTest，覆盖 Redis parser/freshness 与输出 schema、AA55/Haptron frame
+parser、基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema 契约。完整的
+session replay、反馈恢复、mailbox 并发和周期回放 harness 仍待补充。
 
-### P0：配置存在两套来源且实际未完全一致
+### 配置所有权已统一并通过真机复核
 
-当前无参数入口的 `ApplyImplicitCommissioningProfile()` 仍以 `-3 N`、`1 cm/s` 接近和
-`rm75_v6_redis_visual_closed_loop_3n_tcp188` 为校验/日志 profile；但 `main_rm75` 创建
-`Rm75ControlConfig` 后只注入周期和标定坐标链，没有把这些 `Options` 中的力控、扫描和跟踪
-值写入控制结构。
+`RobotRuntimeConfig` 统一装配入口参数及 `Rm75ControlConfig`、`Rm75ServoPlannerConfig`、
+`Rm75RuntimeSafetyConfig`。无参数 profile 不再复制力控、扫描或 tracking 标量；启动校验、
+控制对象、终端输出和 summary 均读取同一有效配置。控制/安全 CLI 已移除，Redis
+`desired_force_n` 仍是协议边界明确提供的单次命令覆盖。
 
-因此按当前源码，真正进入 `Rm75ControlLaw`/summary 的值来自 `rm75_control.hpp`，包括
-`-2 N` 目标力和 `2 cm/s` 接近速度。profile 名称、启动约束错误信息以及部分旧文档仍描述
-`-3 N / 1 cm/s`。在统一参数所有权并完成 dry-run/真机复核前，不得根据 profile 名称推断
-实际控制值；每次运行必须以启动输出和 `.summary.json` 的 `control` 字段确认。
+当前 profile 的实际与校验基线均为 `-2 N`、`2 cm/s` 接近和 `1 cm/s` 扫描，名称改为不携带
+目标力的 `rm75_redis_visual_closed_loop_tcp188`。生产入口、全部 maintenance tools 均已
+离线编译通过，批次 2 的 5/5 CTest 通过，并已获得本轮真机确认。
+显式 `--no-redis` provisional 执行仍受原有 `1 mm / 0.05 cm/s` 更严格准入门约束；控制/安全
+CLI 移除后，当前默认 `2 cm/s` 配置会使该调试路径 fail-closed，不得将其当作无参数生产入口
+的替代启动方式。
 
 ## 在线链路
 
@@ -50,7 +54,7 @@ RM75 TCP 状态线程 ───────────────────�
 | Haptron | `/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0`，`115200/8N1`，Modbus RTU |
 | Redis | `127.0.0.1:7777`；命令 fresh 门 500 ms，视觉心跳 200 ms |
 | 控制周期 | 10 ms；连续两次超期或任一周期超过 40 ms 触发 deadline fault |
-| 标定 | `infer/Robot/build/rm75_force_calibration_v9_provisional.json` |
+| 标定 | `infer/Robot/build/rm75_force_calibration.json` |
 | 探头模型 | `infer/Robot/model/Lprobe-IFS.STL`，启动时核对 SHA-256 |
 | Tool/TCP | Tool 与 Sensor 原点重合；Probe TCP 为 sensor 原点 `+Z 0.188 m`；Arm_Tip→Tool 固定旋转来自标定 |
 | 日志 | 控制周期记录由后台线程写 CSV，结束时生成 schema v2 summary JSON |
@@ -99,17 +103,20 @@ RM75 TCP 状态线程 ───────────────────�
 
 ## 标定状态
 
-当前 v9 文件创建于 `2026-08-06T02:58:29Z`，传感器 ID 为 `DU0DU5LC`，探头模型摘要已
+当前唯一部署标定 `rm75_force_calibration.json` 来源于v10采集，文件创建于
+`2026-08-20T08:33:57Z`，传感器 ID 为
+`DU0DU5LC`，探头模型摘要已
 记录。质量结果为：
 
 | 指标 | 当前值 | 接受门 |
 | --- | ---: | ---: |
-| Force RMS | `1.1534 N` | — |
-| Force max | `1.7448 N` | `0.6 N` |
-| Torque RMS | `0.02675 N·m` | — |
-| Torque max | `0.05610 N·m` | `0.1 N·m` |
+| Force RMS | `0.7881 N` | — |
+| Force max | `1.2488 N` | `0.6 N` |
+| Torque RMS | `0.02095 N·m` | — |
+| Torque max | `0.05099 N·m` | `0.1 N·m` |
 
-`residuals_verified=false` 且 `tool_chain_verified=false`。当前文件只能在显式 provisional
+`residuals_verified=false` 且 `tool_chain_verified=false`。“唯一部署/最终选用”仅表示当前不再保留
+其他版本文件，不表示已通过正式计量验收。当前文件只能在显式 provisional
 commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏置，不能替代多姿态重力、
 质量、质心以及 R/t/TCP 验证。
 
@@ -120,19 +127,20 @@ commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏�
 
 | 能力 | 状态 | 当前说明 |
 | --- | --- | --- |
-| RM75 TCP、状态快照、ServoJ、Hold、Stop | 已实现 | 单一 I/O owner；ServoJ 单槽 mailbox；Stop 优先并确认静止 |
+| RM75 TCP、状态快照、ServoJ、Hold、Stop | 已实现，已真机复核 | 单一 I/O owner；确认重试/析构 guard 在 transport，Probe TCP 静止确认使用统一 frame chain |
 | 七轴 FK、6×7 Jacobian、数值 IK | 已实现 | 规划器检查有限值、关节限位、速度/加速度和奇异性；真机边界仍需持续验收 |
 | Haptron Modbus 与线程安全快照 | 已实现 | 包含 checksum、sequence、单调时间、stale 和统计信息 |
-| 标定加载、模型摘要、runtime tare | 已实现，正式标定未完成 | v9 force max 不合格，tool chain 未验证 |
+| 标定加载、模型摘要、runtime tare | 已实现，tare 迁移待真机复核 | 采集与稳定门已收敛到 frame-chain 模块；v10 force max 不合格，tool chain 未验证 |
 | 接触点估计 | 已实现，真值验收未完成 | STL 事务式加载；低力为正常无接触，不用零点伪装有效结果 |
 | Z 导纳、超力卸载、制动与重接触 | 已实现，仿体验收未完成 | 卸载在 Redis Hold 下仍可独立工作；idle 不自动重接近 |
 | Tool-Y/X/RZ 状态机 | 已实现，端到端验收未完成 | 包含跟踪暂停/恢复、Y 主导重建参考、连续扫描和 RZ 额度 |
 | 旋转丢失恢复 | 已实现，真机验收未完成 | X/RZ 归零、固定基方向 Y 搜索、20 mm 上限、保留 Z 力控 |
 | Redis v1 session/sequence/freshness | 已实现 | 新连接清空旧命令；重复/回放/过期/断开全部 fail-closed |
 | 反馈恢复与新命令屏障 | 已实现 | 从实测关节重建参考，禁止恢复后继续旧视觉命令 |
-| 异步 Redis 与运行日志 | 已实现 | 控制循环不做阻塞 Redis、JSON 序列化或磁盘写入 |
-| CSV/summary 诊断 | 已实现 | summary schema v2，记录标定、控制、tare、安全、时序和 completion/fault |
-| 自动测试 / 回放 harness | 未完成 | CTest 无注册测试；Redis parser、状态机、断线/恢复和离线控制均需覆盖 |
+| 异步 Redis 与运行日志 | 已实现，已真机复核 | 控制循环不做阻塞 Redis、JSON 序列化或磁盘写入；CSV writer 已提取至 `rm75_runtime_logging` |
+| CSV/summary 诊断 | 已实现，已真机复核 | `RuntimeSummaryData` 单次构造 summary v2，字段、单位和 CSV 126 列契约保持不变 |
+| 标定坐标链 | 已集中，已真机复核 | `CalibratedFrameChain` 唯一提供 Base→Arm_Tip→Tool/Sensor→Probe TCP 变换；生产和维护目标编译、6/6 CTest 通过 |
+| 自动测试 / 回放 harness | 部分完成 | 已注册 6 个纯离线 CTest，含有效配置和坐标链等价测试；session replay、反馈恢复、mailbox 并发和完整周期回放仍待覆盖 |
 
 ## 当前状态机
 
@@ -183,17 +191,16 @@ Redis 命令异常通常进入 Hold 而不退出；机器人/传感器持续失�
 
 ## 下一步优先级
 
-1. **统一配置所有权（P0）**：删除无参数 `Options` 与 `Rm75ControlConfig` 的双重力控/扫描值，
-   让启动校验、实际控制、终端输出、profile 名称和 summary 使用同一配置；先离线验证，再决定
-   正式目标是 `-2 N` 还是 `-3 N`。
+1. **完成 runtime tare 迁移的真机复核（P0）**：确认 3 s 样本数、Sensor-frame offset、最大
+   wrench 偏差、关节/TCP/姿态跨度及所有拒绝原因与迁移前一致。
 2. **完成正式标定（P0）**：独立核对 R/t/TCP，重新采集低外力多姿态样本，将 force max
    降至 `<=0.6 N`，设置 residual/tool-chain verified 后完成多姿态悬空验收。
 3. 修正视觉 recovery 速度注释，并离线/真机确认左右侧到 Tool-Y 的符号、旋转前基方向、
    `0.2 mm/s` 搜索速度和 `20 mm` 停止上限。
 4. 在软质仿体上依次验收接触点真值、Z 稳态、超力卸载、idle 不重接近、Tool-Y、Tool-X、
    phase/RZ 及自动 terminate；每次只改变一个参数并保留 CSV/summary。
-5. 建立 Redis JSON/session/replay/超时、状态机、反馈恢复、mailbox 和离线控制的自动测试，
-   再执行长时间真机稳定性验证。
+5. 在现有 parser/freshness、传感器帧、基础状态机、planner 和 schema CTest 上继续补齐
+   session replay、反馈恢复、mailbox 并发和完整周期回放，再执行长时间真机稳定性验证。
 
 不要在 `main_rm75` 运行期间清理 `infer/Robot/build/logs/`。所有真机操作必须遵守
 [AGENTS.md](AGENTS.md) 的硬约束。

@@ -1683,6 +1683,37 @@ void RMCommand::StopMotion() {
     ReportLegacyFailure("StopMotion", result);
 }
 
+RMResult RequestConfirmedStop(RMCommand& command, int timeout_ms) {
+    RMResult result = RMResult::Failure(
+        RMErrorCode::kTimeout, "StopMotion was not attempted");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        result = command.TryStopMotion(timeout_ms);
+        if (result) return result;
+        if (result.code == RMErrorCode::kTimeout) break;
+        if (attempt == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    return result;
+}
+
+void BestEffortStopGuard::Arm(RMCommand& command) noexcept {
+    command_ = &command;
+    armed_ = true;
+}
+
+void BestEffortStopGuard::Disarm() noexcept { armed_ = false; }
+
+BestEffortStopGuard::~BestEffortStopGuard() {
+    if (!armed_ || command_ == nullptr || !command_->IsConnected()) return;
+    try {
+        (void)command_->TryStopMotion(500);
+    } catch (...) {
+        // Destructors must remain noexcept. The transport's latched Servo
+        // gate still prevents a later target from overtaking this stop path.
+    }
+}
+
 // -------------------------------------------------------------------------
 // 模块八：RMStateReader 异步状态与 I/O 线程
 // -------------------------------------------------------------------------

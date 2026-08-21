@@ -68,6 +68,9 @@ struct Rm75ControlConfig {
     double force_retract_threshold_z_n = 20.0; // 固定阈值回退进入力（N）
     // 卸载至该值以下回到普通导纳；应高于目标力且低于进入阈值，形成滞回。
     double force_retract_release_z_n = 1.2; // 固定阈值回退释放力（N）
+    double retract_direction_tool_z = 0.0; // 旧式回退方向；默认关闭时不使用
+    double retract_distance_m = 0.005;      // 旧式回退最大距离（m）
+    double retract_speed_m_s = 0.002;       // 旧式回退速度（m/s）
     double force_limit_z_n = 50.0;          // 补偿后 Tool-Z 硬门（N）
     double torque_limit_nm = 5.0;           // 补偿后 Tx/Ty/Tz 硬门（N·m）
 
@@ -77,8 +80,8 @@ struct Rm75ControlConfig {
     double force_virtual_damping = 20.0;
     // 相对目标力的超力卸载：额外压入超过该裕量时，暂停横向/角运动并执行 -Tool-Z。
     bool target_force_unload_enabled = true; // 是否启用相对目标力的卸载层
-    // Fz 比目标力额外压入该值时启动 -Tool-Z 卸载（N）。当前 -3 N
-    // 目标下，须低于 -4 N 才进入卸载，避免正常力控波动频繁触发。
+    // Fz 比目标力额外压入该值时启动 -Tool-Z 卸载（N）。当前 -2 N
+    // 目标下，须低于 -3 N 才进入卸载，避免正常力控波动频繁触发。
     double target_force_unload_margin_n = 1.0;
     // 力连续超过卸载门的最短时间（s）。短暂噪声或接触瞬态不会触发卸载。
     double target_force_unload_entry_duration_s = 0.50;
@@ -111,7 +114,7 @@ struct Rm75ControlConfig {
     bool legacy_contact_roll_limits_enabled = true; // 是否再受公共角速度限制
 
     // ===== 4. 悬空接近、接触后 Tool-Z 与角速度 =====
-    // 悬空接近使用 +Tool-Z 1 cm/s；接触后切换到下方的导纳速度上限。
+    // 悬空接近使用 +Tool-Z 2 cm/s；接触后切换到下方的导纳速度上限。
     double approach_speed_m_s = 0.020;
     double approach_direction_tool_z = 1.0;
     // 接触导纳的 Tool-Z 速度上限。
@@ -333,6 +336,10 @@ struct Rm75RuntimeSafetyConfig {
     double max_tracking_position_error_mm = 25.0;
     // 0 表示不单独以笛卡尔姿态残差终止；关节与位置误差仍受监督。
     double max_tracking_orientation_error_deg = 0.0;
+    // 悬空接近相对起点的 Probe-TCP 行程和姿态包络。
+    double maximum_no_contact_approach_distance_m = 0.005;
+    // 0 表示关闭独立姿态 excursion 门；关节/IK 门仍保持有效。
+    double maximum_orientation_excursion_deg = 5.0;
 };
 
 struct Rm75ServoPlan {

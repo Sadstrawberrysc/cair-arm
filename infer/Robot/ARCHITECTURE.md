@@ -10,14 +10,18 @@ Redis 视觉意图、确定性控制律、七轴规划、安全监督和运行�
 
 | 模块 | 公共 API | 职责 | 直接依赖 |
 | --- | --- | --- | --- |
-| `realman_transport` | `RMCommand`、`RMStateReader`、`RMResult` | RM75 JSON-over-TCP、状态快照、ServoJ mailbox、Stop 优先级 | Threads、nlohmann/json |
+| `realman_transport` | `RMCommand`、`RMStateReader`、`RMResult`、`BestEffortStopGuard` | RM75 JSON-over-TCP、状态快照、ServoJ mailbox、Stop 优先级与确认重试 | Threads、nlohmann/json |
 | `robot_sensor` | `ForceSensorReader`、`ForceCalibration`、`ContactLocation` | Modbus/legacy 帧解析、SI 样本、重力与 tare 补偿、STL 接触点 | Threads、OpenSSL、Eigen |
 | `rm75_motion` | `Rm75ControlLaw`、`Rm75ServoPlanner`、`RMKinematics` | 状态机、Tool 增量、七轴 FK/Jacobian/IK、安全规划 | Eigen |
+| `rm75_runtime_config` | `RobotRuntimeConfig`、profile 工厂、配置校验 | 入口参数与 Control/Planner/Safety 有效配置的单一装配路径 | `rm75_motion` |
+| `rm75_frame_chain` | `CalibratedFrameChain`、`StopAndConfirmStationary()`、`CollectRuntimeTare()` | 不可变标定变换、物理静止确认及悬空 tare | transport、sensor、Eigen |
+| `rm75_runtime_logging` | `AsyncRuntimeLogger`、`RuntimeSummaryData`、`BuildRuntimeSummary()` | 有界异步 CSV、summary v2 构造/落盘及终端完成报告 | transport、sensor、motion |
 | `RedisBridge` | `LatestCommand`、`PublishSensor`、`PublishStatus` | Redis v1/legacy 边界、重连、回放保护和异步发布 | hiredis、nlohmann/json |
-| `main_rm75` | 进程入口 | 配置校验、线程生命周期、10 ms 编排、安全门、CSV/summary | 上述全部 |
+| `main_rm75` | 进程入口 | 配置校验、线程生命周期、10 ms 编排、安全门、周期/最终快照提交 | 上述全部 |
+| `tests/offline` | CTest 可执行文件 | 有效配置、parser、freshness、控制/planner 拒绝边界和 schema characterization | 生产静态库，不访问设备 |
 
-CMake 依赖方向为 `main_rm75 → realman_transport + robot_sensor + rm75_motion`。`redis_bridge.cpp`
-直接编入入口，避免控制/传感器库反向依赖 Redis。
+CMake 依赖方向为 `main_rm75 → rm75_runtime_config + rm75_frame_chain + rm75_runtime_logging + realman_transport + robot_sensor + rm75_motion`。
+`redis_bridge.cpp` 直接编入入口，避免控制/传感器库反向依赖 Redis。
 
 ## 核心 API 契约
 
@@ -30,6 +34,18 @@ CMake 依赖方向为 `main_rm75 → realman_transport + robot_sensor + rm75_mot
 - `Rm75ControlLaw::Step(input, intent, motion_armed)` 只产生笛卡尔目标，不发送硬件命令。
 - `Rm75ServoPlanner::Plan(...)` 只有返回 `valid=true` 才可提交 ServoJ。
 - `RedisBridge::EvaluateCommandForControl()` 是 Redis 意图进入控制层的 fail-closed 门。
+- `MakeImplicitRm75ProductionConfig()` 生成无参数生产 profile；启动校验、模块构造、终端输出和
+  summary 必须读取其中同一组 `control/planner/safety` 配置。
+- `CalibratedFrameChain` 从已校验标定单次构造，统一提供 Probe TCP Base 位置、Tool-Y Base
+  方向、Base←Tool/Sensor 旋转和 Arm_Tip 姿态差；入口不得手工重组这些矩阵。
+- `RequestConfirmedStop()` 保持 Stop mailbox 优先和有界确认重试；`StopAndConfirmStationary()`
+  只有连续 5 帧同时满足关节、Probe TCP 和姿态静止门才返回成功。提前退出由
+  `BestEffortStopGuard` 补发一次有界 Stop。
+- `CollectRuntimeTare()` 只接受新鲜机器人/传感器快照，通过 raw wrench 门后执行标定补偿，
+  并使用 `RuntimeTareConfig` 的单一阈值集合检查采样数、关节/TCP/姿态跨度和 wrench 稳定性；
+  停止标志作为只读参数注入。
+- `AsyncRuntimeLogger::PushAndMeasure()` 只向 8192 行有界队列提交周期快照并记录完成时间；后台
+  writer 是唯一 CSV 文件 owner。`BuildRuntimeSummary()` 只处理最终快照，不参与控制循环。
 
 ## 线程与时序
 
@@ -38,7 +54,7 @@ RMStateReader/I/O owner ─┐
 ForceSensorReader ───────┼→ immutable/latest snapshots → 10 ms control loop
 Redis subscriber ────────┘                                │
 Redis publisher ← bounded/coalesced queue ────────────────┤
-AsyncRuntimeLogger ← fixed cycle record ──────────────────┘
+rm75_runtime_logging writer ← fixed cycle record ─────────┘
 ```
 
 控制周期固定顺序为：读取快照 → 校验安全门 → wrench 补偿 → 接触估计 → Redis 意图判定 →
@@ -59,16 +75,24 @@ ServoJ 使用单个待处理 mailbox，防止 10 ms 目标在 socket 队列中�
 - 控制律与规划器保持无硬件 I/O，便于未来离线回放和确定性测试。
 - 原始量程、补偿量程、数据陈旧、关节限位、奇异、跟踪误差和调度异常分层检查。
 - 参数唯一来源是 `Rm75ControlConfig`、`Rm75ServoPlannerConfig`、
-  `Rm75RuntimeSafetyConfig`；入口只注入标定坐标链。
+  `Rm75RuntimeSafetyConfig`；`RobotRuntimeConfig` 只统一装配这些配置及入口参数，入口随后只
+  派生控制周期，并从 `CalibratedFrameChain` 注入控制律所需的不可变变换。控制和安全参数不再
+  提供 CLI 覆盖。
 - 生产使用七轴反馈和 6×7 Jacobian；不得接入 `tests/legacy/six_axis`。
+- CSV 列顺序和单位由 `runtime_schema.hpp` 固化，summary 由 `RuntimeSummaryData` 单次构造；入口
+  不得自行追加平行的日志序列化路径。
 - `build/` 中标定、日志和二进制属于运行产物，不是模块 API。
 
 ## 构建与验证
 
 ```bash
 cmake -S infer/Robot -B infer/Robot/build -DCMAKE_BUILD_TYPE=Release
-cmake --build infer/Robot/build --target main_rm75
+cmake --build infer/Robot/build --target main_rm75 robot_offline_tests
+ctest --test-dir infer/Robot/build --output-on-failure
 ```
 
-当前没有注册 CTest。编译只验证接口和链接，不代表状态机、标定或真机运动验收通过。
-任何运行命令必须遵守根目录 `AGENTS.md` 的真机硬约束。
+当前注册 6 个纯离线 CTest，覆盖有效配置唯一来源、标定坐标链等价性、Redis
+parser/freshness 与输出 schema、
+AA55/Haptron frame parser、基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema
+契约。测试不访问 Redis 服务、串口或机器人；通过仍不代表标定或真机运动验收完成。任何运行
+命令必须遵守根目录 `AGENTS.md` 的真机硬约束。

@@ -1116,11 +1116,11 @@ def main():
     auto_terminate_latched = False
     terminate_command_sequence = 0
 
-    # Tool-Y 视觉误差调理：0.15 mm 居中死区，方向连续 3 帧确认；
-    # alpha=1.0 表示直接采用当前帧误差，不进行 EMA 低通。
+    # Tool-Y 视觉误差调理：0.01 mm 居中死区，方向当帧确认；
+    # alpha=0.7：当前帧占 70%，上一次滤波结果占 30%。
     visual_y_deadband_m = 0.00001
-    visual_y_lowpass_alpha = 1.0
-    visual_y_confirmation_frames = 3
+    visual_y_lowpass_alpha = 0.7
+    visual_y_confirmation_frames = 1
     visual_y_conditioner = VisualYConditioner(
         visual_y_deadband_m,
         visual_y_lowpass_alpha,

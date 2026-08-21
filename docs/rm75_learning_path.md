@@ -84,14 +84,14 @@ RM75 状态反馈 ────────────────────�
 检查项：
 
 - [ ] 能说明无参数 `./main_rm75` 为什么能得到机器人 IP、串口、标定文件、Redis、目标力与速度。
-- [ ] 能说明 `rm75_control.hpp` 是当前控制、规划和安全参数的唯一调参来源；`main_rm75.cpp` 只负责启动、硬件 I/O、标定坐标链注入和日志。
+- [ ] 能说明 `rm75_control.hpp` 是当前控制、规划和安全参数的唯一调参来源；`CalibratedFrameChain` 负责标定坐标链，`main_rm75.cpp` 只负责装配和运行编排。
 - [ ] 能在终端输出中找到 `configuration_profile`、`desired_force_n`、`approach_speed_cm_s` 和 `runtime_log`。
 
 ## 2. RM75 通信、状态与七轴运动学
 
 阅读顺序：
 
-1. `infer/Robot/include/realman_command.hpp` 与 `src/realman_command.cpp`：TCP 建连、状态读取、ServoJ 和 Stop。
+1. `infer/Robot/include/realman_command.hpp` 与 `src/realman_command.cpp`：TCP 建连、状态读取、ServoJ、Stop 优先级、确认重试和提前退出 guard。
 2. `include/realman_kinematics.hpp` 与 `src/realman_kinematics.cpp`：七轴 FK、6×7 Jacobian、数值 IK。
 3. `tests/tools/arm_read_state.cpp` 与 `tests/tools/arm_preset_pose.cpp`：维护工具示例。
 
@@ -141,7 +141,9 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 
 其中 force 的单位为 N，torque 的单位为 N·m。`tare` 是探头完全悬空、静止时采集的现场零点；它只能消除当前姿态和安装条件下的静态偏置，不能替代正式多姿态重力标定。
 
-真机观察：生产入口启动时会执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。当前静止门为关节跨度 `0.02°`、TCP 跨度 `0.35 mm`、姿态跨度 `0.10°`；临时标定残差门为 `5 N / 0.5 N·m`。若被拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
+真机观察：生产入口通过 `CollectRuntimeTare()` 执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。`RuntimeTareConfig` 的静止门为关节跨度 `0.02°`、TCP 跨度 `0.35 mm`、姿态跨度 `0.10°`，wrench 稳定门为 `0.25 N / 0.02 N·m`；临时标定残差门仍为 `5 N / 0.5 N·m`。若被拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
+
+Stop 后的物理静止确认与 tare 稳定门是两套用途不同的门：`StopAndConfirmStationary()` 要求连续 5 帧满足相邻/窗口关节 `0.01°/0.02°`、Probe TCP `0.05/0.10 mm`、姿态 `0.01°/0.02°`，不能只凭控制器返回 `arm_stop=true` 判断已经静止。
 
 检查项：
 
@@ -153,7 +155,7 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 
 阅读顺序：
 
-1. `main_rm75.cpp` 中 `rotation_pose_from_tool`、`probe_tcp_tool_m` 和 Arm_Tip/Tool 配置。
+1. `calibrated_frame_chain.hpp/.cpp` 中不可变的 Arm_Tip/Tool/Sensor/Probe TCP 变换。
 2. `rm75_control.cpp` 中 `translation_delta` 与最终 `desired_pose` 合成位置。
 3. 当前标定 JSON 中的 `rotation_tool_from_sensor_row_major`、`probe_tcp_sensor_m`。
 
@@ -179,17 +181,17 @@ Base → Arm_Tip → Tool/Sensor → Probe TCP
 
 1. `rm75_control.hpp`：目标力、接触阈值、虚拟质量/阻尼、卸载和恢复参数。
 2. `rm75_control.cpp`：接触判定、Z 导纳、`target_force_unloading`、制动、重新接触和恢复分支。
-3. `main_rm75.cpp`：查看它如何创建 `control_config`，并只注入标定给出的 Tool/Arm_Tip 坐标变换与 TCP。
+3. `main_rm75.cpp`：查看它如何从单份标定创建 `CalibratedFrameChain`，并向控制配置单次注入 Tool/Arm_Tip 变换与 TCP。
 
 当前配置的关键值：
 
 ```text
-目标力：-3 N
+目标力：-2 N
 接触门：|Fz| ≥ 0.99 N
 虚拟质量 M：3
 虚拟阻尼 D：20
 普通 Tool-Z 力控上限：0.20 cm/s
-超力开始卸载：Fz ≤ -4 N 且连续 0.50 s
+超力开始卸载：Fz ≤ -3 N 且连续 0.50 s
 ```
 
 wrench Kalman 和接触点 Kalman 当前均开启。前者平滑补偿后的六个 wrench 分量，
@@ -197,9 +199,9 @@ wrench Kalman 和接触点 Kalman 当前均开启。前者平滑补偿后的六�
 因此新的接触会从真实接触点重新初始化，而不会被“无接触零点”拖向错误位置。接触姿态
 模块使用过滤后的接触点驱动 Tool-X/Roll；Pitch 同样接入过滤结果，但默认 Pitch 增益为 0。
 
-控制含义：未接触时沿 `+Tool-Z` 接近；接触后导纳使 Fz 向 -3 N 收敛；压得更深、Fz 更负时请求 `-Tool-Z` 卸载。卸载与恢复期间 X/Y/RZ 会被抑制，避免横向或旋转与卸载相互干扰。
+控制含义：未接触时沿 `+Tool-Z` 接近；接触后导纳使 Fz 向 -2 N 收敛；压得更深、Fz 更负时请求 `-Tool-Z` 卸载。卸载与恢复期间 X/Y/RZ 会被抑制，避免横向或旋转与卸载相互干扰。
 
-真机练习顺序：按 `b` 后观察未接触接近；轻接触后观察向 -3 N 收敛；施加更大压缩力，确认仅轴向卸载；释放后观察制动、重新接触与普通导纳恢复。
+真机练习顺序：按 `b` 后观察未接触接近；轻接触后观察向 -2 N 收敛；施加更大压缩力，确认仅轴向卸载；释放后观察制动、重新接触与普通导纳恢复。
 
 检查项：
 

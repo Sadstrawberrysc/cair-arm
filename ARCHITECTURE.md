@@ -2,8 +2,9 @@
 
 ## 文档范围
 
-本文记录仓库中可独立运行进程之间的边界、API 层架构决策和依赖方向。训练、预训练与
-数据实验目录属于离线工作负载，不作为在线微服务。各运行服务的内部模块说明见本文末尾。
+本文记录仓库中可独立运行进程之间的边界、API 层架构决策和依赖方向。设计决策的历史与
+原因见 [DECISIONS.md](DECISIONS.md)。训练、预训练与数据实验目录属于离线工作负载，不作为
+在线微服务。各运行服务的内部模块说明见本文末尾。
 
 本仓库当前采用“同机多进程 + Redis 消息总线 + 设备 TCP/串口”的部署方式，并不是具有
 服务发现、统一网关和容器编排的传统微服务平台。这里的“服务”指拥有独立入口、生命周期
@@ -18,10 +19,11 @@ flowchart LR
     Redis7777 --> Robot[RM75 控制服务]
     Robot -->|TCP JSON| RM75[RM75 七轴机械臂]
     Haptron[Haptron 六维力传感器] -->|Modbus RTU / 串口| Robot
+    Haptron -.->|独占只读诊断模式| SensorMonitor[传感器监视器]
     Robot -->|robot:sensor:v1| Redis7777
     Robot -->|robot:status:channel| Redis7777
     Robot -->|sensor_data legacy| Redis7777
-    Redis7777 --> SensorMonitor[传感器监视器]
+    Redis7777 -->|主程序运行时自动选择| SensorMonitor
     Redis7777 --> ContactShow[接触点显示器]
 
     Voice[py-xiaokai] -->|sonoscape:cmd| Redis6379[(Redis :6379)]
@@ -39,7 +41,7 @@ flowchart LR
 | 超声视觉推理 | `intergrate_infer/main_redis_seg_newphase_recovery_mode.py` | Redis Pub/Sub v1 | [intergrate_infer/ARCHITECTURE.md](intergrate_infer/ARCHITECTURE.md) |
 | 人体/解剖相机 | `infer/Camera_RT/cliff_demo.py` | RealSense 输入、本地可视化 | — |
 | 接触点显示 | `infer/ContactPointShow/main.py` | 只读订阅 `sensor_data` | — |
-| 传感器监视 | `infer/SensorMonitor/main.py` | 只读订阅 `robot:sensor:v1` | [infer/SensorMonitor/ARCHITECTURE.md](infer/SensorMonitor/ARCHITECTURE.md) |
+| 传感器监视 | `infer/SensorMonitor/main.py` | 自动选择独占直连 Haptron 或只读订阅 `robot:sensor:v1` | [infer/SensorMonitor/ARCHITECTURE.md](infer/SensorMonitor/ARCHITECTURE.md) |
 | SonoScape API | `SonoScape_api/redis_service.py` | Redis 队列/结果键、超声 TCP | — |
 | 语音/UI 客户端 | `py-xiaokai/main.py` | WebSocket/MQTT、Redis `:6379` | — |
 
@@ -136,6 +138,7 @@ Rm75ServoPlanner → RMCommand ServoJ mailbox → RM75 I/O owner
 2. 新增协议版本，不在原版本中改变字段单位或含义。
 3. 对必填字段、数值范围、重复序号、断线、超时和重连行为给出确定规则。
 4. 保留 fail-closed 行为和结构化错误；不得用默认零值把无效数据伪装成有效输入。
-5. 增加离线解析/状态机测试后再进行真机验证；当前没有完整 CTest harness。
+5. Robot 模块的纯离线 CTest 必须通过后再进行真机验证；当前覆盖 parser、freshness、基础
+   状态机、planner 拒绝边界和运行 schema，但尚未形成完整回放 harness。
 6. 真机步骤遵守 [AGENTS.md](AGENTS.md) 的硬约束和
    [RM75 运行边界](PROGRESS.md)。

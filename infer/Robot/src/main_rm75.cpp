@@ -16,17 +16,13 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
-#include <condition_variable>
 #include <csignal>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -35,27 +31,20 @@
 #include <Eigen/Dense>
 #include <json.hpp>
 
+#include <calibrated_frame_chain.hpp>
 #include <contact_sensing.hpp>
 #include <force_calibration.hpp>
 #include <force_sensor.hpp>
 #include <realman_command.hpp>
 #include <redis_bridge.hpp>
 #include <rm75_control.hpp>
+#include <rm75_runtime_config.hpp>
+#include <rm75_runtime_logging.hpp>
 
 namespace {
 
 std::atomic<bool> g_stop_requested{false};
 // ServoJ 由异步发送线程执行；这里限制相邻两次真实 socket 写入的最小间隔。
-constexpr const char* kImplicitProfileName =
-    "rm75_v6_redis_visual_closed_loop_3n_tcp188";
-constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
-// RM75 pose feedback is quantized at roughly 0.001 rad. At the legacy
-// 188 mm probe TCP this can appear as about 0.19 mm of endpoint motion even
-// while joint feedback and the physical arm remain stationary. Keep the
-// independent orientation gate and allow a consistent endpoint envelope.
-constexpr double kRuntimeTareMaximumTcpSpanMm = 0.35;
-// RM75 静止反馈存在约 0.08° 的正常微抖；使用 0.10° 仍远小于真实姿态运动。
-constexpr double kRuntimeTareMaximumOrientationSpanDeg = 0.10;
 constexpr double kProvisionalTareMaximumForceNormN = 5.0;
 constexpr double kProvisionalTareMaximumTorqueNormNm = 0.5;
 // Provisional commissioning remains gated by the no-contact tare, old
@@ -73,439 +62,9 @@ void HandleSignal(int) {
 // 模块一：控制器配置与命令行契约
 // -------------------------------------------------------------------------
 
-enum class ControllerMode {
-    // 只读取、发布和记录，不计算或发送运动。
-    kObserve,
-    // 计算控制量和关节目标，但不向真机发送 ServoJ。
-    kDryRun,
-    // 向真实机械臂发送 ServoJ；默认生产入口使用该模式。
-    kExecute,
-};
-
-const char* ModeName(ControllerMode mode) {
-    switch (mode) {
-        case ControllerMode::kObserve: return "observe";
-        case ControllerMode::kDryRun: return "dry_run";
-        case ControllerMode::kExecute: return "execute";
-    }
-    return "unknown";
-}
-
-struct Options {
-    // I/O、实时周期和运行方式。
-    ControllerMode mode = ControllerMode::kObserve;
-    bool simulate = false;
-    bool redis_enabled = true;
-    std::string robot_ip = "192.168.50.254";
-    int robot_port = 8080;
-    std::string sensor_device = "/dev/ttyUSB0";
-    unsigned int sensor_baud = 115200;
-    int sensor_stale_ms = 50; //六维力传感器数据过期时间
-    int robot_stale_ms = 200; //机械臂数据过期时间
-    int command_stale_ms = 500; //Redis命令过期时间
-    std::string calibration_path;
-    std::string expected_sensor_id;
-    std::string probe_model_path = "../model/Lprobe-IFS.STL";
-    std::string redis_host = "127.0.0.1";
-    int redis_port = 7777;
-    int period_ms = 10;
-    int duration_s = 0;
-    int publish_every = 5;
-    int execute_warmup_s = 2;
-    int tare_no_contact_s = 0;
-    std::string runtime_log_path;
-
-    // 力控、扫描、跟踪误差和旧六轴兼容参数。
-    // 名称带 cm/mm/deg 的字段使用对应单位，其余运动量使用 SI 单位。
-    double desired_force_n = -1.0;
-    double raw_force_limit_n = 50.0;
-    double raw_torque_limit_nm = 5.0;
-    double approach_speed_cm_s = 0.0;
-    double approach_direction_tool_z = 0.0;
-    double maximum_force_axis_speed_cm_s = 0.5;
-    double maximum_approach_distance_mm = 5.0;
-    double scan_start_force_n = 2.0;
-    double scan_force_tolerance_n = 0.3;
-    double scan_force_stable_duration_s = 0.5;
-    double scan_speed_cm_s = 0.1;
-    double scan_distance_mm = 100.0;
-    double scan_direction_tool_x = -1.0;
-    double maximum_orientation_excursion_deg = 5.0;
-    double max_tracking_joint_error_deg = 20.0;
-    double max_tracking_position_error_mm = 3.0;
-    double max_tracking_orientation_error_deg = 2.0;
-    double manual_y_m = 0.0;
-    double manual_rz_deg = 0.0;
-    double contact_pitch_gain_rad_per_m = 0.0;
-    int manual_phase = -1;
-    bool manual_action = false;
-    bool manual_terminate = false;
-    bool allow_provisional_force_control = false;
-    bool implicit_commissioning_profile = false;
-    // Reproduce the remaining legacy six-axis force/contact dynamics.
-    // Unfiltered force limits and all RM75 motion gates remain independent.
-    bool legacy_six_axis_force_stage = false;
-
-    bool allow_near_singularity = false;
-    bool enable_force_retract = false;
-    double retract_direction_tool_z = 0.0;
-    double retract_distance_mm = 5.0;
-    double retract_speed_cm_s = 0.2;
-};
-
 // -------------------------------------------------------------------------
 // 模块二：非阻塞运行日志
 // -------------------------------------------------------------------------
-
-struct RuntimeLogRow {
-    // 一个 10 ms 控制周期的完整快照。结构体只保存数据，实际磁盘写入由
-    // AsyncRuntimeLogger 的后台线程执行，避免格式化和文件 I/O 阻塞控制周期。
-    std::uint64_t cycle = 0;
-    std::int64_t monotonic_ns = 0;
-    double work_us = 0.0;
-    double cycle_interval_us = 0.0;
-    double deadline_lateness_us = 0.0;
-    bool deadline_missed = false;
-    Rm75SupervisorState state = Rm75SupervisorState::kInitializing;
-    std::uint64_t robot_sequence = 0;
-    std::uint64_t sensor_sequence = 0;
-    std::int64_t robot_received_monotonic_ns = 0;
-    std::int64_t sensor_received_monotonic_ns = 0;
-    std::int64_t sensor_source_unix_ns = 0;
-    bool robot_valid = false;
-    bool wrench_valid = false;
-    int arm_error = 0;
-    int system_error = 0;
-    double robot_age_ms = 0.0;
-    double sensor_age_ms = 0.0;
-    bool checksum_valid = false;
-    ForceSensorIoStatus sensor_io_status = ForceSensorIoStatus::kDisconnected;
-    int sensor_io_error = 0;
-    bool redis_enabled = false;
-    bool redis_subscriber_connected = false;
-    bool redis_publisher_connected = false;
-    bool command_present = false;
-    bool command_valid = false;
-    bool command_fresh = false;
-    std::uint64_t command_sequence = 0;
-    std::uint64_t command_producer_sequence = 0;
-    int command_protocol_version = 0;
-    std::string command_session_id;
-    std::int64_t command_producer_timestamp_unix_ms = 0;
-    double command_phase_confidence = 0.0;
-    std::uint64_t command_connection_generation = 0;
-    double command_age_ms = 0.0;
-    bool command_action_enabled = false;
-    bool command_terminate = false;
-    bool command_recovery_mode = false;
-    int command_mask_lr_majority = 0;
-    int command_phase_index = -1;
-    double command_model_y_m = 0.0;
-    double command_model_rz_deg = 0.0;
-    double command_desired_force_n = -1.0;
-    std::string command_hold_reason;
-    std::uint64_t servo_submitted_sequence = 0;
-    std::uint64_t servo_consumed_sequence = 0;
-    std::uint64_t servo_discarded_sequence = 0;
-    std::uint64_t servo_pending_sequence = 0;
-    std::uint64_t servo_sent_sequence = 0;
-    std::uint64_t servo_result_sequence = 0;
-    RMErrorCode servo_result_code = RMErrorCode::kNone;
-    bool servo_outstanding = false;
-    Eigen::Matrix<double, 7, 1> actual_joints =
-        Eigen::Matrix<double, 7, 1>::Zero();
-    Eigen::Matrix<double, 6, 1> actual_pose =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    Eigen::Matrix<double, 6, 1> raw_wrench =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    Eigen::Matrix<double, 6, 1> compensated_wrench =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    Eigen::Matrix<double, 6, 1> control_wrench =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    ContactEstimate contact;
-    Eigen::Vector3d filtered_contact_point = Eigen::Vector3d::Zero();
-    Eigen::Matrix<double, 6, 1> requested_delta =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    Eigen::Matrix<double, 6, 1> desired_pose =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    double reference_model_position_error_mm = 0.0;
-    double reference_model_orientation_error_deg = 0.0;
-    double robot_model_position_error_mm = 0.0;
-    double robot_model_tool_y_error_mm = 0.0;
-    bool target_force_unloading = false;
-    bool target_force_recovering = false;
-    bool target_force_reference_rebased = false;
-    bool visual_y_tracking_paused = false;
-    bool visual_y_tracking_reference_rebased = false;
-    bool recovery_search_active = false;
-    int recovery_locked_mask_side = 0;
-    double recovery_tool_y_velocity_m_s = 0.0;
-    double recovery_search_distance_m = 0.0;
-    bool recovery_distance_limit_reached = false;
-    Eigen::Matrix<double, 7, 1> target_joints =
-        Eigen::Matrix<double, 7, 1>::Zero();
-    std::string fault;
-};
-
-struct CycleTimingResult {
-    std::chrono::steady_clock::time_point finished{};
-    double work_us = 0.0;
-    double deadline_lateness_us = 0.0;
-    bool deadline_missed = false;
-};
-
-class AsyncRuntimeLogger {
-public:
-    bool Start(const std::string& path, std::string* error) {
-        if (path.empty()) return true;
-        path_ = path;
-        const std::filesystem::path output(path);
-        std::error_code ec;
-        if (!output.parent_path().empty()) {
-            std::filesystem::create_directories(output.parent_path(), ec);
-            if (ec) {
-                if (error != nullptr) *error = "cannot create log directory";
-                return false;
-            }
-        }
-        stream_.open(path);
-        if (!stream_) {
-            if (error != nullptr) *error = "cannot open runtime log: " + path;
-            return false;
-        }
-        stream_ << "cycle,monotonic_ns,work_us,cycle_interval_us,"
-                   "deadline_lateness_us,deadline_missed,state,"
-                   "robot_sequence,sensor_sequence,"
-                   "robot_received_monotonic_ns,sensor_received_monotonic_ns,"
-                   "sensor_source_unix_ns,robot_valid,wrench_valid,"
-                   "arm_error,system_error,robot_age_ms,sensor_age_ms,"
-                   "checksum_valid,sensor_io_status,sensor_io_error,"
-                   "redis_enabled,redis_subscriber_connected,"
-                   "redis_publisher_connected,command_present,command_valid,"
-                   "command_fresh,command_sequence,command_producer_sequence,"
-                   "command_protocol_version,command_session_id,"
-                   "command_producer_timestamp_unix_ms,command_phase_confidence,"
-                   "command_connection_generation,"
-                   "command_age_ms,command_action_enabled,command_terminate,"
-                   "command_recovery_mode,command_mask_lr_majority,"
-                   "command_phase_index,command_model_y_m,command_model_rz_deg,"
-                   "command_desired_force_n,command_hold_reason,"
-                   "servo_submitted_sequence,servo_consumed_sequence,"
-                   "servo_discarded_sequence,servo_pending_sequence,"
-                   "servo_sent_sequence,"
-                   "servo_result_sequence,servo_result_code,servo_outstanding,"
-                   "actual_j1_rad,actual_j2_rad,actual_j3_rad,actual_j4_rad,"
-                   "actual_j5_rad,actual_j6_rad,actual_j7_rad,"
-                   "actual_x_m,actual_y_m,actual_z_m,actual_rx_rad,"
-                   "actual_ry_rad,actual_rz_rad,"
-                   "raw_fx_n,raw_fy_n,raw_fz_n,raw_tx_nm,raw_ty_nm,raw_tz_nm,"
-                   "tool_fx_n,tool_fy_n,tool_fz_n,tool_tx_nm,tool_ty_nm,tool_tz_nm,"
-                   "control_fx_n,control_fy_n,control_fz_n,"
-                   "control_tx_nm,control_ty_nm,control_tz_nm,"
-                   "contact_valid,contact_x_m,contact_y_m,contact_z_m,contact_residual_nm,"
-                   "contact_point_error_m,filtered_contact_x_m,"
-                   "filtered_contact_y_m,filtered_contact_z_m,"
-                   "requested_dx_tool_m,requested_dy_tool_m,requested_dz_tool_m,"
-                   "requested_drx_tool_rad,requested_dry_tool_rad,"
-                   "requested_drz_tool_rad,"
-                   "desired_x_m,desired_y_m,desired_z_m,desired_rx_rad,desired_ry_rad,desired_rz_rad,"
-                   "reference_model_position_error_mm,"
-                   "reference_model_orientation_error_deg,"
-                   "robot_model_position_error_mm,robot_model_tool_y_error_mm,"
-                   "target_force_unloading,"
-                   "target_force_recovering,"
-                   "target_force_reference_rebased,"
-                   "visual_y_tracking_paused,"
-                   "visual_y_tracking_reference_rebased,"
-                   "recovery_search_active,recovery_locked_mask_side,"
-                   "recovery_tool_y_velocity_m_s,recovery_search_distance_m,"
-                   "recovery_distance_limit_reached,"
-                   "j1_rad,j2_rad,j3_rad,j4_rad,j5_rad,j6_rad,j7_rad,fault\n";
-        queue_.resize(kMaximumRows);
-        queue_head_ = 0;
-        queue_size_ = 0;
-        running_.store(true);
-        thread_ = std::thread(&AsyncRuntimeLogger::ThreadMain, this);
-        return true;
-    }
-
-    CycleTimingResult PushAndMeasure(
-        RuntimeLogRow row,
-        std::chrono::steady_clock::time_point cycle_started,
-        std::chrono::steady_clock::time_point deadline) {
-        CycleTimingResult timing;
-        if (!running_.load()) {
-            timing.finished = std::chrono::steady_clock::now();
-            timing.work_us = std::chrono::duration<double, std::micro>(
-                                 timing.finished - cycle_started)
-                                 .count();
-            timing.deadline_missed = timing.finished > deadline;
-            timing.deadline_lateness_us = timing.deadline_missed
-                ? std::chrono::duration<double, std::micro>(
-                      timing.finished - deadline)
-                      .count()
-                : 0.0;
-            return timing;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (queue_size_ >= kMaximumRows) {
-                queue_head_ = (queue_head_ + 1) % kMaximumRows;
-                --queue_size_;
-                ++dropped_rows_;
-            }
-            const std::size_t index =
-                (queue_head_ + queue_size_) % kMaximumRows;
-            queue_[index] = std::move(row);
-            timing.finished = std::chrono::steady_clock::now();
-            timing.work_us = std::chrono::duration<double, std::micro>(
-                                 timing.finished - cycle_started)
-                                 .count();
-            timing.deadline_missed = timing.finished > deadline;
-            timing.deadline_lateness_us = timing.deadline_missed
-                ? std::chrono::duration<double, std::micro>(
-                      timing.finished - deadline)
-                      .count()
-                : 0.0;
-            queue_[index].work_us = timing.work_us;
-            queue_[index].deadline_lateness_us =
-                timing.deadline_lateness_us;
-            queue_[index].deadline_missed = timing.deadline_missed;
-            ++queue_size_;
-        }
-        condition_.notify_one();
-        return timing;
-    }
-
-    void Stop() {
-        if (!running_.exchange(false)) return;
-        condition_.notify_all();
-        if (thread_.joinable()) thread_.join();
-        stream_.close();
-    }
-
-    ~AsyncRuntimeLogger() { Stop(); }
-    std::uint64_t DroppedRows() const { return dropped_rows_.load(); }
-    const std::string& Path() const { return path_; }
-
-private:
-    void ThreadMain() {
-        stream_ << std::fixed << std::setprecision(9);
-        for (;;) {
-            RuntimeLogRow row;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [&]() {
-                    return !running_.load() || queue_size_ != 0;
-                });
-                if (queue_size_ == 0 && !running_.load()) break;
-                row = std::move(queue_[queue_head_]);
-                queue_head_ = (queue_head_ + 1) % kMaximumRows;
-                --queue_size_;
-            }
-            stream_ << row.cycle << ',' << row.monotonic_ns << ','
-                    << row.work_us << ',' << row.cycle_interval_us << ','
-                    << row.deadline_lateness_us << ','
-                    << (row.deadline_missed ? 1 : 0) << ','
-                    << ToString(row.state) << ',' << row.robot_sequence << ','
-                    << row.sensor_sequence
-                    << ',' << row.robot_received_monotonic_ns
-                    << ',' << row.sensor_received_monotonic_ns
-                    << ',' << row.sensor_source_unix_ns
-                    << ',' << (row.robot_valid ? 1 : 0)
-                    << ',' << (row.wrench_valid ? 1 : 0)
-                    << ',' << row.arm_error << ',' << row.system_error
-                    << ',' << row.robot_age_ms << ',' << row.sensor_age_ms
-                    << ',' << (row.checksum_valid ? 1 : 0)
-                    << ',' << ForceSensorIoStatusName(row.sensor_io_status)
-                    << ',' << row.sensor_io_error
-                    << ',' << (row.redis_enabled ? 1 : 0)
-                    << ',' << (row.redis_subscriber_connected ? 1 : 0)
-                    << ',' << (row.redis_publisher_connected ? 1 : 0)
-                    << ',' << (row.command_present ? 1 : 0)
-                    << ',' << (row.command_valid ? 1 : 0)
-                    << ',' << (row.command_fresh ? 1 : 0)
-                    << ',' << row.command_sequence
-                    << ',' << row.command_producer_sequence
-                    << ',' << row.command_protocol_version;
-            std::string escaped_session_id = row.command_session_id;
-            std::replace(escaped_session_id.begin(),
-                         escaped_session_id.end(), ',', ';');
-            stream_ << ',' << escaped_session_id
-                    << ',' << row.command_producer_timestamp_unix_ms
-                    << ',' << row.command_phase_confidence
-                    << ',' << row.command_connection_generation
-                    << ',' << row.command_age_ms
-                    << ',' << (row.command_action_enabled ? 1 : 0)
-                    << ',' << (row.command_terminate ? 1 : 0)
-                    << ',' << (row.command_recovery_mode ? 1 : 0)
-                    << ',' << row.command_mask_lr_majority
-                    << ',' << row.command_phase_index
-                    << ',' << row.command_model_y_m
-                    << ',' << row.command_model_rz_deg
-                    << ',' << row.command_desired_force_n;
-            std::string escaped_command_hold_reason = row.command_hold_reason;
-            std::replace(escaped_command_hold_reason.begin(),
-                         escaped_command_hold_reason.end(), ',', ';');
-            stream_ << ',' << escaped_command_hold_reason
-                    << ',' << row.servo_submitted_sequence
-                    << ',' << row.servo_consumed_sequence
-                    << ',' << row.servo_discarded_sequence
-                    << ',' << row.servo_pending_sequence
-                    << ',' << row.servo_sent_sequence
-                    << ',' << row.servo_result_sequence
-                    << ',' << static_cast<int>(row.servo_result_code)
-                    << ',' << (row.servo_outstanding ? 1 : 0);
-            for (int i = 0; i < 7; ++i) stream_ << ',' << row.actual_joints[i];
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.actual_pose[i];
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.raw_wrench[i];
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.compensated_wrench[i];
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.control_wrench[i];
-            stream_ << ',' << (row.contact.valid ? 1 : 0)
-                    << ',' << row.contact.point.x()
-                    << ',' << row.contact.point.y()
-                    << ',' << row.contact.point.z()
-                    << ',' << row.contact.residual
-                    << ',' << row.contact.point_error_m
-                    << ',' << row.filtered_contact_point.x()
-                    << ',' << row.filtered_contact_point.y()
-                    << ',' << row.filtered_contact_point.z();
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.requested_delta[i];
-            for (int i = 0; i < 6; ++i) stream_ << ',' << row.desired_pose[i];
-            stream_ << ',' << row.reference_model_position_error_mm
-                    << ',' << row.reference_model_orientation_error_deg
-                    << ',' << row.robot_model_position_error_mm
-                    << ',' << row.robot_model_tool_y_error_mm
-                    << ',' << (row.target_force_unloading ? 1 : 0)
-                    << ',' << (row.target_force_recovering ? 1 : 0)
-                    << ',' << (row.target_force_reference_rebased ? 1 : 0)
-                    << ',' << (row.visual_y_tracking_paused ? 1 : 0)
-                    << ',' << (row.visual_y_tracking_reference_rebased ? 1 : 0)
-                    << ',' << (row.recovery_search_active ? 1 : 0)
-                    << ',' << row.recovery_locked_mask_side
-                    << ',' << row.recovery_tool_y_velocity_m_s
-                    << ',' << row.recovery_search_distance_m
-                    << ',' << (row.recovery_distance_limit_reached ? 1 : 0);
-            for (int i = 0; i < 7; ++i) stream_ << ',' << row.target_joints[i];
-            std::string escaped_fault = row.fault;
-            std::replace(escaped_fault.begin(), escaped_fault.end(), ',', ';');
-            stream_ << ',' << escaped_fault << '\n';
-        }
-        stream_.flush();
-    }
-
-    static constexpr std::size_t kMaximumRows = 8192;
-    std::string path_;
-    std::ofstream stream_;
-    std::atomic<bool> running_{false};
-    std::thread thread_;
-    mutable std::mutex mutex_;
-    std::condition_variable condition_;
-    std::vector<RuntimeLogRow> queue_;
-    std::size_t queue_head_ = 0;
-    std::size_t queue_size_ = 0;
-    std::atomic<std::uint64_t> dropped_rows_{0};
-};
 
 std::string TimestampForFilename() {
     const std::time_t now = std::time(nullptr);
@@ -537,70 +96,11 @@ std::filesystem::path ExecutableDirectory(const char* argv0) {
 
 // “./main_rm75”唯一使用的本机默认配置。带其他参数的调用仍走
 // ParseOptions 的显式配置和校验，因此不会静默继承这套真机参数。
-void ApplyImplicitCommissioningProfile(const char* argv0, Options& options) {
+void ApplyImplicitCommissioningProfile(const char* argv0,
+                                       RobotRuntimeConfig& options) {
     const std::filesystem::path executable_directory = ExecutableDirectory(argv0);
-    options.mode = ControllerMode::kExecute;
-    options.redis_enabled = true;
-    options.robot_ip = "192.168.50.254";
-    options.robot_port = 8080;
-    options.sensor_device =
-        "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0";
-    options.sensor_baud = 115200;
-    options.calibration_path =
-        (executable_directory / "rm75_force_calibration_v9_provisional.json").string();
-    options.expected_sensor_id = "DU0DU5LC";
-    options.probe_model_path =
-        (executable_directory / "../model/Lprobe-IFS.STL").lexically_normal().string();
-    // Zero means continuous operation. Tool-X scanning and Z-force admittance
-    // both continue until Ctrl+C, terminate or a fault.
-    options.duration_s = 0;
-    options.tare_no_contact_s = 3;
-    // First RM75 force-control baseline: reproduce the original six-axis
-    // operating target before tuning new gains or force bands.
-    options.desired_force_n = -3.0;
-    options.raw_force_limit_n = 50.0;
-    options.raw_torque_limit_nm = 5.0;
-    // The commissioned free-space approach direction is +Tool-Z.
-    options.approach_speed_cm_s = 1.0;
-    options.approach_direction_tool_z = 1.0;
-    options.maximum_force_axis_speed_cm_s = 0.20;
-    options.maximum_approach_distance_mm = 250.0;
-    // Phase and action state come exclusively from the fresh Redis command.
-    // The controller starts fail-closed and waits for a new session's idle
-    // handshake before accepting its first moving command.
-    options.manual_phase = -1;
-    options.scan_start_force_n = 2.0;
-    // Tool-X 启动前仍需连续 0.5 s 力稳定；现场力波动较大，采用
-    // -3 +/- 0.8 N 的启动带，避免在已建立接触后长期停留在 force_settle。
-    options.scan_force_tolerance_n = 0.8;
-    options.scan_force_stable_duration_s = 0.5;
-    options.scan_speed_cm_s = 1.0;
-    options.scan_distance_mm = 0.0;
-    options.scan_direction_tool_x = -1.0;
-    // Zero disables the separate total Cartesian-orientation excursion gate.
-    options.maximum_orientation_excursion_deg = 0.0;
-    options.max_tracking_joint_error_deg = 20.0;
-    options.max_tracking_position_error_mm = 25.0;
-    // Zero disables Cartesian orientation tracking-error supervision for the
-    // current force-contact commissioning profile. Joint and position
-    // tracking supervision remain enabled.
-    options.max_tracking_orientation_error_deg = 0.0;
-    options.manual_action = false;
-    options.allow_provisional_force_control = true;
-    // 默认生产链启用旧六轴已经验证过的三段接触处理：wrench Kalman、
-    // contact-point Kalman 及接触点驱动的 Tool-X/Roll 姿态导纳。
-    // 原始 wrench 量程门和 RM75 的关节/IK 故障门仍在滤波前独立执行。
-    options.legacy_six_axis_force_stage = true;
-    // Keep the historical fixed-threshold retreat disabled. Target-relative
-    // unloading is a separate control-layer behavior configured in
-    // Rm75ControlConfig and remains available during Redis Hold.
-    options.enable_force_retract = false;
-    options.runtime_log_path =
-        (executable_directory / "logs"
-         / ("rm75_v6_redis_visual_closed_loop_3n_tcp188_"
-            + TimestampForFilename() + ".csv"))
-            .string();
-    options.implicit_commissioning_profile = true;
+    options = MakeImplicitRm75ProductionConfig(
+        executable_directory.string(), TimestampForFilename());
 }
 
 void Usage(const char* program) {
@@ -628,31 +128,14 @@ void Usage(const char* program) {
         << "    no-argument production entry enables Redis 127.0.0.1:7777 continuously\n"
         << "  --period-ms MS --duration-sec SEC --publish-every N\n"
         << "  --runtime-log FILE\n\n"
-        << "Control (SI except names carrying cm/mm/deg):\n"
-        << "  --desired-force-n N               default -1, allowed -3..-0.1\n"
-        << "  --raw-force-limit-n N --raw-torque-limit-nm NM (cannot exceed 50/5)\n"
+        << "Runtime safety and manual intent:\n"
         << "  --execute-warmup-sec SEC          no-contact gate, default 2\n"
         << "  --tare-no-contact-sec SEC         explicit stationary tare, 1..10\n"
         << "  --allow-provisional-force-control explicit restricted commissioning\n"
-        << "  --approach-speed-cm-s SPEED        default 0, maximum 0.5\n"
-        << "  --approach-direction-tool-z -1|0|1\n"
-        << "  --max-force-axis-speed-cm-s SPEED contact Tool-Z maximum 0.5\n"
-        << "  --max-approach-distance-mm MM      default/maximum 5\n"
-        << "    no-argument production entry uses 250 mm only as the no-contact approach ceiling\n"
-        << "  --scan-start-force-n N --scan-speed-cm-s SPEED\n"
-        << "  --scan-force-tolerance-n N --scan-force-stable-sec SEC\n"
-        << "  --scan-distance-mm MM (0 continuous) --scan-direction-tool-x -1|1\n"
-        << "  --max-orientation-excursion-deg DEG default 5, 0 disables, maximum 15\n"
-        << "  --max-tracking-joint-error-deg DEG --max-tracking-position-error-mm MM\n"
-        << "  --max-tracking-orientation-error-deg DEG (0 disables)\n"
         << "  --manual-action --manual-terminate --manual-y-m M\n"
         << "  --manual-rz-deg DEG --manual-phase -1..2\n"
-        << "  --contact-pitch-gain-rad-per-m G  default 0 (confirm sign in dry-run)\n"
-        << "  --legacy-six-axis-force-stage     old wrench/contact filters and\n"
-        << "                                    contact-roll dynamics\n"
-        << "  --allow-near-singularity\n"
-        << "  --enable-force-retract --retract-direction-tool-z -1|1\n"
-        << "  --retract-distance-mm MM --retract-speed-cm-s SPEED\n";
+        << "Control, planner and hardware safety parameters are owned by their\n"
+        << "typed module configurations and are not command-line options.\n";
 }
 
 bool ParseInt(const char* text, int& output) {
@@ -688,7 +171,7 @@ bool ParseDouble(const char* text, double& output) {
     }
 }
 
-bool ParseOptions(int argc, char** argv, Options& options) {
+bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         auto value = [&]() -> const char* {
@@ -745,134 +228,23 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* item = value(); if (!item || !ParseInt(item, options.tare_no_contact_s)) return false;
         } else if (argument == "--allow-provisional-force-control") {
             options.allow_provisional_force_control = true;
-        } else if (argument == "--legacy-six-axis-force-stage") {
-            options.legacy_six_axis_force_stage = true;
-        } else if (argument == "--desired-force-n") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.desired_force_n)) return false;
-        } else if (argument == "--raw-force-limit-n") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.raw_force_limit_n)) return false;
-        } else if (argument == "--raw-torque-limit-nm") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.raw_torque_limit_nm)) return false;
-        } else if (argument == "--approach-speed-cm-s") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.approach_speed_cm_s)) return false;
-        } else if (argument == "--approach-direction-tool-z") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.approach_direction_tool_z)) return false;
-        } else if (argument == "--max-force-axis-speed-cm-s") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.maximum_force_axis_speed_cm_s)) return false;
-        } else if (argument == "--max-approach-distance-mm") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.maximum_approach_distance_mm)) return false;
-        } else if (argument == "--scan-start-force-n") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_start_force_n)) return false;
-        } else if (argument == "--scan-force-tolerance-n") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_force_tolerance_n)) return false;
-        } else if (argument == "--scan-force-stable-sec") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_force_stable_duration_s)) return false;
-        } else if (argument == "--scan-speed-cm-s") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_speed_cm_s)) return false;
-        } else if (argument == "--scan-distance-mm") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_distance_mm)) return false;
-        } else if (argument == "--scan-direction-tool-x") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.scan_direction_tool_x)) return false;
-        } else if (argument == "--max-orientation-excursion-deg") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.maximum_orientation_excursion_deg)) return false;
-        } else if (argument == "--max-tracking-joint-error-deg") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.max_tracking_joint_error_deg)) return false;
-        } else if (argument == "--max-tracking-position-error-mm") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.max_tracking_position_error_mm)) return false;
-        } else if (argument == "--max-tracking-orientation-error-deg") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.max_tracking_orientation_error_deg)) return false;
         } else if (argument == "--manual-y-m") {
             const char* item = value(); if (!item || !ParseDouble(item, options.manual_y_m)) return false;
         } else if (argument == "--manual-rz-deg") {
             const char* item = value(); if (!item || !ParseDouble(item, options.manual_rz_deg)) return false;
-        } else if (argument == "--contact-pitch-gain-rad-per-m") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.contact_pitch_gain_rad_per_m)) return false;
         } else if (argument == "--manual-phase") {
             const char* item = value(); if (!item || !ParseInt(item, options.manual_phase)) return false;
         } else if (argument == "--manual-action") {
             options.manual_action = true;
         } else if (argument == "--manual-terminate") {
             options.manual_terminate = true;
-        } else if (argument == "--allow-near-singularity") {
-            options.allow_near_singularity = true;
-        } else if (argument == "--enable-force-retract") {
-            options.enable_force_retract = true;
-        } else if (argument == "--retract-direction-tool-z") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.retract_direction_tool_z)) return false;
-        } else if (argument == "--retract-distance-mm") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.retract_distance_mm)) return false;
-        } else if (argument == "--retract-speed-cm-s") {
-            const char* item = value(); if (!item || !ParseDouble(item, options.retract_speed_cm_s)) return false;
         } else {
             std::cerr << "Unknown option: " << argument << '\n';
             return false;
         }
     }
 
-    const auto direction_valid = [](double value, bool allow_zero) {
-        return (allow_zero && value == 0.0) || value == -1.0 || value == 1.0;
-    };
-    if (options.calibration_path.empty()
-        || options.robot_port <= 0 || options.robot_port > 65535
-        || options.redis_port <= 0 || options.redis_port > 65535
-        || options.period_ms < 10 || options.period_ms > 100
-        || options.sensor_stale_ms < options.period_ms || options.sensor_stale_ms > 1000
-        || options.robot_stale_ms < options.period_ms || options.robot_stale_ms > 2000
-        || options.command_stale_ms < options.period_ms || options.command_stale_ms > 10000
-        || options.duration_s < 0 || options.publish_every <= 0
-        || options.execute_warmup_s < 2 || options.execute_warmup_s > 10
-        || options.tare_no_contact_s < 0 || options.tare_no_contact_s > 10
-        || options.desired_force_n < -3.0 || options.desired_force_n > -0.1
-        || options.raw_force_limit_n <= 0.0 || options.raw_force_limit_n > 50.0
-        || options.raw_torque_limit_nm <= 0.0
-        || options.raw_torque_limit_nm > 5.0
-        || options.approach_speed_cm_s < 0.0
-        || options.approach_speed_cm_s
-               > (options.implicit_commissioning_profile ? 1.0 : 0.5)
-        || options.maximum_force_axis_speed_cm_s <= 0.0
-        || options.maximum_force_axis_speed_cm_s > 0.5
-        || options.maximum_approach_distance_mm <= 0.0
-        || options.maximum_approach_distance_mm
-               > (options.implicit_commissioning_profile ? 250.0 : 5.0)
-        || options.scan_start_force_n < 0.99
-        || options.scan_start_force_n > 50.0
-        || options.scan_force_tolerance_n <= 0.0
-        || options.scan_force_tolerance_n > 3.0
-        || options.scan_force_stable_duration_s < 0.02
-        || options.scan_force_stable_duration_s > 10.0
-        // 无参数固定视觉 profile 使用 1 cm/s Tool-X 扫描；
-        // 显式参数模式仍限制在 0.5 cm/s，避免意外放宽手动调用。
-        || options.scan_speed_cm_s <= 0.0
-        || options.scan_speed_cm_s
-               > (options.implicit_commissioning_profile ? 1.0 : 0.5)
-        || options.scan_distance_mm < 0.0 || options.scan_distance_mm > 50.0
-        || !direction_valid(options.scan_direction_tool_x, false)
-        || options.maximum_orientation_excursion_deg < 0.0
-        || options.maximum_orientation_excursion_deg > 15.0
-        || options.max_tracking_joint_error_deg <= 0.0
-        || options.max_tracking_joint_error_deg > 20.0
-        || options.max_tracking_position_error_mm <= 0.0
-        || options.max_tracking_position_error_mm > 25.0
-        || options.max_tracking_orientation_error_deg < 0.0
-        || options.max_tracking_orientation_error_deg > 10.0
-        || !direction_valid(options.approach_direction_tool_z, true)
-        || options.manual_y_m < -0.2 || options.manual_y_m > 0.2
-        || options.manual_rz_deg < -180.0 || options.manual_rz_deg > 180.0
-        || std::abs(options.contact_pitch_gain_rad_per_m) > 1000.0
-        || options.manual_phase < -1 || options.manual_phase > 2
-        || options.retract_distance_mm <= 0.0
-        || options.retract_distance_mm
-               > (options.implicit_commissioning_profile ? 200.0 : 5.0)
-        || options.retract_speed_cm_s <= 0.0 || options.retract_speed_cm_s > 0.5
-        || (options.enable_force_retract
-            && !direction_valid(options.retract_direction_tool_z, false))) {
-        return false;
-    }
-    if (options.mode == ControllerMode::kExecute && options.simulate) return false;
-    if (options.mode == ControllerMode::kExecute && options.period_ms != 10) {
-        return false;
-    }
-    return true;
+    return ValidateRobotRuntimeConfig(options);
 }
 
 Eigen::Matrix<double, 6, 1> ArrayToEigen(const std::array<double, 6>& input) {
@@ -922,48 +294,6 @@ double Percentile99(std::vector<double> values) {
 // 模块三：启动 Stop、静止确认与悬空 tare 安全门
 // -------------------------------------------------------------------------
 
-RMResult RequestConfirmedStop(RMCommand& command) {
-    // StopMotion 的“控制器确认”与后面的“物理静止反馈”是两件事：本函数只
-    // 负责可靠地取得命令确认，StopAndConfirmStationary 再检查反馈是否静止。
-    RMResult result = RMResult::Failure(
-        RMErrorCode::kTimeout, "StopMotion was not attempted");
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        result = command.TryStopMotion(1000);
-        if (result) return result;
-        if (result.code == RMErrorCode::kTimeout) break;
-        if (attempt == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
-    return result;
-}
-
-class BestEffortStopGuard {
-public:
-    void Arm(RMCommand& command) noexcept {
-        command_ = &command;
-        armed_ = true;
-    }
-
-    void Disarm() noexcept { armed_ = false; }
-
-    ~BestEffortStopGuard() {
-        // main() 在任意提前返回路径退出时，尽力补发一次 StopMotion；正常完成
-        // 且已确认静止后会 Disarm，避免析构阶段重复发送。
-        if (!armed_ || command_ == nullptr || !command_->IsConnected()) return;
-        try {
-            (void)command_->TryStopMotion(500);
-        } catch (...) {
-            // Destructors must remain noexcept. A failed best-effort Stop is
-            // still protected by the transport's latched Servo gate.
-        }
-    }
-
-private:
-    RMCommand* command_ = nullptr;
-    bool armed_ = false;
-};
-
 double WrappedAngleDifference(double lhs, double rhs) {
     return std::atan2(std::sin(lhs - rhs), std::cos(lhs - rhs));
 }
@@ -973,290 +303,18 @@ bool ServoOutstanding(const ServoSendSnapshot& status) {
         > std::max(status.sent_sequence, status.discarded_sequence);
 }
 
-double MaximumWrappedJointDeltaDeg(
-    const Eigen::Matrix<double, 7, 1>& lhs,
-    const Eigen::Matrix<double, 7, 1>& rhs) {
-    double maximum = 0.0;
-    for (int joint = 0; joint < 7; ++joint) {
-        maximum = std::max(
-            maximum,
-            std::abs(WrappedAngleDifference(lhs[joint], rhs[joint]))
-                * 180.0 / M_PI);
-    }
-    return maximum;
-}
-
-Eigen::Vector3d ProbeTcpBase(
-    const Eigen::Matrix<double, 6, 1>& controller_pose,
-    const Eigen::Vector3d& probe_tcp_pose_frame_m) {
-    // 控制器反馈的是 Arm_Tip 位姿；将 188 mm 探头 TCP 偏移旋转到 Base，
-    // 得到实际用于静止、行程和跟踪检查的探头端点位置。
-    return controller_pose.head<3>()
-        + RotationBaseFromControllerEuler(controller_pose.tail<3>())
-            * probe_tcp_pose_frame_m;
-}
-
-RMResult StopAndConfirmStationary(
-    RMCommand& command,
-    RMStateReader& state_reader,
-    const Eigen::Vector3d& probe_tcp_pose_frame_m,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
-    // 必须连续取得 5 次满足阈值的新反馈，不能仅凭 StopMotion 返回成功就认为
-    // 机械臂已经物理停止。相邻差值检测瞬时运动，窗口差值检测缓慢漂移。
-    const RMResult stop_result = RequestConfirmedStop(command);
-    if (!stop_result) return stop_result;
-
-    RobotStateSnapshot previous = state_reader.Latest();
-    if (!previous.valid || previous.stale) {
-        return RMResult::Failure(
-            RMErrorCode::kProtocol,
-            "StopMotion was acknowledged but robot feedback is invalid or stale");
-    }
-    RobotStateSnapshot window_anchor = previous;
-    int stationary_updates = 0;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        RobotStateSnapshot current;
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-        if (!state_reader.WaitForUpdate(
-                previous.sequence,
-                std::min(std::chrono::milliseconds(250),
-                         std::max(std::chrono::milliseconds(1), remaining)),
-                current)) {
-            if (!state_reader.running()) break;
-            continue;
-        }
-        if (!current.valid || current.stale
-            || current.arm_err != 0 || current.sys_err != 0) {
-            return RMResult::Failure(
-                RMErrorCode::kProtocol,
-                "StopMotion was acknowledged but healthy feedback was lost");
-        }
-
-        const double adjacent_joint_deg =
-            MaximumWrappedJointDeltaDeg(current.joints, previous.joints);
-        const double window_joint_deg =
-            MaximumWrappedJointDeltaDeg(current.joints, window_anchor.joints);
-        const double adjacent_tcp_mm =
-            (ProbeTcpBase(current.pose, probe_tcp_pose_frame_m)
-             - ProbeTcpBase(previous.pose, probe_tcp_pose_frame_m)).norm()
-            * 1000.0;
-        const double window_tcp_mm =
-            (ProbeTcpBase(current.pose, probe_tcp_pose_frame_m)
-             - ProbeTcpBase(window_anchor.pose, probe_tcp_pose_frame_m)).norm()
-            * 1000.0;
-        const Eigen::Matrix3d adjacent_rotation =
-            RotationBaseFromControllerEuler(current.pose.tail<3>())
-            * RotationBaseFromControllerEuler(previous.pose.tail<3>()).transpose();
-        const Eigen::Matrix3d window_rotation =
-            RotationBaseFromControllerEuler(current.pose.tail<3>())
-            * RotationBaseFromControllerEuler(window_anchor.pose.tail<3>()).transpose();
-        const double adjacent_orientation_deg =
-            Eigen::AngleAxisd(adjacent_rotation).angle() * 180.0 / M_PI;
-        const double window_orientation_deg =
-            Eigen::AngleAxisd(window_rotation).angle() * 180.0 / M_PI;
-        const bool stationary = adjacent_joint_deg <= 0.01
-            && window_joint_deg <= 0.02
-            && adjacent_tcp_mm <= 0.05
-            && window_tcp_mm <= 0.10
-            && adjacent_orientation_deg <= 0.01
-            && window_orientation_deg <= 0.02;
-        if (stationary) {
-            ++stationary_updates;
-            if (stationary_updates >= 5) return RMResult::Success();
-        } else {
-            stationary_updates = 0;
-            window_anchor = current;
-        }
-        previous = current;
-    }
-    return RMResult::Failure(
-        RMErrorCode::kTimeout,
-        "StopMotion was acknowledged but five stationary feedback updates "
-        "were not observed within the timeout");
-}
-
-struct RuntimeTareResult {
-    bool valid = false;
-    std::size_t samples = 0;
-    Eigen::Matrix<double, 6, 1> sensor_offset =
-        Eigen::Matrix<double, 6, 1>::Zero();
-    double maximum_force_norm_n = 0.0;
-    double maximum_torque_norm_nm = 0.0;
-    double maximum_force_deviation_n = 0.0;
-    double maximum_torque_deviation_nm = 0.0;
-    double maximum_joint_span_deg = 0.0;
-    double maximum_tcp_span_mm = 0.0;
-    double maximum_orientation_span_deg = 0.0;
-    std::string error;
-};
-
-RuntimeTareResult CollectRuntimeTare(
-    ForceSensorReader& force_reader,
-    RMStateReader& state_reader,
-    const ForceCalibration& calibration,
-    const Eigen::Vector3d& probe_tcp_pose_frame_m,
-    int seconds,
-    double raw_force_limit_n,
-    double raw_torque_limit_nm) {
-    // tare 采集流程：
-    // 1. 只接受新鲜、校验正确且未超量程的传感器帧；
-    // 2. 使用机器人当前姿态执行零偏、工具重力和质心力矩补偿；
-    // 3. 同时确认七关节、探头 TCP 和姿态在整个窗口内保持静止；
-    // 4. 取补偿后 wrench 均值作为本次运行的固定传感器系偏置。
-    RuntimeTareResult result;
-    std::vector<Eigen::Matrix<double, 6, 1>> samples;
-    samples.reserve(static_cast<std::size_t>(seconds * 50));
-    std::uint64_t last_sensor_sequence = 0;
-    RobotStateSnapshot anchor;
-    bool have_anchor = false;
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds(seconds);
-
-    while (!g_stop_requested.load()
-           && std::chrono::steady_clock::now() < deadline) {
-        const RobotStateSnapshot robot = state_reader.Latest();
-        const WrenchSample sample = force_reader.LatestSample();
-        const RMResult reader_result = state_reader.LastResult();
-        if (!robot.valid || robot.stale || !reader_result
-            || robot.arm_err != 0 || robot.sys_err != 0) {
-            result.error = "runtime tare lost healthy robot feedback";
-            return result;
-        }
-        if (!sample.valid || sample.stale || !sample.checksum_valid
-            || sample.io_status != ForceSensorIoStatus::kStreaming
-            || sample.io_error != 0) {
-            result.error = "runtime tare lost healthy force-sensor data";
-            return result;
-        }
-        if (sample.sequence == 0 || sample.sequence == last_sensor_sequence) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        last_sensor_sequence = sample.sequence;
-        const Eigen::Matrix<double, 6, 1> raw =
-            ArrayToEigen(sample.wrench_si);
-        if (!RawWrenchWithinLimits(raw,
-                                   raw_force_limit_n,
-                                   raw_torque_limit_nm)) {
-            result.error = "runtime tare rejected raw sensor overrange";
-            return result;
-        }
-        const Eigen::Matrix3d rotation_base_from_arm_tip =
-            RotationBaseFromControllerEuler(robot.pose.tail<3>());
-        const Eigen::Matrix3d rotation_base_from_sensor =
-            rotation_base_from_arm_tip * calibration.rotation_tool_from_sensor;
-        const CompensatedWrench compensated =
-            calibration.Compensate(raw, rotation_base_from_sensor);
-        if (!compensated.valid) {
-            result.error = "runtime tare compensation failed: "
-                + compensated.error;
-            return result;
-        }
-        if (!have_anchor) {
-            anchor = robot;
-            have_anchor = true;
-        }
-        result.maximum_joint_span_deg = std::max(
-            result.maximum_joint_span_deg,
-            MaximumWrappedJointDeltaDeg(robot.joints, anchor.joints));
-        result.maximum_tcp_span_mm = std::max(
-            result.maximum_tcp_span_mm,
-            (ProbeTcpBase(robot.pose, probe_tcp_pose_frame_m)
-             - ProbeTcpBase(anchor.pose, probe_tcp_pose_frame_m)).norm()
-                * 1000.0);
-        const Eigen::Matrix3d orientation_delta =
-            rotation_base_from_arm_tip
-            * RotationBaseFromControllerEuler(anchor.pose.tail<3>()).transpose();
-        result.maximum_orientation_span_deg = std::max(
-            result.maximum_orientation_span_deg,
-            Eigen::AngleAxisd(orientation_delta).angle() * 180.0 / M_PI);
-        // 这里记录的是“应用本次 tare 之前”的补偿残差。启动门使用它判断
-        // 当前装配/姿态是否仍与标定模型相符，不能靠大幅 tare 掩盖错误标定。
-        result.maximum_force_norm_n = std::max(
-            result.maximum_force_norm_n,
-            compensated.sensor.head<3>().norm());
-        result.maximum_torque_norm_nm = std::max(
-            result.maximum_torque_norm_nm,
-            compensated.sensor.tail<3>().norm());
-        samples.push_back(compensated.sensor);
-    }
-
-    result.samples = samples.size();
-    const std::size_t minimum_samples =
-        static_cast<std::size_t>(seconds * 20);
-    if (g_stop_requested.load()) {
-        result.error = "runtime tare interrupted";
-        return result;
-    }
-    if (samples.size() < minimum_samples) {
-        result.error = "runtime tare collected too few fresh samples";
-        return result;
-    }
-    for (const auto& sample : samples) result.sensor_offset += sample;
-    result.sensor_offset /= static_cast<double>(samples.size());
-    for (const auto& sample : samples) {
-        result.maximum_force_deviation_n = std::max(
-            result.maximum_force_deviation_n,
-            (sample.head<3>() - result.sensor_offset.head<3>()).norm());
-        result.maximum_torque_deviation_nm = std::max(
-            result.maximum_torque_deviation_nm,
-            (sample.tail<3>() - result.sensor_offset.tail<3>()).norm());
-    }
-    if (result.maximum_joint_span_deg > kRuntimeTareMaximumJointSpanDeg
-        || result.maximum_tcp_span_mm > kRuntimeTareMaximumTcpSpanMm
-        || result.maximum_orientation_span_deg
-               > kRuntimeTareMaximumOrientationSpanDeg) {
-        std::ostringstream message;
-        message << "runtime tare requires a stationary robot"
-                << " (joint_span_deg=" << result.maximum_joint_span_deg
-                << ", limit=" << kRuntimeTareMaximumJointSpanDeg
-                << "; tcp_span_mm=" << result.maximum_tcp_span_mm
-                << ", limit=" << kRuntimeTareMaximumTcpSpanMm
-                << "; orientation_span_deg="
-                << result.maximum_orientation_span_deg
-                << ", limit=" << kRuntimeTareMaximumOrientationSpanDeg
-                << ')';
-        result.error = message.str();
-        return result;
-    }
-    if (result.maximum_force_deviation_n > 0.25
-        || result.maximum_torque_deviation_nm > 0.02) {
-        std::ostringstream message;
-        message << "runtime tare residual wrench is not stable"
-                << " (force_deviation_n="
-                << result.maximum_force_deviation_n
-                << ", limit=0.25; torque_deviation_nm="
-                << result.maximum_torque_deviation_nm
-                << ", limit=0.02)";
-        result.error = message.str();
-        return result;
-    }
-    result.valid = true;
-    return result;
-}
-
-void ApplyRuntimeTare(const Eigen::Matrix<double, 6, 1>& sensor_offset,
-                      CompensatedWrench& compensated) {
-    // 运行时 tare 只消除当前悬空姿态下的固定偏置；它不能替代跨姿态的重力、
-    // 工具质量和质心标定。
-    if (!compensated.valid) return;
-    compensated.sensor -= sensor_offset;
-}
-
 // On this RM75 installation the logical Tool axes are coincident with the
 // force-sensor axes. The legacy calibration field named sensor_to_tool stores
 // the fixed Arm_Tip <- Sensor mount rotation needed to combine controller pose
 // feedback with sensor gravity compensation; it must not rotate the wrench a
 // second time when exposing it in the logical Tool frame.
 void ExpressWrenchInSensorAlignedToolFrame(
-    const ForceCalibration& calibration,
+    const CalibratedFrameChain& frame_chain,
     CompensatedWrench& compensated) {
     if (!compensated.valid) return;
     const Eigen::Vector3d force_tool = compensated.sensor.head<3>();
     const Eigen::Vector3d torque_tool = compensated.sensor.tail<3>()
-        - calibration.translation_sensor_to_tool_m.cross(force_tool);
+        - frame_chain.TranslationSensorToToolM().cross(force_tool);
     compensated.tool << force_tool, torque_tool;
 }
 
@@ -1269,7 +327,7 @@ void ExpressWrenchInSensorAlignedToolFrame(
 int main(int argc, char** argv) {
     // 4.1 选择配置来源并执行真机运行前的参数约束。
     // 无参数调用使用固定的 Redis 视觉闭环配置；其他形式必须完整显式传参。
-    Options options;
+    RobotRuntimeConfig options;
     if (argc == 1) {
         ApplyImplicitCommissioningProfile(argv[0], options);
     }
@@ -1277,12 +335,15 @@ int main(int argc, char** argv) {
         Usage(argv[0]);
         return 2;
     }
+    const Rm75ControlConfig& effective_control = options.control;
+    const Rm75ServoPlannerConfig& effective_planner = options.planner;
+    const Rm75RuntimeSafetyConfig& effective_safety = options.safety;
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
     const bool provisional_execute =
         options.mode == ControllerMode::kExecute
         && options.allow_provisional_force_control;
-    // provisional 允许尚未正式验收的 v6 标定用于当前调试，但通过运行时间、
+    // provisional 允许尚未正式验收的当前标定用于调试，但通过运行时间、
     // 速度、方向、tare 和命令来源等约束限制可执行范围。
     if (options.allow_provisional_force_control
         && options.mode != ControllerMode::kExecute) {
@@ -1308,7 +369,7 @@ int main(int argc, char** argv) {
         const double maximum_commissioning_distance_mm =
             options.implicit_commissioning_profile ? 250.0 : 1.0;
         const double maximum_commissioning_approach_speed_cm_s =
-            options.implicit_commissioning_profile ? 1.0 : 0.05;
+            options.implicit_commissioning_profile ? 2.0 : 0.05;
         const bool command_source_constrained =
             options.implicit_commissioning_profile
             ? (options.redis_enabled
@@ -1325,41 +386,41 @@ int main(int argc, char** argv) {
         const bool constrained = command_source_constrained
             && options.tare_no_contact_s >= 3
             && options.tare_no_contact_s <= 10
-            && std::abs(options.desired_force_n + 3.0) <= 1e-12
-            && options.approach_speed_cm_s > 0.0
-            && options.approach_speed_cm_s
+            && std::abs(effective_control.desired_force_n + 2.0) <= 1e-12
+            && effective_control.approach_speed_m_s > 0.0
+            && effective_control.approach_speed_m_s * 100.0
                    <= maximum_commissioning_approach_speed_cm_s
-            && options.approach_direction_tool_z != 0.0
-            && options.maximum_force_axis_speed_cm_s <= 0.20
-            && options.maximum_approach_distance_mm
+            && effective_control.approach_direction_tool_z != 0.0
+            && effective_control.max_force_axis_speed_m_s <= 0.002
+            && effective_safety.maximum_no_contact_approach_distance_m * 1000.0
                    <= maximum_commissioning_distance_mm
-            && options.maximum_orientation_excursion_deg <= 1.0
+            && effective_safety.maximum_orientation_excursion_deg <= 1.0
             && options.manual_y_m == 0.0
             && options.manual_rz_deg == 0.0
-            && options.contact_pitch_gain_rad_per_m == 0.0
+            && effective_control.contact_pitch_gain_rad_per_m == 0.0
             && (!options.implicit_commissioning_profile
-                || (options.scan_start_force_n == 2.0
-                    && options.scan_force_tolerance_n == 0.8
-                    && options.scan_force_stable_duration_s == 0.5
-                    && options.scan_speed_cm_s > 0.0
-                    && options.scan_distance_mm == 0.0
-                    && options.scan_direction_tool_x == -1.0))
-            && !options.allow_near_singularity
-            && !options.enable_force_retract;
+                || (effective_control.scan_start_force_n == 2.0
+                    && effective_control.scan_force_tolerance_n == 0.8
+                    && effective_control.scan_force_stable_duration_s == 0.5
+                    && effective_control.scan_speed_m_s == 0.010
+                    && effective_control.maximum_scan_distance_m == 0.0
+                    && effective_control.scan_direction_tool_x == -1.0))
+            && !effective_planner.allow_near_singularity
+            && !effective_control.force_retract_enabled;
         if (!constrained) {
             std::cerr
                 << "Provisional production profile rejected: commissioning requires "
                    "the no-argument entry to use Redis with duration 0 and no manual "
                    "intent, or explicit --no-redis duration 1.."
                 << maximum_commissioning_duration_s
-                << " s, tare >=3 s, -3 N, approach speed <="
+                << " s, tare >=3 s, -2 N, approach speed <="
                 << maximum_commissioning_approach_speed_cm_s << " cm/s, "
                    "force-axis speed <=0.20 cm/s, max distance <= "
                 << maximum_commissioning_distance_mm
                 << " mm, no Y/RZ/pitch or independent retract, and the "
                    "implicit profile uses Redis phase commands with a positive scan speed "
                    "not above max linear speed, a 2 N / continuous / "
-                   "-Tool-X scan after -3+/-0.8 N remains stable for 0.5 s, "
+                   "-Tool-X scan after -2+/-0.8 N remains stable for 0.5 s, "
                    "while explicit no-Redis commissioning uses --manual-action\n";
             return 3;
         }
@@ -1390,14 +451,15 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (options.mode == ControllerMode::kExecute
-        && options.approach_speed_cm_s > 0.0
-        && options.approach_direction_tool_z == 0.0) {
+        && effective_control.approach_speed_m_s > 0.0
+        && effective_control.approach_direction_tool_z == 0.0) {
         std::cerr << "Execute rejected: non-zero approach speed requires an explicit direction\n";
         return 3;
     }
     if (options.mode == ControllerMode::kExecute
-        && options.approach_speed_cm_s > 0.0
-        && options.approach_direction_tool_z * options.desired_force_n >= 0.0) {
+        && effective_control.approach_speed_m_s > 0.0
+        && effective_control.approach_direction_tool_z
+               * effective_control.desired_force_n >= 0.0) {
         std::cerr << "Execute rejected: approach direction is inconsistent with the configured force sign\n";
         return 3;
     }
@@ -1453,8 +515,9 @@ int main(int argc, char** argv) {
             std::cerr << "WARNING: provisional commissioning uses an "
                          "unverified calibration with runtime no-contact tare.\n";
         }
-        if (options.allow_near_singularity) {
-            std::cerr << "Execute rejected: --allow-near-singularity is dry-run only\n";
+        if (effective_planner.allow_near_singularity) {
+            std::cerr << "Execute rejected: production planner may not allow "
+                         "near-singularity targets\n";
             return 3;
         }
     }
@@ -1477,24 +540,21 @@ int main(int argc, char** argv) {
     // 4.3 组装控制律、七轴规划器、Redis 和日志模块。
     // 力控、视觉、扫描和 IK 的生产参数分别定义在其模块配置结构中；本入口
     // 只注入运行时标定得到的坐标关系，不再逐项覆盖模块默认参数。
-    Rm75ControlConfig control_config;
-    Rm75RuntimeSafetyConfig safety_config;
+    Rm75ControlConfig control_config = options.control;
+    Rm75RuntimeSafetyConfig safety_config = options.safety;
     control_config.cycle_s = options.period_ms / 1000.0;
     // RMState pose is Base -> Arm_Tip. The current hardware Tool frame is
     // coincident with Sensor, while Arm_Tip and Tool differ by the calibrated
     // fixed 30-degree Z mount rotation. Keep control deltas in Tool/Sensor.
+    const CalibratedFrameChain frame_chain(calibration);
     control_config.rotation_pose_from_tool =
-        calibration.rotation_tool_from_sensor;
-    control_config.probe_tcp_tool_m = calibration.probe_tcp_sensor_m
-        - calibration.translation_sensor_to_tool_m;
-    const Eigen::Vector3d probe_tcp_pose_frame_m =
-        control_config.rotation_pose_from_tool
-        * control_config.probe_tcp_tool_m;
+        frame_chain.RotationArmTipFromTool();
+    control_config.probe_tcp_tool_m = frame_chain.ProbeTcpToolM();
     Rm75ControlLaw control_law(control_config);
 
     // 规划器把每周期的 6D 笛卡尔目标转换为七关节 ServoJ 目标，并统一执行
     // 关节限位、速度/加速度约束及奇异性检查。
-    Rm75ServoPlannerConfig planner_config;
+    Rm75ServoPlannerConfig planner_config = options.planner;
     planner_config.period_ms = options.period_ms;
     planner_config.minimum_dispatch_gap_ms = options.period_ms;
     Rm75ServoPlanner planner(planner_config);
@@ -1596,7 +656,7 @@ int main(int argc, char** argv) {
         const RMResult stationary_result = StopAndConfirmStationary(
             command,
             *state_reader,
-            probe_tcp_pose_frame_m);
+            frame_chain);
         if (!stationary_result) {
             std::cerr << "Execute startup stop/stationary gate failed: "
                       << stationary_result.message << '\n';
@@ -1615,7 +675,8 @@ int main(int argc, char** argv) {
             *force_reader,
             *state_reader,
             calibration,
-            probe_tcp_pose_frame_m,
+            frame_chain,
+            g_stop_requested,
             warmup_seconds,
             safety_config.raw_force_limit_n,
             safety_config.raw_torque_limit_nm);
@@ -1623,7 +684,7 @@ int main(int argc, char** argv) {
             const RMResult stop_result = StopAndConfirmStationary(
                 command,
                 *state_reader,
-                probe_tcp_pose_frame_m);
+                frame_chain);
             if (!stop_result) {
                 std::cerr << "Stop after cancelled warm-up was not physically confirmed: "
                           << stop_result.message << '\n';
@@ -1673,7 +734,8 @@ int main(int argc, char** argv) {
             *force_reader,
             *state_reader,
             calibration,
-            probe_tcp_pose_frame_m,
+            frame_chain,
+            g_stop_requested,
             options.tare_no_contact_s,
             safety_config.raw_force_limit_n,
             safety_config.raw_torque_limit_nm);
@@ -1719,7 +781,7 @@ int main(int argc, char** argv) {
     std::cout << "main_rm75 mode: " << ModeName(options.mode) << '\n'
               << "configuration_profile: "
               << (options.implicit_commissioning_profile
-                      ? kImplicitProfileName
+                      ? kImplicitRm75ProfileName
                       : "explicit_cli")
               << '\n'
               << "period_ms: " << options.period_ms << '\n'
@@ -1772,7 +834,10 @@ int main(int argc, char** argv) {
               << "maximum_force_axis_acceleration_m_s2: "
               << control_config.max_force_axis_acceleration_m_s2 << '\n'
               << "legacy_six_axis_force_stage: "
-              << (options.legacy_six_axis_force_stage ? "enabled" : "disabled")
+              << ((control_config.legacy_wrench_filter_enabled
+                   && control_config.legacy_contact_filter_enabled
+                   && control_config.legacy_contact_roll_enabled)
+                      ? "enabled" : "disabled")
               << '\n'
               << "legacy_wrench_kalman: "
               << (control_config.legacy_wrench_filter_enabled
@@ -1787,9 +852,10 @@ int main(int argc, char** argv) {
                       ? "enabled" : "disabled")
               << '\n'
               << "maximum_no_contact_approach_distance_mm: "
-              << options.maximum_approach_distance_mm << '\n'
+              << safety_config.maximum_no_contact_approach_distance_m * 1000.0
+              << '\n'
               << "maximum_orientation_excursion_deg: "
-              << options.maximum_orientation_excursion_deg << '\n'
+              << safety_config.maximum_orientation_excursion_deg << '\n'
               << "controller_pose_frame: arm_tip\n"
               << "control_tool_frame: sensor\n"
               << "rotation_arm_tip_from_tool_row_major: ["
@@ -1803,11 +869,11 @@ int main(int argc, char** argv) {
               << control_config.rotation_pose_from_tool(2, 1) << ' '
               << control_config.rotation_pose_from_tool(2, 2) << "]\n"
               << "probe_tcp_sensor_m: ["
-              << calibration.probe_tcp_sensor_m.transpose() << "]\n"
+              << frame_chain.ProbeTcpSensorM().transpose() << "]\n"
               << "probe_tcp_tool_m: ["
               << control_config.probe_tcp_tool_m.transpose() << "]\n"
               << "probe_tcp_arm_tip_m: ["
-              << probe_tcp_pose_frame_m.transpose() << "]\n"
+              << frame_chain.ProbeTcpArmTipM().transpose() << "]\n"
               << "phase_index: " << options.manual_phase << '\n'
               << "scan_start_force_n: "
               << control_config.scan_start_force_n << '\n'
@@ -1865,11 +931,11 @@ int main(int argc, char** argv) {
               << "runtime_log: " << options.runtime_log_path << '\n';
     if (control_config.force_retract_enabled) {
         std::cout << "retract_direction_tool_z: "
-                  << options.retract_direction_tool_z << '\n'
+                  << control_config.retract_direction_tool_z << '\n'
                   << "retract_distance_mm: "
-                  << options.retract_distance_mm << '\n'
+                  << control_config.retract_distance_m * 1000.0 << '\n'
                   << "retract_speed_cm_s: "
-                  << options.retract_speed_cm_s << '\n';
+                  << control_config.retract_speed_m_s * 100.0 << '\n';
     }
     if (options.mode != ControllerMode::kExecute) {
         std::cout << "No real motion command will be sent in this mode.\n";
@@ -1896,10 +962,10 @@ int main(int argc, char** argv) {
     Eigen::Matrix<double, 7, 1> previous_joint_delta =
         Eigen::Matrix<double, 7, 1>::Zero();
     const Eigen::Vector3d initial_probe_tcp =
-        ProbeTcpBase(model_pose, probe_tcp_pose_frame_m);
+        frame_chain.ProbeTcpBase(model_pose);
     Eigen::Vector3d approach_origin_probe_tcp = initial_probe_tcp;
     const Eigen::Matrix3d initial_tool_rotation =
-        RotationBaseFromControllerEuler(model_pose.tail<3>());
+        frame_chain.RotationBaseFromArmTip(model_pose);
     const auto started_at = std::chrono::steady_clock::now();
     auto next_tick = started_at;
     std::uint64_t cycle = 0;
@@ -2034,12 +1100,11 @@ int main(int argc, char** argv) {
         double robot_model_tool_y_error_m = 0.0;
         if (robot_valid && !options.simulate) {
             const Eigen::Vector3d robot_model_tcp_error_base =
-                ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m)
-                - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m);
+                frame_chain.ProbeTcpBase(robot_state.pose)
+                - frame_chain.ProbeTcpBase(model_pose);
             robot_model_position_error_m = robot_model_tcp_error_base.norm();
             const Eigen::Vector3d model_tool_y_base =
-                RotationBaseFromControllerEuler(model_pose.tail<3>())
-                * control_config.rotation_pose_from_tool.col(1);
+                frame_chain.ToolYAxisBase(model_pose);
             robot_model_tool_y_error_m = std::abs(
                 robot_model_tcp_error_base.dot(model_tool_y_base));
         }
@@ -2065,12 +1130,11 @@ int main(int argc, char** argv) {
             cartesian_reference_pose = model_pose;
             previous_joint_delta.setZero();
             const Eigen::Vector3d rebased_tcp_error_base =
-                ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m)
-                - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m);
+                frame_chain.ProbeTcpBase(robot_state.pose)
+                - frame_chain.ProbeTcpBase(model_pose);
             robot_model_position_error_m = rebased_tcp_error_base.norm();
             const Eigen::Vector3d rebased_tool_y_base =
-                RotationBaseFromControllerEuler(model_pose.tail<3>())
-                * control_config.rotation_pose_from_tool.col(1);
+                frame_chain.ToolYAxisBase(model_pose);
             robot_model_tool_y_error_m = std::abs(
                 rebased_tcp_error_base.dot(rebased_tool_y_base));
             visual_y_tracking_reference_rebased = true;
@@ -2097,19 +1161,19 @@ int main(int argc, char** argv) {
                     std::min(lower_margin, upper_margin) * 180.0 / M_PI);
             }
             const Eigen::Matrix3d tracking_rotation_error =
-                RotationBaseFromControllerEuler(robot_state.pose.tail<3>())
-                * RotationBaseFromControllerEuler(model_pose.tail<3>()).transpose();
+                frame_chain.ArmTipOrientationDelta(robot_state.pose,
+                                                   model_pose);
             const double orientation_error_deg =
                 Eigen::AngleAxisd(tracking_rotation_error).angle()
                 * 180.0 / M_PI;
             const double position_error_mm =
                 robot_model_position_error_m * 1000.0;
             const Eigen::Vector3d actual_probe_tcp =
-                ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m);
+                frame_chain.ProbeTcpBase(robot_state.pose);
             const double actual_approach_distance_mm =
                 (actual_probe_tcp - approach_origin_probe_tcp).norm() * 1000.0;
             const Eigen::Matrix3d actual_rotation =
-                RotationBaseFromControllerEuler(robot_state.pose.tail<3>());
+                frame_chain.RotationBaseFromArmTip(robot_state.pose);
             const double actual_total_orientation_deg =
                 Eigen::AngleAxisd(
                     actual_rotation * initial_tool_rotation.transpose()).angle()
@@ -2120,12 +1184,13 @@ int main(int argc, char** argv) {
                 fatal_fault_code = "actual_joint_limit_margin_exceeded";
             } else if (!contact_established
                        && actual_approach_distance_mm
-                       > options.maximum_approach_distance_mm) {
+                       > safety_config.maximum_no_contact_approach_distance_m
+                             * 1000.0) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_maximum_approach_distance_exceeded";
-            } else if (options.maximum_orientation_excursion_deg > 0.0
+            } else if (safety_config.maximum_orientation_excursion_deg > 0.0
                        && actual_total_orientation_deg
-                              > options.maximum_orientation_excursion_deg) {
+                              > safety_config.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_maximum_orientation_excursion_exceeded";
             } else if (maximum_joint_error_deg
@@ -2159,11 +1224,8 @@ int main(int argc, char** argv) {
             force_sample.timestamp = std::chrono::system_clock::now();
             force_sample.monotonic_timestamp = cycle_started;
             force_sample.io_status = ForceSensorIoStatus::kStreaming;
-            const Eigen::Matrix3d rotation_base_from_arm_tip =
-                RotationBaseFromControllerEuler(model_pose.tail<3>());
             const Eigen::Matrix3d rotation_base_from_sensor =
-                rotation_base_from_arm_tip
-                * calibration.rotation_tool_from_sensor;
+                frame_chain.RotationBaseFromTool(model_pose);
             const Eigen::Vector3d gravity_sensor =
                 rotation_base_from_sensor.transpose() * calibration.gravity_base_n;
             raw_wrench.head<3>() = calibration.force_bias_n + gravity_sensor;
@@ -2172,10 +1234,8 @@ int main(int argc, char** argv) {
             raw_wrench.z() -= 1.0;
         }
 
-        const Eigen::Matrix3d rotation_base_from_arm_tip =
-            RotationBaseFromControllerEuler(robot_state.pose.tail<3>());
         const Eigen::Matrix3d rotation_base_from_sensor =
-            rotation_base_from_arm_tip * calibration.rotation_tool_from_sensor;
+            frame_chain.RotationBaseFromTool(robot_state.pose);
         // 补偿顺序：原始量程检查 -> 标定的零点/重力/质心补偿 -> 本次 tare
         // -> 表达到逻辑 Tool 坐标。control_wrench 最终由控制律进一步处理。
         CompensatedWrench compensated;
@@ -2193,7 +1253,7 @@ int main(int argc, char** argv) {
                 ApplyRuntimeTare(runtime_tare.sensor_offset,
                                  compensated);
             }
-            ExpressWrenchInSensorAlignedToolFrame(calibration, compensated);
+            ExpressWrenchInSensorAlignedToolFrame(frame_chain, compensated);
         } else if (!raw_wrench_in_range) {
             compensated.error = "force_sensor_raw_overrange";
         } else {
@@ -2376,7 +1436,7 @@ int main(int argc, char** argv) {
             // ContactLocation returns Sensor coordinates, which are already
             // the physical Tool coordinates on this installation.
             control_input.contact_point_probe_m =
-                contact.point - calibration.probe_tcp_sensor_m;
+                contact.point - frame_chain.ProbeTcpSensorM();
         } else {
             control_input.contact_point_probe_m.setZero();
         }
@@ -2448,15 +1508,14 @@ int main(int argc, char** argv) {
             previous_joint_delta.setZero();
             robot_model_position_error_m = options.simulate
                 ? 0.0
-                : (ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m)
-                   - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m)).norm();
+                : (frame_chain.ProbeTcpBase(robot_state.pose)
+                   - frame_chain.ProbeTcpBase(model_pose)).norm();
             if (!options.simulate) {
                 const Eigen::Vector3d robot_model_tcp_error_base =
-                    ProbeTcpBase(robot_state.pose, probe_tcp_pose_frame_m)
-                    - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m);
+                    frame_chain.ProbeTcpBase(robot_state.pose)
+                    - frame_chain.ProbeTcpBase(model_pose);
                 const Eigen::Vector3d model_tool_y_base =
-                    RotationBaseFromControllerEuler(model_pose.tail<3>())
-                    * control_config.rotation_pose_from_tool.col(1);
+                    frame_chain.ToolYAxisBase(model_pose);
                 robot_model_tool_y_error_m = std::abs(
                     robot_model_tcp_error_base.dot(model_tool_y_base));
             }
@@ -2495,8 +1554,8 @@ int main(int argc, char** argv) {
             contact_established = true;
         } else if (control_output.state == Rm75SupervisorState::kArmed) {
             contact_established = false;
-            approach_origin_probe_tcp = ProbeTcpBase(
-                robot_state.pose, probe_tcp_pose_frame_m);
+            approach_origin_probe_tcp =
+                frame_chain.ProbeTcpBase(robot_state.pose);
         }
         if (control_output.state == Rm75SupervisorState::kScan) {
             planned_scan_distance_m +=
@@ -2537,7 +1596,7 @@ int main(int argc, char** argv) {
         double retreat_planned_step_m = 0.0;
 
         if (control_output.request_retract) {
-            // 这是可选的旧式固定阈值回退路径，与当前“相对 -3 N 目标的平滑卸载”
+            // 这是可选的旧式固定阈值回退路径，与当前“相对配置目标的平滑卸载”
             // 不是同一机制。只有显式启用且横向力/力矩安全时才允许执行。
             const bool axial_fz_unload_requested =
                 std::abs(compensated.tool.z())
@@ -2549,7 +1608,7 @@ int main(int argc, char** argv) {
                 && compensated.tool.tail<3>().cwiseAbs().maxCoeff()
                        <= control_config.torque_limit_nm;
             if (options.mode == ControllerMode::kExecute
-                && options.enable_force_retract
+                && control_config.force_retract_enabled
                 && axial_fz_unload_requested
                 && non_axial_components_safe) {
                 if (!retreat_active) {
@@ -2562,7 +1621,7 @@ int main(int argc, char** argv) {
                 }
             } else if (options.mode == ControllerMode::kExecute) {
                 fatal_fault = true;
-                fatal_fault_code = options.enable_force_retract
+                fatal_fault_code = control_config.force_retract_enabled
                     ? "force_retract_rejected_non_axial_overload"
                     : control_output.fault;
             }
@@ -2600,17 +1659,18 @@ int main(int argc, char** argv) {
 
         if (retreat_active && !fatal_fault) {
             const double step_m = std::min(
-                options.retract_speed_cm_s / 100.0 * options.period_ms / 1000.0,
-                options.retract_distance_mm / 1000.0 - retreat_distance_m);
+                control_config.retract_speed_m_s * options.period_ms / 1000.0,
+                control_config.retract_distance_m - retreat_distance_m);
             if (step_m <= 0.0) {
                 fatal_fault = true;
                 fatal_fault_code = "force_retract_completed_operator_reset_required";
             } else {
                 Eigen::Matrix<double, 6, 1> retreat_pose = model_pose;
                 const Eigen::Vector3d retreat_base =
-                    RotationBaseFromControllerEuler(model_pose.tail<3>())
+                    frame_chain.RotationBaseFromArmTip(model_pose)
                     * Eigen::Vector3d(0.0, 0.0,
-                                      options.retract_direction_tool_z * step_m);
+                                      control_config.retract_direction_tool_z
+                                          * step_m);
                 retreat_pose.head<3>() += retreat_base;
                 servo_plan = planner.Plan(model_joints,
                                           model_pose,
@@ -2679,19 +1739,18 @@ int main(int argc, char** argv) {
             // 发送前再次检查“规划结果”本身的姿态和未接触行程。实际反馈门与
             // 规划目标门同时存在，分别防止真实跟踪越界和参考轨迹越界。
             const Eigen::Matrix3d planned_rotation =
-                RotationBaseFromControllerEuler(servo_plan.model_pose.tail<3>());
+                frame_chain.RotationBaseFromArmTip(servo_plan.model_pose);
             const Eigen::AngleAxisd orientation_excursion(
                 planned_rotation * initial_tool_rotation.transpose());
-            if (options.maximum_orientation_excursion_deg > 0.0
+            if (safety_config.maximum_orientation_excursion_deg > 0.0
                 && orientation_excursion.angle() * 180.0 / M_PI
-                       > options.maximum_orientation_excursion_deg) {
+                       > safety_config.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "maximum_orientation_excursion_exceeded";
             } else if (!contact_established
-                       && (ProbeTcpBase(servo_plan.model_pose,
-                              probe_tcp_pose_frame_m)
+                       && (frame_chain.ProbeTcpBase(servo_plan.model_pose)
                  - approach_origin_probe_tcp).norm()
-                > options.maximum_approach_distance_mm / 1000.0) {
+                > safety_config.maximum_no_contact_approach_distance_m) {
                 fatal_fault = true;
                 fatal_fault_code = "maximum_approach_distance_exceeded";
             } else {
@@ -2767,7 +1826,7 @@ int main(int argc, char** argv) {
                 const RMResult stop_result = StopAndConfirmStationary(
                     command,
                     *state_reader,
-                    probe_tcp_pose_frame_m);
+                    frame_chain);
                 if (!stop_result) {
                     std::cerr << "StopMotion/stationary confirmation failed: "
                               << stop_result.message << '\n';
@@ -2824,7 +1883,7 @@ int main(int argc, char** argv) {
             message.legacy_contact_point_sensor_m = contact.point;
             if (contact.valid) {
                 message.contact_point_probe_m =
-                    contact.point - calibration.probe_tcp_sensor_m;
+                    contact.point - frame_chain.ProbeTcpSensorM();
             }
             message.contact_residual_nm = contact.valid ? contact.residual : 0.0;
             message.contact_point_error_m =
@@ -2934,17 +1993,14 @@ int main(int argc, char** argv) {
         row.requested_delta = control_output.requested_delta;
         row.desired_pose = control_output.desired_pose;
         row.reference_model_position_error_mm =
-            (ProbeTcpBase(cartesian_reference_pose,
-                          probe_tcp_pose_frame_m)
-             - ProbeTcpBase(model_pose, probe_tcp_pose_frame_m))
+            (frame_chain.ProbeTcpBase(cartesian_reference_pose)
+             - frame_chain.ProbeTcpBase(model_pose))
                 .norm()
             * 1000.0;
         row.reference_model_orientation_error_deg =
             Eigen::AngleAxisd(
-                RotationBaseFromControllerEuler(
-                    cartesian_reference_pose.tail<3>())
-                * RotationBaseFromControllerEuler(model_pose.tail<3>())
-                      .transpose())
+                frame_chain.ArmTipOrientationDelta(cartesian_reference_pose,
+                                                   model_pose))
                 .angle()
             * 180.0 / M_PI;
         row.robot_model_position_error_mm =
@@ -3008,7 +2064,7 @@ int main(int argc, char** argv) {
             const RMResult stop_result = StopAndConfirmStationary(
                 command,
                 *state_reader,
-                probe_tcp_pose_frame_m);
+                frame_chain);
             if (!stop_result) {
                 std::cerr << "Stop/stationary confirmation after deadline failed: "
                           << stop_result.message << '\n';
@@ -3036,7 +2092,7 @@ int main(int argc, char** argv) {
         const RMResult stop_result = StopAndConfirmStationary(
             command,
             *state_reader,
-            probe_tcp_pose_frame_m);
+            frame_chain);
         if (!stop_result) {
             std::cerr << "Final stop/stationary confirmation failed: "
                       << stop_result.message << '\n';
@@ -3062,8 +2118,12 @@ int main(int argc, char** argv) {
     redis.Stop();
     logger.Stop();
 
-    // summary.json 保存控制配置、标定身份、tare 质量、Redis/Servo 状态和实时性，
-    // 与逐周期 CSV 配套用于复盘，不参与实时控制。
+    // 日志模块接收最终运行快照，统一构造 schema v2 summary 并输出终端报告。
+    // 该路径仅在控制循环和所有 I/O owner 停止后执行。
+    if (!fatal_fault && completion_reason.empty()) {
+        completion_reason = g_stop_requested.load()
+            ? "stop_requested" : "duration_elapsed";
+    }
     const double p99_us = Percentile99(work_durations_us);
     const double maximum_us = work_durations_us.empty()
         ? 0.0
@@ -3075,282 +2135,93 @@ int main(int argc, char** argv) {
     const double within_22ms_percent = measured_periods == 0
         ? 0.0
         : 100.0 * (measured_periods - periods_over_22ms) / measured_periods;
-    std::filesystem::path summary_path(options.runtime_log_path);
-    summary_path.replace_extension(".summary.json");
-    nlohmann::json summary;
-    summary["schema_version"] = 2;
-    summary["controller"] = "main_rm75";
-    summary["mode"] = ModeName(options.mode);
-    summary["simulated"] = options.simulate;
-    if (!fatal_fault && completion_reason.empty()) {
-        completion_reason = g_stop_requested.load()
-            ? "stop_requested" : "duration_elapsed";
+
+    RuntimeSummaryData summary_data;
+    summary_data.mode = ModeName(options.mode);
+    summary_data.simulated = options.simulate;
+    summary_data.fatal_fault = fatal_fault;
+    summary_data.completion_reason = completion_reason;
+    summary_data.fault_code = fatal_fault_code;
+    summary_data.provisional_force_control = provisional_execute;
+    summary_data.configuration_profile = options.implicit_commissioning_profile
+        ? kImplicitRm75ProfileName : "explicit_cli";
+    summary_data.calibration = calibration;
+    summary_data.selected_probe_sha256 = selected_probe_sha256;
+    summary_data.probe_tcp_arm_tip_m = frame_chain.ProbeTcpArmTipM();
+
+    summary_data.control.duration_s = options.duration_s;
+    summary_data.control.phase_index = options.manual_phase;
+    summary_data.control.config = control_config;
+    summary_data.control.safety = safety_config;
+    summary_data.control.planned_scan_distance_m = planned_scan_distance_m;
+    summary_data.control.maximum_reference_model_position_error_mm =
+        maximum_reference_model_position_error_mm;
+    summary_data.control.maximum_reference_model_orientation_error_deg =
+        maximum_reference_model_orientation_error_deg;
+    summary_data.control.maximum_robot_model_position_error_mm =
+        maximum_robot_model_position_error_mm;
+    summary_data.control.maximum_robot_model_tool_y_error_mm =
+        maximum_robot_model_tool_y_error_mm;
+    summary_data.control.visual_y_tracking_paused_cycles =
+        visual_y_tracking_paused_cycles;
+    summary_data.control.recovery_search_cycles = recovery_search_cycles;
+    summary_data.control.visual_y_tracking_reference_rebases =
+        visual_y_tracking_reference_rebases;
+    summary_data.control.target_force_unloading_cycles =
+        target_force_unloading_cycles;
+    summary_data.control.target_force_recovering_cycles =
+        target_force_recovering_cycles;
+    summary_data.control.target_force_reference_rebases =
+        target_force_reference_rebases;
+    summary_data.control.robot_state_stale_hold_cycles =
+        robot_state_stale_hold_cycles;
+    summary_data.control.robot_state_recoveries = robot_state_recoveries;
+
+    summary_data.tare.applied = runtime_tare_applied;
+    summary_data.tare.samples = runtime_tare.samples;
+    summary_data.tare.sensor_offset = runtime_tare.sensor_offset;
+    summary_data.tare.maximum_force_norm_n =
+        runtime_tare.maximum_force_norm_n;
+    summary_data.tare.maximum_torque_norm_nm =
+        runtime_tare.maximum_torque_norm_nm;
+    summary_data.tare.maximum_force_deviation_n =
+        runtime_tare.maximum_force_deviation_n;
+    summary_data.tare.maximum_torque_deviation_nm =
+        runtime_tare.maximum_torque_deviation_nm;
+    summary_data.tare.maximum_joint_span_deg =
+        runtime_tare.maximum_joint_span_deg;
+    summary_data.tare.maximum_tcp_span_mm = runtime_tare.maximum_tcp_span_mm;
+    summary_data.tare.maximum_orientation_span_deg =
+        runtime_tare.maximum_orientation_span_deg;
+
+    summary_data.timing.period_ms = options.period_ms;
+    summary_data.timing.cycles = cycle;
+    summary_data.timing.missed_periods = missed_periods;
+    summary_data.timing.periods_within_22ms_percent = within_22ms_percent;
+    summary_data.timing.periods_over_22ms = periods_over_22ms;
+    summary_data.timing.periods_over_40ms = periods_over_40ms;
+    summary_data.timing.maximum_consecutive_missed_periods =
+        maximum_consecutive_missed_periods;
+    summary_data.timing.on_time_percent = on_time_percent;
+    summary_data.timing.work_p99_us = p99_us;
+    summary_data.timing.work_max_us = maximum_us;
+    summary_data.runtime_csv = options.runtime_log_path;
+    summary_data.logger_dropped_rows = logger.DroppedRows();
+    summary_data.redis_enabled = options.redis_enabled;
+    summary_data.command_stale_ms = options.command_stale_ms;
+    summary_data.servo = servo_status;
+    summary_data.servo_outstanding = ServoOutstanding(servo_status);
+
+    const nlohmann::json summary = BuildRuntimeSummary(summary_data);
+    std::string summary_path;
+    std::string summary_error;
+    if (!WriteRuntimeSummary(options.runtime_log_path,
+                             summary,
+                             &summary_path,
+                             &summary_error)) {
+        std::cerr << summary_error << '\n';
     }
-    summary["result"] = fatal_fault ? "fault" : "completed";
-    summary["completion_reason"] = fatal_fault
-        ? nlohmann::json(nullptr) : nlohmann::json(completion_reason);
-    summary["fault_code"] = fatal_fault_code.empty()
-        ? nlohmann::json(nullptr)
-        : nlohmann::json(fatal_fault_code);
-    summary["calibration"] = {
-        {"sensor_id", calibration.sensor_id},
-        {"probe_model", calibration.probe_model},
-        {"probe_model_sha256", selected_probe_sha256},
-        {"controller_pose_frame", "arm_tip"},
-        {"control_tool_frame", "sensor"},
-        {"legacy_rotation_field_interpretation",
-         "rotation_arm_tip_from_tool_sensor"},
-        {"rotation_arm_tip_from_tool_row_major", {
-            control_config.rotation_pose_from_tool(0, 0),
-            control_config.rotation_pose_from_tool(0, 1),
-            control_config.rotation_pose_from_tool(0, 2),
-            control_config.rotation_pose_from_tool(1, 0),
-            control_config.rotation_pose_from_tool(1, 1),
-            control_config.rotation_pose_from_tool(1, 2),
-            control_config.rotation_pose_from_tool(2, 0),
-            control_config.rotation_pose_from_tool(2, 1),
-            control_config.rotation_pose_from_tool(2, 2)}},
-        {"rotation_tool_from_sensor_row_major", {
-            calibration.rotation_tool_from_sensor(0, 0),
-            calibration.rotation_tool_from_sensor(0, 1),
-            calibration.rotation_tool_from_sensor(0, 2),
-            calibration.rotation_tool_from_sensor(1, 0),
-            calibration.rotation_tool_from_sensor(1, 1),
-            calibration.rotation_tool_from_sensor(1, 2),
-            calibration.rotation_tool_from_sensor(2, 0),
-            calibration.rotation_tool_from_sensor(2, 1),
-            calibration.rotation_tool_from_sensor(2, 2)}},
-        {"translation_sensor_to_tool_m", {
-            calibration.translation_sensor_to_tool_m.x(),
-            calibration.translation_sensor_to_tool_m.y(),
-            calibration.translation_sensor_to_tool_m.z()}},
-        {"probe_tcp_sensor_m", {
-            calibration.probe_tcp_sensor_m.x(),
-            calibration.probe_tcp_sensor_m.y(),
-            calibration.probe_tcp_sensor_m.z()}},
-        {"probe_tcp_arm_tip_m", {
-            probe_tcp_pose_frame_m.x(),
-            probe_tcp_pose_frame_m.y(),
-            probe_tcp_pose_frame_m.z()}},
-        {"tool_chain_verified", calibration.tool_chain_verified},
-        {"residuals_verified", calibration.calibration_residuals_verified}};
-    summary["provisional_force_control"] = provisional_execute;
-    summary["configuration_profile"] = options.implicit_commissioning_profile
-        ? kImplicitProfileName
-        : "explicit_cli";
-    summary["control"] = {
-        {"duration_s", options.duration_s},
-        {"desired_force_n", control_config.desired_force_n},
-        {"approach_speed_cm_s", control_config.approach_speed_m_s * 100.0},
-        {"approach_direction_tool_z", control_config.approach_direction_tool_z},
-        {"maximum_force_axis_speed_cm_s",
-         control_config.max_force_axis_speed_m_s * 100.0},
-        {"visual_y_control_mode", "proportional_error_velocity"},
-        {"model_y_velocity_gain_per_s",
-         control_config.model_y_velocity_gain_per_s},
-        {"maximum_model_y_step_mm",
-         control_config.maximum_model_y_step_m * 1000.0},
-        {"visual_y_tracking_pause_error_mm",
-         control_config.visual_y_tracking_pause_error_m * 1000.0},
-        {"visual_y_tracking_resume_error_mm",
-         control_config.visual_y_tracking_resume_error_m * 1000.0},
-        {"maximum_no_contact_approach_distance_mm",
-         options.maximum_approach_distance_mm},
-        {"phase_index", options.manual_phase},
-        {"scan_start_force_n", control_config.scan_start_force_n},
-        {"visual_y_enable_force_n",
-         control_config.visual_y_enable_force_n},
-        {"visual_y_force_stable_duration_s",
-         control_config.visual_y_force_stable_duration_s},
-        {"model_y_direction", control_config.model_y_direction},
-        {"scan_force_tolerance_n", control_config.scan_force_tolerance_n},
-        {"scan_force_stable_duration_s",
-         control_config.scan_force_stable_duration_s},
-        {"scan_speed_cm_s", control_config.scan_speed_m_s * 100.0},
-        {"scan_distance_mm",
-         control_config.maximum_scan_distance_m * 1000.0},
-        {"scan_direction_tool_x", control_config.scan_direction_tool_x},
-        {"planned_scan_distance_mm", planned_scan_distance_m * 1000.0},
-        {"maximum_reference_model_position_error_mm",
-         maximum_reference_model_position_error_mm},
-        {"maximum_reference_model_orientation_error_deg",
-         maximum_reference_model_orientation_error_deg},
-        {"maximum_robot_model_position_error_mm",
-         maximum_robot_model_position_error_mm},
-        {"maximum_robot_model_tool_y_error_mm",
-         maximum_robot_model_tool_y_error_mm},
-        {"visual_y_tracking_paused_cycles",
-         visual_y_tracking_paused_cycles},
-        {"recovery_search_cycles", recovery_search_cycles},
-        {"recovery_tool_y_speed_mm_s",
-         control_config.recovery_tool_y_speed_m_s * 1000.0},
-        {"maximum_recovery_tool_y_distance_mm",
-         control_config.maximum_recovery_tool_y_distance_m * 1000.0},
-        {"visual_y_tracking_reference_rebases",
-         visual_y_tracking_reference_rebases},
-        {"target_force_unloading_cycles",
-         target_force_unloading_cycles},
-        {"target_force_recovering_cycles",
-         target_force_recovering_cycles},
-        {"target_force_reference_rebases",
-         target_force_reference_rebases},
-        {"robot_state_stale_hold_cycles",
-         robot_state_stale_hold_cycles},
-        {"robot_state_recoveries",
-         robot_state_recoveries},
-        {"retract_direction_tool_z", options.retract_direction_tool_z},
-        {"retract_distance_mm", options.retract_distance_mm},
-        {"retract_speed_cm_s", options.retract_speed_cm_s},
-        {"maximum_orientation_excursion_deg",
-         options.maximum_orientation_excursion_deg},
-        {"force_retract_enabled",
-         control_config.force_retract_enabled},
-        {"force_limit_xy_n", control_config.force_limit_xy_n},
-        {"force_limit_z_n", control_config.force_limit_z_n},
-        {"torque_limit_nm", control_config.torque_limit_nm},
-        {"raw_force_limit_n", safety_config.raw_force_limit_n},
-        {"raw_torque_limit_nm", safety_config.raw_torque_limit_nm},
-        {"contact_threshold_n", control_config.contact_threshold_n},
-        {"force_virtual_mass", control_config.force_virtual_mass},
-        {"force_virtual_damping", control_config.force_virtual_damping},
-        {"target_force_unload_enabled",
-         control_config.target_force_unload_enabled},
-        {"target_force_unload_margin_n",
-         control_config.target_force_unload_margin_n},
-        {"target_force_unload_speed_cm_s",
-         control_config.target_force_unload_speed_m_s * 100.0},
-        {"target_force_unload_deceleration_band_n",
-         control_config.target_force_unload_deceleration_band_n},
-        {"target_force_unload_stop_acceleration_m_s2",
-         control_config.target_force_unload_stop_acceleration_m_s2},
-        {"target_force_reacquire_speed_cm_s",
-         control_config.target_force_reacquire_speed_m_s * 100.0},
-        {"target_force_recovery_stable_duration_s",
-         control_config.target_force_recovery_stable_duration_s},
-        {"maximum_force_axis_acceleration_m_s2",
-         control_config.max_force_axis_acceleration_m_s2},
-        {"legacy_six_axis_force_stage",
-         options.legacy_six_axis_force_stage},
-        {"legacy_wrench_filter_enabled",
-         control_config.legacy_wrench_filter_enabled},
-        {"legacy_contact_filter_enabled",
-         control_config.legacy_contact_filter_enabled},
-        {"legacy_contact_roll_enabled",
-         control_config.legacy_contact_roll_enabled},
-        {"legacy_wrench_filter_measurement_noise",
-         control_config.legacy_wrench_filter_measurement_noise},
-        {"legacy_wrench_filter_process_noise",
-         control_config.legacy_wrench_filter_process_noise},
-        {"legacy_contact_filter_measurement_noise",
-         control_config.legacy_contact_filter_measurement_noise},
-        {"legacy_contact_filter_process_noise",
-         control_config.legacy_contact_filter_process_noise},
-        {"legacy_contact_roll_virtual_mass",
-         control_config.legacy_contact_roll_virtual_mass},
-        {"legacy_contact_roll_virtual_damping",
-         control_config.legacy_contact_roll_virtual_damping},
-        {"legacy_contact_roll_scale",
-         control_config.legacy_contact_roll_scale},
-        {"legacy_contact_roll_limits_enabled",
-         control_config.legacy_contact_roll_limits_enabled},
-        {"max_tracking_joint_error_deg",
-         safety_config.max_tracking_joint_error_deg},
-        {"max_tracking_position_error_mm",
-         safety_config.max_tracking_position_error_mm},
-        {"max_tracking_orientation_error_deg",
-         safety_config.max_tracking_orientation_error_deg}};
-    summary["runtime_tare"] = {
-        {"applied", runtime_tare_applied},
-        {"samples", runtime_tare.samples},
-        {"sensor_offset", {
-            runtime_tare.sensor_offset[0], runtime_tare.sensor_offset[1],
-            runtime_tare.sensor_offset[2], runtime_tare.sensor_offset[3],
-            runtime_tare.sensor_offset[4], runtime_tare.sensor_offset[5]}},
-        {"maximum_force_norm_n", runtime_tare.maximum_force_norm_n},
-        {"maximum_torque_norm_nm", runtime_tare.maximum_torque_norm_nm},
-        {"maximum_force_deviation_n",
-         runtime_tare.maximum_force_deviation_n},
-        {"maximum_torque_deviation_nm",
-         runtime_tare.maximum_torque_deviation_nm},
-        {"maximum_joint_span_deg", runtime_tare.maximum_joint_span_deg},
-        {"maximum_tcp_span_mm", runtime_tare.maximum_tcp_span_mm},
-        {"maximum_orientation_span_deg",
-         runtime_tare.maximum_orientation_span_deg}};
-    summary["timing"] = {
-        {"period_ms", options.period_ms},
-        {"cycles", cycle},
-        {"missed_periods", missed_periods},
-        {"periods_within_22ms_percent", within_22ms_percent},
-        {"periods_over_22ms", periods_over_22ms},
-        {"periods_over_40ms", periods_over_40ms},
-        {"maximum_consecutive_missed_periods",
-         maximum_consecutive_missed_periods},
-        {"work_p99_us", p99_us},
-        {"work_max_us", maximum_us}};
-    summary["runtime_csv"] = options.runtime_log_path;
-    summary["logger_dropped_rows"] = logger.DroppedRows();
-    summary["redis"] = {
-        {"enabled", options.redis_enabled},
-        {"command_stale_ms", options.command_stale_ms},
-        {"fail_closed", true},
-        {"requires_new_command_after_reconnect", true}};
-    summary["servo"] = {
-        {"submitted_sequence", servo_status.submitted_sequence},
-        {"consumed_sequence", servo_status.consumed_sequence},
-        {"discarded_sequence", servo_status.discarded_sequence},
-        {"pending_sequence", servo_status.pending_sequence},
-        {"sent_sequence", servo_status.sent_sequence},
-        {"result_sequence", servo_status.result_sequence},
-        {"result_code", servo_status.result_sequence == 0
-                            ? static_cast<int>(RMErrorCode::kNone)
-                            : static_cast<int>(servo_status.result.code)},
-        {"mailbox_pending", servo_status.pending()},
-        {"outstanding", ServoOutstanding(servo_status)}};
-    std::ofstream summary_stream(summary_path);
-    if (summary_stream) {
-        summary_stream << std::setw(2) << summary << '\n';
-    } else {
-        std::cerr << "Unable to write runtime summary: "
-                  << summary_path.string() << '\n';
-    }
-    std::cout << "cycles: " << cycle << '\n'
-              << "result: " << (fatal_fault ? "fault" : "completed") << '\n'
-              << "completion_reason: "
-              << (fatal_fault ? "none" : completion_reason) << '\n'
-              << "planned_scan_distance_mm: "
-              << planned_scan_distance_m * 1000.0 << '\n'
-              << "maximum_reference_model_position_error_mm: "
-              << maximum_reference_model_position_error_mm << '\n'
-              << "maximum_reference_model_orientation_error_deg: "
-              << maximum_reference_model_orientation_error_deg << '\n'
-              << "maximum_robot_model_position_error_mm: "
-              << maximum_robot_model_position_error_mm << '\n'
-              << "visual_y_tracking_paused_cycles: "
-              << visual_y_tracking_paused_cycles << '\n'
-              << "target_force_unloading_cycles: "
-              << target_force_unloading_cycles << '\n'
-              << "target_force_recovering_cycles: "
-              << target_force_recovering_cycles << '\n'
-              << "target_force_reference_rebases: "
-              << target_force_reference_rebases << '\n'
-              << "robot_state_stale_hold_cycles: "
-              << robot_state_stale_hold_cycles << '\n'
-              << "robot_state_recoveries: "
-              << robot_state_recoveries << '\n'
-              << "fault_code: "
-              << (fatal_fault_code.empty() ? "none" : fatal_fault_code) << '\n'
-              << "missed_periods: " << missed_periods << '\n'
-              << "on_time_percent: " << on_time_percent << '\n'
-              << "periods_within_22ms_percent: " << within_22ms_percent << '\n'
-              << "periods_over_22ms: " << periods_over_22ms << '\n'
-              << "periods_over_40ms: " << periods_over_40ms << '\n'
-              << "maximum_consecutive_missed_periods: "
-              << maximum_consecutive_missed_periods << '\n'
-              << "work_p99_us: " << p99_us << '\n'
-              << "work_max_us: " << maximum_us << '\n'
-              << "logger_dropped_rows: " << logger.DroppedRows() << '\n'
-              << "runtime_log_written: " << logger.Path() << '\n';
-    std::cout << "runtime_summary_written: " << summary_path.string() << '\n';
+    PrintRuntimeCompletion(summary_data, summary_path, logger.Path());
 
     return fatal_fault ? 6 : 0;
 }

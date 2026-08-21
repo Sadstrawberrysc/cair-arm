@@ -265,6 +265,24 @@ private:
     std::shared_ptr<const StopCompletion> stop_completion_snapshot_;
 };
 
+// Requests a bounded, explicitly acknowledged StopMotion. A non-timeout
+// transport failure receives one retry; timeout remains fail-closed.
+RMResult RequestConfirmedStop(RMCommand& command, int timeout_ms = 1000);
+
+// Arms only after execute mode owns a live connection. Early-return paths
+// receive one best-effort StopMotion unless a confirmed stationary stop has
+// explicitly disarmed the guard.
+class BestEffortStopGuard {
+public:
+    void Arm(RMCommand& command) noexcept;
+    void Disarm() noexcept;
+    ~BestEffortStopGuard();
+
+private:
+    RMCommand* command_ = nullptr;
+    bool armed_ = false;
+};
+
 // A single background I/O owner for one RMCommand connection. It serializes
 // and sends each accepted ServoJ mailbox target, prioritizes StopMotion,
 // issues state queries, and consumes all incoming JSON. The real-time thread

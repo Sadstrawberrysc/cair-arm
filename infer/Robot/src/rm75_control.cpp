@@ -27,6 +27,9 @@ bool ValidConfig(const Rm75ControlConfig& config) {
         config.force_limit_xy_n,
         config.force_retract_threshold_z_n,
         config.force_retract_release_z_n,
+        config.retract_direction_tool_z,
+        config.retract_distance_m,
+        config.retract_speed_m_s,
         config.force_limit_z_n,
         config.torque_limit_nm,
         config.force_virtual_mass,
@@ -107,7 +110,11 @@ bool ValidConfig(const Rm75ControlConfig& config) {
                 && config.force_retract_release_z_n
                     < config.force_retract_threshold_z_n
                 && config.force_retract_threshold_z_n
-                    <= config.force_limit_z_n))
+                    <= config.force_limit_z_n
+                && std::abs(std::abs(config.retract_direction_tool_z) - 1.0)
+                    <= 1e-12
+                && config.retract_distance_m > 0.0
+                && config.retract_speed_m_s > 0.0))
         && config.force_limit_z_n > 0.0
         && config.torque_limit_nm > 0.0
         && config.force_virtual_mass > 0.0
@@ -497,7 +504,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
     if (in_contact) {
         if (target_force_unloading_) {
             if (target_force_release_pending_) {
-                // Do not let a sensor sample crossing -3 N flip directly
+                // Do not let a sensor sample crossing the target flip directly
                 // from retreat to positive admittance velocity. Brake to zero
                 // first; ordinary admittance starts on a later cycle.
                 force_axis_velocity_m_s_ = MoveToward(
@@ -547,7 +554,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
                 target_force_contact_reacquired_ = false;
                 target_force_recovery_stable_time_s_ = 0.0;
             } else {
-                // Contact is present again. Restore -3 N with the ordinary
+                // Contact is present again. Restore the configured target with
                 // low-speed admittance and its acceleration limit.
                 if (!target_force_contact_reacquired_) {
                     force_axis_velocity_m_s_ = 0.0;

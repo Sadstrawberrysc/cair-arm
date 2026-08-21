@@ -81,8 +81,16 @@ idle，`q` 发布 terminate 后退出。停止顺序为先在视觉端按 `t` �
 `main_rm75` 终端按 `Ctrl+C`。
 
 维护工具默认不构建；只有明确需要诊断或标定时才使用
-`-DBUILD_MAINTENANCE_TOOLS=ON`。项目目前没有注册 CTest 自动测试，也没有完整的自动
-回放 harness；不要把“编译成功”表述为“控制逻辑或真机测试通过”。
+`-DBUILD_MAINTENANCE_TOOLS=ON`。Robot 模块已注册纯离线 CTest，覆盖有效配置、Redis 命令
+解析与 freshness、传感器帧解析、基础控制状态、planner 拒绝边界和运行 schema；它仍不是完整的
+回放或真机验收 harness，不得把“编译/CTest 通过”表述为“真机控制已验收”。
+
+## 工作规则
+
+- 每次只做一个功能点。
+- 当前功能点端到端验证通过后，才能开始下一个。
+- 不要在实现功能 A 时“顺便”重构功能 B。
+- Robot 重构期间不得新增 `.cpp` 或 `.hpp` 文件；后续实现必须合并到现有模块，除非用户另行明确授权。
 
 ## 不可违反的硬约束
 
@@ -94,15 +102,20 @@ idle，`q` 发布 terminate 后退出。停止顺序为先在视觉端按 `t` �
    不得把它当作 dry-run。
 3. 不得绕过或放宽原始/补偿 wrench、关节限位、IK/奇异、通信陈旧、跟踪误差、控制周期、
    tare 或 emergency stop 等安全门，除非用户明确要求该项变更并说明了验证方案。
-4. 当前 `rm75_force_calibration_v9_provisional.json` 是未通过正式 `0.6 N` 残差门的临时标定。
+4. 当前 `rm75_force_calibration.json` 是唯一部署的标定文件，但其 Force max
+   `1.2488 N` 仍未通过正式 `0.6 N` 残差门。
    启动 tare 不能替代多姿态重力、质量、质心及 R/t/TCP 标定；不得宣称其已正式验收。
 5. 控制、规划和运行安全参数以 `infer/Robot/include/rm75_control.hpp` 中的
    `Rm75ControlConfig`、`Rm75ServoPlannerConfig` 和 `Rm75RuntimeSafetyConfig` 为准。
-   不要在 `main_rm75.cpp` 重复覆盖常规算法参数；该文件负责启动编排、硬件 I/O、坐标链注入
-   和日志。
+   入口设备、路径、模式和生命周期参数由 `rm75_runtime_config.hpp` 的
+   `RobotRuntimeConfig` 持有。不要在 `main_rm75.cpp` 重复覆盖常规算法参数；该文件负责启动
+   编排和硬件 I/O，标定坐标转换由 `CalibratedFrameChain` 唯一提供。
 6. 保持生产模块边界：传感器协议/标定补偿属于 `force_sensor`，接触点算法属于
    `contact_sensing`，运动学与控制属于 `realman_kinematics`/`rm75_control`，Redis I/O 属于
-   `redis_bridge`，`main_rm75` 只做编排。
+   `redis_bridge`，异步 CSV 与 summary v2 属于 `rm75_runtime_logging`，`main_rm75` 只提交周期
+   快照、最终运行结果并完成编排。Stop 确认重试和析构兜底属于 `realman_transport`，带 Probe
+   TCP 的物理静止判定及 runtime tare 采集/稳定门属于 `CalibratedFrameChain`；不得在入口复制
+   这些安全路径或 tare 阈值。
 7. `infer/Robot/tests/legacy/six_axis/` 仅作旧六轴参考，不得重新接入 RM75 七轴生产入口。
    `infer/Robot/tests/tools/` 是会接触硬件的维护工具，不等同于自动化单元测试。
 8. 不得在 `main_rm75` 运行期间删除或清理 `infer/Robot/build/logs/`。修改控制参数时每次只改
@@ -111,10 +124,13 @@ idle，`q` 发布 terminate 后退出。停止顺序为先在视觉端按 `t` �
    已有的未提交改动；修改前后都应检查 `git status --short`。
 10. 涉及真实硬件的失败应先进入安全停止并报告证据，不得通过自动重试运动、扩大阈值或忽略
     返回码来“让流程继续”。
+11. 新的跨模块、公共 API、安全或长期维护决策落地时，必须在根目录 `DECISIONS.md` 追加
+    “什么决策、为什么、什么时候做的”；不得通过改写旧记录隐藏已被取代的决策。
 
 ## 详细文档
 
 - [系统架构与 API 决策](ARCHITECTURE.md)：服务边界、依赖方向、Redis 协议和各服务模块文档索引。
+- [决策日志](DECISIONS.md)：关键设计决策、原因和作出日期。
 - [根目录 README](README.md)：各主要程序的简要入口。
 - [RM75 构建与启动命令](docs/rm75_build_and_start_commands.md)：完整启动、按键与停止顺序。
 - [RM75 当前进度与运行边界](PROGRESS.md)：当前配置、标定状态、安全门、状态机、日志和待验收项。
