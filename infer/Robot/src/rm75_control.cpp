@@ -1159,16 +1159,20 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
     result.joint_delta = delta;
     result.minimum_joint_margin_deg = std::numeric_limits<double>::infinity();
     for (int joint = 0; joint < 7; ++joint) {
-        if (result.target_joints[joint] < kinematics_.joint_min[joint]
-            || result.target_joints[joint] > kinematics_.joint_max[joint]) {
+        if (result.target_joints[joint]
+                < kinematics_.JointMinimums()[joint]
+            || result.target_joints[joint]
+                > kinematics_.JointMaximums()[joint]) {
             result.error = Rm75PlanError::kJointLimit;
             result.detail = "planned target exceeds J" + std::to_string(joint + 1)
                 + " joint limit";
             return result;
         }
         const double margin = std::min(
-            result.target_joints[joint] - kinematics_.joint_min[joint],
-            kinematics_.joint_max[joint] - result.target_joints[joint])
+            result.target_joints[joint]
+                - kinematics_.JointMinimums()[joint],
+            kinematics_.JointMaximums()[joint]
+                - result.target_joints[joint])
             * kRadToDeg;
         result.minimum_joint_margin_deg =
             std::min(result.minimum_joint_margin_deg, margin);

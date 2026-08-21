@@ -127,11 +127,11 @@ commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏�
 
 | 能力 | 状态 | 当前说明 |
 | --- | --- | --- |
-| RM75 TCP、状态快照、ServoJ、Hold、Stop | 已实现，已真机复核 | 单一 I/O owner；确认重试/析构 guard 在 transport，Probe TCP 静止确认使用统一 frame chain |
-| 七轴 FK、6×7 Jacobian、数值 IK | 已实现 | 规划器检查有限值、关节限位、速度/加速度和奇异性；真机边界仍需持续验收 |
-| Haptron Modbus 与线程安全快照 | 已实现 | 包含 checksum、sequence、单调时间、stale 和统计信息 |
-| 标定加载、模型摘要、runtime tare | 已实现，tare 迁移待真机复核 | 采集与稳定门已收敛到 frame-chain 模块；v10 force max 不合格，tool chain 未验证 |
-| 接触点估计 | 已实现，真值验收未完成 | STL 事务式加载；低力为正常无接触，不用零点伪装有效结果 |
+| RM75 TCP、状态快照、ServoJ、Hold、Stop | 已实现，已真机复核 | `RMCommand` 只保留 `RMResult`/`Try*` API；旧 wrapper、重复收发/JSON 镜像及 framer 无消费状态已删除；单一 I/O owner 和 Stop 路径不变 |
+| 七轴 FK、6×7 Jacobian、数值 IK | 已实现，已真机复核 | `RMKinematics` 私有持有非零 MDH 参数和关节限位；恒零 a/关节 offset/tool offset 不再占用运行状态，外部限位接口和 IK 规划逻辑不变 |
+| Haptron Modbus 与线程安全快照 | 已实现，已真机复核 | reader 统计镜像、无调用 getter 和 stale 转发已删除；parser seam、checksum、sequence、stale 与 fail-closed 条件不变 |
+| 标定加载、模型摘要、runtime tare | 已实现，正式标定未完成 | runtime tare 保留在入口安全门；v10 force max 不合格，tool chain 未验证 |
+| 接触点估计 | 已实现，已真机复核 | 删除无人读取的面片索引和加载阶段已拒绝的退化模型周期错误；错误码后续数值、Redis/CSV 字段、平面求解和残差门不变 |
 | Z 导纳、超力卸载、制动与重接触 | 已实现，仿体验收未完成 | 卸载在 Redis Hold 下仍可独立工作；idle 不自动重接近 |
 | Tool-Y/X/RZ 状态机 | 已实现，端到端验收未完成 | 包含跟踪暂停/恢复、Y 主导重建参考、连续扫描和 RZ 额度 |
 | 旋转丢失恢复 | 已实现，真机验收未完成 | X/RZ 归零、固定基方向 Y 搜索、20 mm 上限、保留 Z 力控 |
@@ -141,6 +141,13 @@ commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏�
 | CSV/summary 诊断 | 已实现，已真机复核 | `RuntimeSummaryData` 单次构造 summary v2，字段、单位和 CSV 126 列契约保持不变 |
 | 标定坐标链 | 已集中，已真机复核 | `CalibratedFrameChain` 唯一提供 Base→Arm_Tip→Tool/Sensor→Probe TCP 变换；生产和维护目标编译、6/6 CTest 通过 |
 | 自动测试 / 回放 harness | 部分完成 | 已注册 6 个纯离线 CTest，含有效配置和坐标链等价测试；session replay、反馈恢复、mailbox 并发和完整周期回放仍待覆盖 |
+
+生产 CMake 已删除只打印 warning、从不创建 target 的 legacy 空选项；旧六轴源码继续仅作
+历史参考，维护工具仍由 `BUILD_MAINTENANCE_TOOLS` 显式构建。
+
+批次 5 API 收缩已完成并通过真机确认：生产与 maintenance tools 均使用强类型连接和结构化
+结果；transport、运动学、接触估计和传感器公共面已完成无调用项清理，legacy 六轴源码不参与
+当前构建。RM75 状态 JSON 分帧、ServoJ/Stop 返回和断线 fail-closed 行为已复核通过。
 
 ## 当前状态机
 
@@ -191,8 +198,8 @@ Redis 命令异常通常进入 Hold 而不退出；机器人/传感器持续失�
 
 ## 下一步优先级
 
-1. **完成 runtime tare 迁移的真机复核（P0）**：确认 3 s 样本数、Sensor-frame offset、最大
-   wrench 偏差、关节/TCP/姿态跨度及所有拒绝原因与迁移前一致。
+1. **确认 runtime tare 回退基线（P0）**：采集、统计和稳定门已恢复至 `main_rm75.cpp`；确认
+   3 s 样本数、Sensor-frame offset 和拒绝原因仍与原基线一致。
 2. **完成正式标定（P0）**：独立核对 R/t/TCP，重新采集低外力多姿态样本，将 force max
    降至 `<=0.6 N`，设置 residual/tool-chain verified 后完成多姿态悬空验收。
 3. 修正视觉 recovery 速度注释，并离线/真机确认左右侧到 Tool-Y 的符号、旋转前基方向、

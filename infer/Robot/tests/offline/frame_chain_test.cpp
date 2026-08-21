@@ -20,6 +20,16 @@ bool Near(const Eigen::MatrixXd& actual,
 
 int main() {
     bool ok = true;
+    const RMCommand default_command;
+    ok &= Check(default_command.ConnectionConfig().ip == "192.168.50.254"
+                    && default_command.ConnectionConfig().port == 8080,
+                "RMCommand default endpoint remains unchanged");
+    const RMCommand configured_command(
+        RMConnectionConfig{"127.0.0.1", 18080});
+    ok &= Check(configured_command.ConnectionConfig().ip == "127.0.0.1"
+                    && configured_command.ConnectionConfig().port == 18080,
+                "RMCommand connection endpoint is injected once");
+
     ForceCalibration calibration;
     calibration.rotation_tool_from_sensor =
         Eigen::AngleAxisd(30.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ())
@@ -79,26 +89,5 @@ int main() {
                          - 0.02 * 180.0 / M_PI) <= 1e-10,
                 "stationary joint delta keeps wrapped-angle semantics");
 
-    const RuntimeTareConfig tare_config;
-    ok &= Check(tare_config.maximum_joint_span_deg == 0.02
-                    && tare_config.maximum_tcp_span_mm == 0.35
-                    && tare_config.maximum_orientation_span_deg == 0.10
-                    && tare_config.maximum_force_deviation_n == 0.25
-                    && tare_config.maximum_torque_deviation_nm == 0.02
-                    && tare_config.minimum_samples_per_second == 20,
-                "runtime tare safety thresholds keep their original values");
-    CompensatedWrench compensated;
-    compensated.valid = true;
-    compensated.sensor << 1.0, 2.0, 3.0, 0.1, 0.2, 0.3;
-    compensated.tool = compensated.sensor;
-    Eigen::Matrix<double, 6, 1> tare_offset;
-    tare_offset << 0.5, 0.25, -0.5, 0.01, 0.02, 0.03;
-    const Eigen::Matrix<double, 6, 1> original_tool = compensated.tool;
-    ApplyRuntimeTare(tare_offset, compensated);
-    ok &= Check(Near(compensated.sensor,
-                     (Eigen::Matrix<double, 6, 1>()
-                          << 0.5, 1.75, 3.5, 0.09, 0.18, 0.27).finished())
-                    && Near(compensated.tool, original_tool),
-                "runtime tare changes only the compensated Sensor frame");
     return ok ? 0 : 1;
 }

@@ -184,7 +184,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
 
-    if (options.robot_ip.empty() || options.robot_ip.size() >= 16
+    if (options.robot_ip.empty()
+        || options.robot_ip.size() > RMConnectionConfig::kMaximumIpv4TextLength
         || options.sensor_device.empty() || options.output_path.empty()
         || !options.sensor_to_tool_rpy_set) {
         return false;
@@ -453,13 +454,11 @@ int main(int argc, char** argv) {
         return 4;
     }
 
-    RMCommand command;
-    command.quiet = true;
-    command.rlm_port = options.robot_port;
-    std::strncpy(command.rlm_ip,
-                 options.robot_ip.c_str(),
-                 sizeof(command.rlm_ip) - 1);
-    command.rlm_ip[sizeof(command.rlm_ip) - 1] = '\0';
+    RMCommand command(RMConnectionConfig{
+        options.robot_ip,
+        options.robot_port,
+    });
+    command.SetQuiet(true);
     RMResult robot_result = command.TryConnectTCPSocket();
     if (!robot_result) {
         std::cerr << "Robot connection failed: " << robot_result.message << '\n';

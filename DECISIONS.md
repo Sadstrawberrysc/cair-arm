@@ -10,15 +10,68 @@
 - 参数微调、普通修复、一次性实验和实现细节不记入本文件。
 - 尚未确定的方案写入 `PROGRESS.md` 待办，达成结论后再转为决策。
 
-## 2026-08-20：runtime tare 使用显式配置与只读停止依赖
+## 2026-08-21：WrenchSample 只公开生产使用的 stale 判定
 
-**决策：** `CollectRuntimeTare()`、`RuntimeTareResult` 和 `ApplyRuntimeTare()` 与依赖 Probe TCP
-的静止逻辑共同归入现有 frame-chain 模块。采样率、关节/TCP/姿态跨度及 wrench 稳定门由
-`RuntimeTareConfig` 唯一持有；进程停止标志通过 `const std::atomic<bool>&` 单次注入。
+**决策：** `WrenchSample` 只保留基于当前 `steady_clock` 的 `IsStale(maximum_age)`；删除无人
+调用的显式时刻转发方法。有效位、I/O 错误、streaming 状态、时间戳缺失/倒退、负最大年龄和
+超龄条件保持原顺序与语义。
 
-**原因：** tare 同时依赖标定坐标、机器人反馈和传感器快照，留在入口会重复坐标和阈值逻辑，
-并隐式读取进程全局状态。显式依赖使入口只编排采集结果，同时保持采集顺序、SI 单位和原安全门
-不变。
+**原因：** 全仓库只有当前时刻入口调用转发方法，额外公开另一套入口扩大 API，但没有测试或
+运行调用者，也不改变 fail-closed stale 判定所需的信息。
+
+## 2026-08-21：传感器运行健康只通过结果和快照公开
+
+**决策：** 删除 force sensor reader 无调用的内部运行、端口和配置 getter，以及两种 parser
+无调用的缓冲区大小 getter。reader 的启动结果、最新 `WrenchSample`、`LastError()` 与 parser
+离线统计接口继续保留；内部原子状态、配置和有界缓冲区不变。
+
+**原因：** 全仓库没有这些 getter 的调用者；并行暴露内部布尔状态会与携带 stale 和 I/O
+错误的快照形成第二套健康判断来源，缓冲区大小也已包含在 parser 统计快照中。
+
+## 2026-08-21：传感器 reader 不再维护无人消费的统计镜像
+
+**决策：** 删除 `ForceSensorReader` 的聚合统计查询、镜像状态和 parser-to-reader 复制路径；
+legacy 与 Haptron parser 继续维护各自的离线统计接口。生产健康状态仍通过最新
+`WrenchSample` 的 sequence、checksum、stale、I/O 状态/错误以及 `LastError()` 表达。
+
+**原因：** 全仓库没有 reader 聚合统计调用者，镜像只在串口热路径增加复制、互斥锁和公共
+API 面积，却不参与任何控制、安全、日志或故障判断。保留 parser 统计即可维持协议测试 seam。
+
+## 2026-08-21：ContactEstimate 只保留被运行链消费的结果
+
+**决策：** `ContactEstimate` 不再公开无人读取的 STL 面片索引；退化面片只在事务式
+`LoadSTL()` 边界拒绝，不再保留无法从周期估计产生的退化模型错误项。其后错误码显式保持
+原数值，点、残差、等效点误差、有效位以及 Redis/CSV 错误字符串契约不变。
+
+**原因：** 全仓库审计确认面片索引只有写入没有读取，成功加载的私有模型也不存在退化面片，
+保留这两项只会扩大公共 API 并暗示不存在的运行分支。
+
+## 2026-08-21：生产 transport 不再兼容旧六轴无返回值 API
+
+**决策：** 删除 `RMCommand` 的 `ConnectTCPSocket()`、`Read*()`、`Move*()`、`ServoJ()`、
+`HoldMotion()` 和 `StopMotion()` 无返回值 wrapper；生产与 maintenance 调用统一使用返回
+`RMResult` 的 `Try*` API。`tests/legacy/six_axis` 仅保留历史源码，不要求针对生产头文件编译。
+
+**原因：** 全仓库审计确认生产入口和 maintenance tools 均已迁移，wrapper 只会吞掉结构化
+错误并保留旧六轴源码兼容负担。统一显式结果传播可以避免运动或 Stop 失败被调用者忽略。
+
+## 2026-08-21：RMCommand 不再公开 transport 实现状态
+
+**决策：** `RMCommand` 的 socket、收发缓冲、JSON/命令缓存及内部错误缓存全部私有化；生产
+入口和 maintenance tools 只使用 `Try*`、状态快照、连接配置及 `SetQuiet()` 公共接口。
+
+**原因：** 这些字段没有非 legacy 外部读取者，公开后却允许调用者绕过 mailbox、锁和结果传播
+直接改变通信状态。收窄接口可以固定单一 I/O owner 边界，同时不改变报文、时序或运动语义。
+
+## 2026-08-21：RM75 连接端点改为构造时单次注入
+
+**决策：** `RMConnectionConfig` 唯一表达 RM75 控制器 IPv4 地址和端口，并在构造
+`RMCommand` 时单次注入；生产入口和 maintenance tools 不再直接改写 transport 的公开字符
+缓冲区或端口字段。默认端点仍为 `192.168.50.254:8080`。
+
+**原因：** 构造后逐字段复制导致生产和维护入口重复维护缓冲区长度与终止符，并允许连接生命
+周期内意外改变目标控制器。不可变配置收缩了公共 API，同时不改变连接时序、socket 协议或运动
+命令路径。
 
 ## 2026-08-20：Stop 命令确认与物理静止确认分层
 

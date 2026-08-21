@@ -8,7 +8,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <string_view>
 #include <thread>
 
 #include <Eigen/Dense>
@@ -48,16 +47,11 @@ public:
     explicit RMJsonLineFramer(std::size_t max_buffer_bytes = 64 * 1024);
 
     void Feed(const char* data, std::size_t size);
-    void Feed(std::string_view data);
     bool PopLine(std::string& line);
     void Reset();
 
-    std::size_t buffered_bytes() const;
-    std::size_t dropped_bytes() const;
-
 private:
     std::size_t max_buffer_bytes_;
-    std::size_t dropped_bytes_ = 0;
     std::string buffer_;
 };
 
@@ -102,28 +96,18 @@ struct ServoSendSnapshot {
 RMResult ParseRobotStateMessage(const nlohmann::json& message,
                                 RobotStateSnapshot& state);
 
+struct RMConnectionConfig {
+    static constexpr std::size_t kMaximumIpv4TextLength = 15;
+
+    std::string ip = "192.168.50.254";
+    int port = 8080;
+};
+
 class RMStateReader;
 
 class RMCommand {
 public:
-    // Kept public for compatibility with the existing command-line tools.
-    int rlm_port;
-    int rlm_socket;
-    int recv_times;
-    char rlm_ip[16];
-    char send_msg[1000];
-    char recv_msg[1000];
-    std::string cmd_str;
-    nlohmann::json command_msg;
-    nlohmann::json return_msg;
-    Eigen::Matrix<double, 7, 1> cmd_joints;
-    Eigen::Matrix<double, 6, 1> cmd_pose;
-    int last_joint_count;
-    int arm_err;
-    int sys_err;
-    bool quiet;
-
-    RMCommand();
+    explicit RMCommand(RMConnectionConfig connection = {});
     ~RMCommand();
     RMCommand(const RMCommand&) = delete;
     RMCommand& operator=(const RMCommand&) = delete;
@@ -162,31 +146,19 @@ public:
 
     void CloseTCPSocket();
     bool IsConnected() const;
+    void SetQuiet(bool quiet);
+    const RMConnectionConfig& ConnectionConfig() const;
     RMResult LastResult() const;
     ServoSendSnapshot ServoStatus() const;
     RobotStateSnapshot CachedRobotState(
         std::chrono::milliseconds stale_after = std::chrono::milliseconds(250)) const;
 
-    // Legacy API retained for source compatibility. These wrappers report an
-    // error and return without terminating the process; new code should use
-    // the Try* variants and inspect RMResult.
-    void ConnectTCPSocket();
-    void SetHighSpeedEth();
-    void ReadJ(Eigen::Matrix<double, 7, 1>& joints);
-    void ReadArmState(Eigen::Matrix<double, 7, 1>& joints,
-                      Eigen::Matrix<double, 6, 1>& pose,
-                      int& arm_err_out,
-                      int& sys_err_out);
-    void MoveJ(Eigen::Matrix<double, 7, 1>& joints, int velo);
-    void MoveL(Eigen::Matrix<double, 6, 1>& pose, int velo);
-    void MoveJP(Eigen::Matrix<double, 6, 1>& pose, int velo);
-    void ServoJ(Eigen::Matrix<double, 7, 1>& joints, bool follow);
-    void ReadL(Eigen::Matrix<double, 6, 1>& pose);
-    void HoldMotion(bool follow = false);
-    void StopMotion();
-
 private:
     friend class RMStateReader;
+
+    const RMConnectionConfig connection_;
+    int rlm_socket;
+    bool quiet_;
 
     RMResult SendJson(const nlohmann::json& request,
                       const char* label,
@@ -212,7 +184,6 @@ private:
                               bool sent,
                               const RMResult& result);
     void CompleteStopRequest(std::uint64_t sequence, const RMResult& result);
-    void ReportLegacyFailure(const char* operation, const RMResult& result) const;
 
     struct ServoMailboxSlot {
         // Single-producer seqlock. Odd means that the producer is rewriting

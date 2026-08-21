@@ -11,8 +11,7 @@ enum class ContactEstimateError {
     ModelNotLoaded,
     NonFiniteWrench,
     ForceTooSmall,
-    DegenerateModel,
-    IllConditionedSystem,
+    IllConditionedSystem = 5,
     ResidualTooLarge,
     NoValidSurface,
 };
@@ -24,20 +23,12 @@ struct ContactEstimate {
     double residual = std::numeric_limits<double>::infinity();
     double point_error_m = std::numeric_limits<double>::infinity();
     bool valid = false;
-    int face_index = -1;
     ContactEstimateError error = ContactEstimateError::ModelNotLoaded;
 };
 
 class ContactLocation
 {
 public:
-    // Model parameters. These remain public for compatibility with the legacy
-    // controller; LoadSTL() keeps all four containers mutually consistent.
-    int faceN = 0;
-    std::vector<Eigen::Vector3d> normal;
-    std::vector<Eigen::Matrix3d> vertex;
-    std::vector<Eigen::Vector4d> facePara;
-
     // Loads an ASCII STL transactionally. On failure the model is empty and a
     // diagnostic is available through lastError(); this function never exits.
     bool LoadSTL(const std::string &filename);
@@ -50,10 +41,8 @@ public:
         double min_force_norm = 1e-3,
         double max_point_error_m = 0.003) const;
 
-    // Compatibility API used by the legacy six-axis controller.
-    bool calContactPoint(Eigen::Matrix<double, 6, 1> &force,
-                         Eigen::Vector3d &point);
-
 private:
+    std::vector<Eigen::Vector3d> normal;
+    std::vector<Eigen::Matrix3d> vertex;
     std::string last_error_;
 };

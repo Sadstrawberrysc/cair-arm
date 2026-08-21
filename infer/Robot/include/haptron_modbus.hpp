@@ -67,7 +67,6 @@ public:
     void DiscardBufferedData() noexcept;
 
     HaptronModbusStatistics statistics() const noexcept;
-    std::size_t buffered_bytes() const noexcept;
 
 private:
     void ParseAvailable(std::vector<HaptronModbusResult>* results);

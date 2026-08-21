@@ -141,7 +141,7 @@ cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
 
 其中 force 的单位为 N，torque 的单位为 N·m。`tare` 是探头完全悬空、静止时采集的现场零点；它只能消除当前姿态和安装条件下的静态偏置，不能替代正式多姿态重力标定。
 
-真机观察：生产入口通过 `CollectRuntimeTare()` 执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。`RuntimeTareConfig` 的静止门为关节跨度 `0.02°`、TCP 跨度 `0.35 mm`、姿态跨度 `0.10°`，wrench 稳定门为 `0.25 N / 0.02 N·m`；临时标定残差门仍为 `5 N / 0.5 N·m`。若被拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
+真机观察：生产入口启动时会执行 3 秒悬空 tare。终端应出现 `runtime_tare_sensor`、`runtime_tare_samples` 与最大偏差。当前静止门为关节跨度 `0.02°`、TCP 跨度 `0.35 mm`、姿态跨度 `0.10°`；临时标定残差门为 `5 N / 0.5 N·m`。若被拒绝，先检查悬空、姿态、线缆受力和标定，而不是直接开始闭环。
 
 Stop 后的物理静止确认与 tare 稳定门是两套用途不同的门：`StopAndConfirmStationary()` 要求连续 5 帧满足相邻/窗口关节 `0.01°/0.02°`、Probe TCP `0.05/0.10 mm`、姿态 `0.01°/0.02°`，不能只凭控制器返回 `arm_stop=true` 判断已经静止。
 

@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
-#include <cstring>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -279,7 +278,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
 
-    if (options.ip.size() >= sizeof(RMCommand().rlm_ip)) {
+    if (options.ip.size() > RMConnectionConfig::kMaximumIpv4TextLength) {
         std::cerr << "IP address is too long.\n";
         return false;
     }
@@ -537,7 +536,8 @@ bool PrintSingularityWarning(const char* label,
 bool WithinJointLimits(const RMKinematics& kinematics,
                        const Eigen::Matrix<double, 7, 1>& joints) {
     for (int i = 0; i < 7; ++i) {
-        if (joints[i] < kinematics.joint_min[i] || joints[i] > kinematics.joint_max[i]) {
+        if (joints[i] < kinematics.JointMinimums()[i]
+            || joints[i] > kinematics.JointMaximums()[i]) {
             std::cerr << "Target joint J" << (i + 1) << " exceeds RM75 joint limits.\n";
             return false;
         }
@@ -548,8 +548,10 @@ bool WithinJointLimits(const RMKinematics& kinematics,
 double JointLimitMarginDeg(const RMKinematics& kinematics,
                            const Eigen::Matrix<double, 7, 1>& joints,
                            int joint) {
-    const double lower_margin = joints[joint] - kinematics.joint_min[joint];
-    const double upper_margin = kinematics.joint_max[joint] - joints[joint];
+    const double lower_margin =
+        joints[joint] - kinematics.JointMinimums()[joint];
+    const double upper_margin =
+        kinematics.JointMaximums()[joint] - joints[joint];
     return std::min(lower_margin, upper_margin) * kRadToDeg;
 }
 
@@ -1420,11 +1422,8 @@ int main(int argc, char** argv) {
         options.trajectory_log_path = DefaultTrajectoryLogPath();
     }
 
-    RMCommand command;
-    command.quiet = true;
-    command.rlm_port = options.port;
-    std::strncpy(command.rlm_ip, options.ip.c_str(), sizeof(command.rlm_ip) - 1);
-    command.rlm_ip[sizeof(command.rlm_ip) - 1] = '\0';
+    RMCommand command(RMConnectionConfig{options.ip, options.port});
+    command.SetQuiet(true);
     const RMResult connect_result = command.TryConnectTCPSocket();
     if (!connect_result) {
         std::cerr << "Failed to connect to the robot: "

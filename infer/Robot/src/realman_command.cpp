@@ -139,12 +139,7 @@ void RMJsonLineFramer::Feed(const char* data, std::size_t size) {
     if (buffer_.size() > max_buffer_bytes_) {
         const std::size_t to_drop = buffer_.size() - max_buffer_bytes_;
         buffer_.erase(0, to_drop);
-        dropped_bytes_ += to_drop;
     }
-}
-
-void RMJsonLineFramer::Feed(std::string_view data) {
-    Feed(data.data(), data.size());
 }
 
 bool RMJsonLineFramer::PopLine(std::string& line) {
@@ -159,14 +154,6 @@ bool RMJsonLineFramer::PopLine(std::string& line) {
 
 void RMJsonLineFramer::Reset() {
     buffer_.clear();
-}
-
-std::size_t RMJsonLineFramer::buffered_bytes() const {
-    return buffer_.size();
-}
-
-std::size_t RMJsonLineFramer::dropped_bytes() const {
-    return dropped_bytes_;
 }
 
 bool RobotStateSnapshot::IsStale(
@@ -251,25 +238,14 @@ RMResult ParseRobotStateMessage(const nlohmann::json& message,
     return RMResult::Success();
 }
 
-RMCommand::RMCommand()
-    : rlm_port(8080),
+RMCommand::RMCommand(RMConnectionConfig connection)
+    : connection_(std::move(connection)),
       rlm_socket(-1),
-      recv_times(0),
-      last_joint_count(0),
-      arm_err(0),
-      sys_err(0),
-      quiet(false),
+      quiet_(false),
       servo_result_snapshot_(
           std::make_shared<const RMResult>(RMResult::Success())),
       stop_completion_snapshot_(
           std::make_shared<const StopCompletion>()) {
-    const std::string default_ip = "192.168.50.254";
-    std::memset(rlm_ip, 0, sizeof(rlm_ip));
-    std::memcpy(rlm_ip, default_ip.data(), default_ip.size());
-    std::memset(send_msg, 0, sizeof(send_msg));
-    std::memset(recv_msg, 0, sizeof(recv_msg));
-    cmd_joints.setZero();
-    cmd_pose.setZero();
     for (auto& slot : servo_mailbox_) {
         for (auto& joint : slot.joints) joint.store(0.0);
         slot.follow.store(false);
@@ -303,11 +279,11 @@ RMResult RMCommand::TryConnectTCPSocket(int timeout_ms) {
 
     sockaddr_in server_address{};
     server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(static_cast<std::uint16_t>(rlm_port));
-    if (inet_pton(AF_INET, rlm_ip, &server_address.sin_addr) != 1) {
+    server_address.sin_port = htons(static_cast<std::uint16_t>(connection_.port));
+    if (inet_pton(AF_INET, connection_.ip.c_str(), &server_address.sin_addr) != 1) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kInvalidAddress,
-            std::string("invalid robot IPv4 address: ") + rlm_ip);
+            std::string("invalid robot IPv4 address: ") + connection_.ip);
         StoreLastResult(result);
         return result;
     }
@@ -423,15 +399,15 @@ RMResult RMCommand::TryConnectTCPSocket(int timeout_ms) {
     {
         std::lock_guard<std::mutex> receive_lock(receive_mutex_);
         receive_framer_.Reset();
-        std::memset(recv_msg, 0, sizeof(recv_msg));
     }
     rlm_socket = socket_fd;
     connected_.store(true);
 
     const RMResult result = RMResult::Success();
     StoreLastResult(result);
-    if (!quiet) {
-        std::cout << "Robot connected to " << rlm_ip << ':' << rlm_port << std::endl;
+    if (!quiet_) {
+        std::cout << "Robot connected to " << connection_.ip << ':'
+                  << connection_.port << std::endl;
     }
     return result;
 }
@@ -457,11 +433,6 @@ RMResult RMCommand::SendJson(const nlohmann::json& request,
     }
 
     const std::string payload = request.dump() + "\r\n";
-    cmd_str = payload;
-    std::memset(send_msg, 0, sizeof(send_msg));
-    const std::size_t compatibility_size =
-        std::min(payload.size(), sizeof(send_msg) - 1);
-    std::memcpy(send_msg, payload.data(), compatibility_size);
 
     std::size_t sent = 0;
     while (sent < payload.size()) {
@@ -510,14 +481,13 @@ RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) 
             if (line.empty()) continue;
             nlohmann::json parsed = nlohmann::json::parse(line, nullptr, false);
             if (parsed.is_discarded()) {
-                if (!quiet) {
+                if (!quiet_) {
                     std::cerr << "WARNING! Ignoring invalid robot JSON frame: "
                               << line << std::endl;
                 }
                 continue;
             }
             response = std::move(parsed);
-            return_msg = response;
             return RMResult::Success();
         }
 
@@ -568,11 +538,6 @@ RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) 
                 std::string("robot recv failed: ") + std::strerror(errno));
         }
 
-        std::memset(recv_msg, 0, sizeof(recv_msg));
-        const std::size_t compatibility_size =
-            std::min<std::size_t>(static_cast<std::size_t>(count),
-                                  sizeof(recv_msg) - 1);
-        std::memcpy(recv_msg, buffer, compatibility_size);
         receive_framer_.Feed(buffer, static_cast<std::size_t>(count));
     }
 }
@@ -664,7 +629,7 @@ RMResult RMCommand::TrySetHighSpeedEth(int timeout_ms) {
             StoreLastResult(result);
             return result;
         }
-        if (!quiet) std::cout << response.dump() << std::endl;
+        if (!quiet_) std::cout << response.dump() << std::endl;
     }
 
     const RMResult result = RMResult::Success();
@@ -736,8 +701,6 @@ RMResult RMCommand::TryReadJ(Eigen::Matrix<double, 7, 1>& joints,
         joints = parsed;
         {
             std::lock_guard<std::mutex> state_lock(state_mutex_);
-            cmd_joints = parsed;
-            last_joint_count = 7;
             hold_joints_ = parsed;
             has_hold_target_ = true;
         }
@@ -838,7 +801,7 @@ RMResult RMCommand::WaitTrajectoryResponseLocked(const char* label,
             ReceiveJsonLocked(response, RemainingMilliseconds(deadline));
         if (!result) return result;
 
-        if (!quiet) {
+        if (!quiet_) {
             std::cout << label << " response:\t" << response.dump() << std::endl;
         }
         if (response.contains("arm_err")) {
@@ -900,7 +863,7 @@ RMResult RMCommand::TryMoveJ(const Eigen::Matrix<double, 7, 1>& joints,
     FillJointCommand(request, joints);
     request["v"] = velo;
     request["r"] = 0;
-    if (!quiet) std::cout << request.dump() << std::endl;
+    if (!quiet_) std::cout << request.dump() << std::endl;
 
     std::lock_guard<std::mutex> receive_lock(receive_mutex_);
     RMResult result = DrainInputLocked();
@@ -933,7 +896,7 @@ RMResult RMCommand::TryMoveL(const Eigen::Matrix<double, 6, 1>& pose,
     FillPoseCommand(request, pose);
     request["v"] = velo;
     request["r"] = 0;
-    if (!quiet) std::cout << request.dump() << std::endl;
+    if (!quiet_) std::cout << request.dump() << std::endl;
 
     std::lock_guard<std::mutex> receive_lock(receive_mutex_);
     RMResult result = DrainInputLocked();
@@ -965,7 +928,7 @@ RMResult RMCommand::TryMoveJP(const Eigen::Matrix<double, 6, 1>& pose,
     FillPoseCommand(request, pose);
     request["v"] = velo;
     request["r"] = 0;
-    if (!quiet) std::cout << request.dump() << std::endl;
+    if (!quiet_) std::cout << request.dump() << std::endl;
 
     std::lock_guard<std::mutex> receive_lock(receive_mutex_);
     RMResult result = DrainInputLocked();
@@ -1018,7 +981,7 @@ RMResult RMCommand::TryServoJ(const Eigen::Matrix<double, 7, 1>& joints,
     request["command"] = "movej_canfd";
     FillJointCommand(request, joints);
     request["follow"] = follow;
-    if (!quiet) std::cout << request.dump() << std::endl;
+    if (!quiet_) std::cout << request.dump() << std::endl;
 
     std::lock_guard<std::mutex> receive_lock(receive_mutex_);
     RMResult result = DrainInputLocked();
@@ -1031,7 +994,7 @@ RMResult RMCommand::TryServoJ(const Eigen::Matrix<double, 7, 1>& joints,
     nlohmann::json response;
     const RMResult receive_result = ReceiveJsonLocked(response, 0);
     if (receive_result) {
-        if (!quiet) {
+        if (!quiet_) {
             std::cout << "ServoJ response:\t" << response.dump() << std::endl;
         }
         if (response.contains("arm_err")) {
@@ -1248,6 +1211,14 @@ void RMCommand::CloseTCPSocket() {
 
 bool RMCommand::IsConnected() const {
     return connected_.load() && rlm_socket >= 0;
+}
+
+void RMCommand::SetQuiet(bool quiet) {
+    quiet_ = quiet;
+}
+
+const RMConnectionConfig& RMCommand::ConnectionConfig() const {
+    return connection_;
 }
 
 RMResult RMCommand::LastResult() const {
@@ -1580,11 +1551,6 @@ void RMCommand::StoreRobotState(const RobotStateSnapshot& state) {
     // 除缓存状态外，同时更新 Hold 的安全关节目标，供通信异常后的保持使用。
     std::lock_guard<std::mutex> lock(state_mutex_);
     cached_state_ = state;
-    cmd_joints = state.joints;
-    cmd_pose = state.pose;
-    last_joint_count = 7;
-    arm_err = state.arm_err;
-    sys_err = state.sys_err;
     hold_joints_ = state.joints;
     has_hold_target_ = true;
 }
@@ -1594,93 +1560,6 @@ void RMCommand::StoreHoldTarget(
     std::lock_guard<std::mutex> lock(state_mutex_);
     hold_joints_ = joints;
     has_hold_target_ = true;
-}
-
-void RMCommand::ReportLegacyFailure(const char* operation,
-                                    const RMResult& result) const {
-    if (!result) {
-        std::cerr << "ERROR! " << operation << " failed: " << result.message
-                  << std::endl;
-    }
-}
-
-void RMCommand::ConnectTCPSocket() {
-    // 以下无返回值接口保留给旧六轴代码；新 RM75 主线应使用 Try* 接口并检查 RMResult。
-    const RMResult result = TryConnectTCPSocket();
-    ReportLegacyFailure("ConnectTCPSocket", result);
-}
-
-void RMCommand::SetHighSpeedEth() {
-    const RMResult result = TrySetHighSpeedEth();
-    ReportLegacyFailure("SetHighSpeedEth", result);
-    if (result && !quiet) {
-        std::cout << "Successfully set high speed Ethernet. Change port and restart the robot."
-                  << std::endl;
-    }
-}
-
-void RMCommand::ReadJ(Eigen::Matrix<double, 7, 1>& joints) {
-    const RMResult result = TryReadJ(joints);
-    ReportLegacyFailure("ReadJ", result);
-    if (!result) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        joints = cmd_joints;
-    }
-}
-
-void RMCommand::ReadArmState(Eigen::Matrix<double, 7, 1>& joints,
-                             Eigen::Matrix<double, 6, 1>& pose,
-                             int& arm_err_out,
-                             int& sys_err_out) {
-    const RMResult result =
-        TryReadArmState(joints, pose, arm_err_out, sys_err_out);
-    ReportLegacyFailure("ReadArmState", result);
-    if (!result) {
-        const RobotStateSnapshot cached = CachedRobotState();
-        joints = cached.joints;
-        pose = cached.pose;
-        arm_err_out = cached.arm_err;
-        sys_err_out = cached.sys_err;
-    }
-}
-
-void RMCommand::MoveJ(Eigen::Matrix<double, 7, 1>& joints, int velo) {
-    const RMResult result = TryMoveJ(joints, velo);
-    ReportLegacyFailure("MoveJ", result);
-}
-
-void RMCommand::MoveL(Eigen::Matrix<double, 6, 1>& pose, int velo) {
-    const RMResult result = TryMoveL(pose, velo);
-    ReportLegacyFailure("MoveL", result);
-}
-
-void RMCommand::MoveJP(Eigen::Matrix<double, 6, 1>& pose, int velo) {
-    const RMResult result = TryMoveJP(pose, velo);
-    ReportLegacyFailure("MoveJ_P", result);
-}
-
-void RMCommand::ServoJ(Eigen::Matrix<double, 7, 1>& joints, bool follow) {
-    const RMResult result = TryServoJ(joints, follow);
-    ReportLegacyFailure("ServoJ", result);
-}
-
-void RMCommand::ReadL(Eigen::Matrix<double, 6, 1>& pose) {
-    const RMResult result = TryReadL(pose);
-    ReportLegacyFailure("ReadL", result);
-    if (!result) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        pose = cmd_pose;
-    }
-}
-
-void RMCommand::HoldMotion(bool follow) {
-    const RMResult result = TryHoldMotion(follow);
-    ReportLegacyFailure("HoldMotion", result);
-}
-
-void RMCommand::StopMotion() {
-    const RMResult result = TryStopMotion();
-    ReportLegacyFailure("StopMotion", result);
 }
 
 RMResult RequestConfirmedStop(RMCommand& command, int timeout_ms) {

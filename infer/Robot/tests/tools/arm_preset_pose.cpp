@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -243,7 +242,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
 
-    if (options.ip.size() >= sizeof(RMCommand().rlm_ip)) {
+    if (options.ip.size() > RMConnectionConfig::kMaximumIpv4TextLength) {
         std::cerr << "IP address is too long: " << options.ip << "\n";
         return false;
     }
@@ -359,13 +358,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    RMCommand command;
-    command.rlm_port = options.port;
-    std::strncpy(command.rlm_ip, options.ip.c_str(), sizeof(command.rlm_ip) - 1);
-    command.rlm_ip[sizeof(command.rlm_ip) - 1] = '\0';
+    RMCommand command(RMConnectionConfig{options.ip, options.port});
 
     std::cout << "Connecting to Realman controller at "
-              << command.rlm_ip << ":" << command.rlm_port << "\n";
+              << options.ip << ":" << options.port << "\n";
     const RMResult connect_result = command.TryConnectTCPSocket();
     if (!connect_result) {
         std::cerr << "Failed to connect to the Realman controller: "

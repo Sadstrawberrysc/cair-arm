@@ -158,12 +158,7 @@ const char* ForceSensorProtocolName(ForceSensorProtocol protocol) noexcept {
 
 bool WrenchSample::IsStale(std::chrono::milliseconds maximum_age) const
     noexcept {
-    return IsStaleAt(std::chrono::steady_clock::now(), maximum_age);
-}
-
-bool WrenchSample::IsStaleAt(
-    std::chrono::steady_clock::time_point now,
-    std::chrono::milliseconds maximum_age) const noexcept {
+    const auto now = std::chrono::steady_clock::now();
     if (!valid || io_error != 0 ||
         io_status != ForceSensorIoStatus::kStreaming ||
         monotonic_timestamp == std::chrono::steady_clock::time_point{}) {
@@ -325,14 +320,6 @@ ForceSensorStatistics ForceSensorFrameParser::statistics() const noexcept {
     return result;
 }
 
-std::size_t ForceSensorFrameParser::buffered_bytes() const noexcept {
-    return receive_buffer_.size();
-}
-
-std::size_t ForceSensorFrameParser::maximum_buffer_bytes() const noexcept {
-    return maximum_buffer_bytes_;
-}
-
 std::uint8_t ForceSensorFrameParser::ComputeChecksum(
     const std::uint8_t* data,
     std::size_t length) noexcept {
@@ -379,7 +366,6 @@ ForceSensorReader::ForceSensorReader(ForceSensorConfig config)
             config_.modbus_slave_address, config_.maximum_buffer_bytes);
     }
     latest_sample_.io_status = ForceSensorIoStatus::kDisconnected;
-    statistics_.io_status = ForceSensorIoStatus::kDisconnected;
 }
 
 ForceSensorReader::~ForceSensorReader() {
@@ -399,7 +385,6 @@ bool ForceSensorReader::Start() {
     {
         std::lock_guard<std::mutex> state_lock(state_mutex_);
         latest_sample_ = WrenchSample{};
-        statistics_ = ForceSensorStatistics{};
         last_error_.clear();
     }
     PublishIoStatus(ForceSensorIoStatus::kOpening, 0, std::string{});
@@ -442,14 +427,6 @@ void ForceSensorReader::Stop() noexcept {
     PublishIoStatus(ForceSensorIoStatus::kStopped, 0, std::string{});
 }
 
-bool ForceSensorReader::IsRunning() const noexcept {
-    return running_.load();
-}
-
-bool ForceSensorReader::IsOpen() const noexcept {
-    return serial_fd_.load() >= 0;
-}
-
 WrenchSample ForceSensorReader::LatestSample() const {
     WrenchSample result;
     {
@@ -460,18 +437,9 @@ WrenchSample ForceSensorReader::LatestSample() const {
     return result;
 }
 
-ForceSensorStatistics ForceSensorReader::Statistics() const {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    return statistics_;
-}
-
 std::string ForceSensorReader::LastError() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return last_error_;
-}
-
-const ForceSensorConfig& ForceSensorReader::config() const noexcept {
-    return config_;
 }
 
 void ForceSensorReader::WorkerLoop() {
@@ -505,8 +473,6 @@ void ForceSensorReader::LegacyStreamWorkerLoop() {
         descriptor.events = POLLIN;
         const int poll_result = ::poll(&descriptor, 1, poll_timeout_ms);
         if (poll_result == 0) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            ++statistics_.read_timeouts;
             continue;
         }
         if (poll_result < 0) {
@@ -528,17 +494,10 @@ void ForceSensorReader::LegacyStreamWorkerLoop() {
         }
 
         const ssize_t count = ::read(fd, read_buffer.data(), read_buffer.size());
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            ++statistics_.read_calls;
-        }
         if (count > 0) {
             const auto samples = legacy_parser_.Feed(
                 read_buffer.data(), static_cast<std::size_t>(count));
-            const ForceSensorStatistics parser_statistics =
-                legacy_parser_.statistics();
             std::lock_guard<std::mutex> lock(state_mutex_);
-            CopyParserStatistics(parser_statistics);
             for (const WrenchSample& sample : samples) {
                 latest_sample_ = sample;
                 latest_sample_.io_status = ForceSensorIoStatus::kStreaming;
@@ -629,10 +588,6 @@ void ForceSensorReader::HaptronModbusWorkerLoop() {
             }
         }
         if (stop_requested_.load()) break;
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            ++statistics_.requests_sent;
-        }
 
         bool response_received = false;
         while (!stop_requested_.load()
@@ -664,19 +619,9 @@ void ForceSensorReader::HaptronModbusWorkerLoop() {
 
             const ssize_t count =
                 ::read(fd, read_buffer.data(), read_buffer.size());
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                ++statistics_.read_calls;
-            }
             if (count > 0) {
                 const auto results = modbus_parser_.Feed(
                     read_buffer.data(), static_cast<std::size_t>(count));
-                const HaptronModbusStatistics parser_statistics =
-                    modbus_parser_.statistics();
-                {
-                    std::lock_guard<std::mutex> lock(state_mutex_);
-                    CopyModbusStatistics(parser_statistics);
-                }
                 for (const HaptronModbusResult& result : results) {
                     if (result.exception) {
                         PublishIoStatus(
@@ -717,16 +662,10 @@ void ForceSensorReader::HaptronModbusWorkerLoop() {
         if (!response_received && !stop_requested_.load()) {
             // A partial or late reply must not be completed and timestamped as
             // the answer to the next request (Modbus RTU has no transaction
-            // identifier). Discard only buffered/driver input; keep cumulative
-            // parser statistics for diagnosis.
+            // identifier). Discard only buffered/driver input so a late reply
+            // cannot be accepted as the answer to the next request.
             modbus_parser_.DiscardBufferedData();
             (void)::tcflush(fd, TCIFLUSH);
-            const HaptronModbusStatistics parser_statistics =
-                modbus_parser_.statistics();
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            CopyModbusStatistics(parser_statistics);
-            ++statistics_.read_timeouts;
-            ++statistics_.response_timeouts;
         }
         next_query_at = std::max(query_started_at + config_.query_period,
                                  std::chrono::steady_clock::now());
@@ -737,7 +676,6 @@ void ForceSensorReader::PublishIoStatus(ForceSensorIoStatus status,
                                         int error_number,
                                         const std::string& message) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    statistics_.io_status = status;
     latest_sample_.io_status = status;
     // A normal Stop after an I/O failure must not erase the errno which
     // explains why the worker exited. A subsequent Start resets the snapshot.
@@ -748,9 +686,6 @@ void ForceSensorReader::PublishIoStatus(ForceSensorIoStatus status,
     if (status != ForceSensorIoStatus::kStreaming) {
         latest_sample_.stale = true;
     }
-    if (status == ForceSensorIoStatus::kIoError) {
-        ++statistics_.io_errors;
-    }
     if (!message.empty()) {
         last_error_ = message;
     } else if (status == ForceSensorIoStatus::kStreaming) {
@@ -758,168 +693,11 @@ void ForceSensorReader::PublishIoStatus(ForceSensorIoStatus status,
     }
 }
 
-void ForceSensorReader::CopyParserStatistics(
-    const ForceSensorStatistics& parser_statistics) {
-    statistics_.bytes_received = parser_statistics.bytes_received;
-    statistics_.valid_frames = parser_statistics.valid_frames;
-    statistics_.checksum_errors = parser_statistics.checksum_errors;
-    statistics_.numeric_errors = parser_statistics.numeric_errors;
-    statistics_.noise_bytes_discarded =
-        parser_statistics.noise_bytes_discarded;
-    statistics_.buffer_overflow_events =
-        parser_statistics.buffer_overflow_events;
-    statistics_.buffer_bytes_discarded =
-        parser_statistics.buffer_bytes_discarded;
-    statistics_.buffered_bytes = parser_statistics.buffered_bytes;
-    statistics_.peak_buffered_bytes = parser_statistics.peak_buffered_bytes;
-}
-
-void ForceSensorReader::CopyModbusStatistics(
-    const HaptronModbusStatistics& parser_statistics) {
-    statistics_.bytes_received = parser_statistics.bytes_received;
-    statistics_.valid_frames = parser_statistics.valid_responses;
-    statistics_.checksum_errors = parser_statistics.crc_errors;
-    statistics_.numeric_errors = parser_statistics.numeric_errors;
-    statistics_.noise_bytes_discarded =
-        parser_statistics.noise_bytes_discarded;
-    statistics_.buffer_overflow_events =
-        parser_statistics.buffer_overflow_events;
-    statistics_.buffered_bytes = parser_statistics.buffered_bytes;
-    statistics_.peak_buffered_bytes = parser_statistics.peak_buffered_bytes;
-    statistics_.exception_responses =
-        parser_statistics.exception_responses;
-    statistics_.protocol_errors = parser_statistics.protocol_errors;
-}
-
 void ForceSensorReader::ClosePort() noexcept {
     const int fd = serial_fd_.exchange(-1);
     if (fd >= 0) {
         (void)::close(fd);
     }
-}
-
-CLinuxSerial::CLinuxSerial() = default;
-
-CLinuxSerial::CLinuxSerial(UINT portNo, UINT baudRate) {
-    (void)InitPort(portNo, baudRate);
-}
-
-CLinuxSerial::CLinuxSerial(const std::string& device, UINT baudRate) {
-    (void)InitPort(device, baudRate);
-}
-
-CLinuxSerial::~CLinuxSerial() {
-    ClosePort();
-}
-
-void CLinuxSerial::ClosePort() noexcept {
-    if (m_iSerialID >= 0) {
-        (void)::close(m_iSerialID);
-        m_iSerialID = -1;
-    }
-}
-
-bool CLinuxSerial::IsOpen() const noexcept {
-    return m_iSerialID >= 0;
-}
-
-bool CLinuxSerial::InitPort(UINT portNo, UINT baudRate) {
-    return InitPort("/dev/ttyUSB" + std::to_string(portNo), baudRate);
-}
-
-bool CLinuxSerial::InitPort(const std::string& device, UINT baudRate) {
-    ClosePort();
-    parser_.Reset();
-    int error_number = 0;
-    const int fd = OpenConfiguredSerialPort(device, baudRate, &error_number);
-    if (fd < 0) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        latest_sample_.io_status = ForceSensorIoStatus::kIoError;
-        latest_sample_.io_error = error_number;
-        latest_sample_.stale = true;
-        return false;
-    }
-    m_iSerialID = fd;
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    latest_sample_ = WrenchSample{};
-    latest_sample_.io_status = ForceSensorIoStatus::kStreaming;
-    return true;
-}
-
-UINT CLinuxSerial::ReadData(UCHAR* data, UINT length) {
-    if (!IsOpen() || data == nullptr || length == 0) {
-        return 0;
-    }
-    const ssize_t result = ::read(m_iSerialID, data, length);
-    return result > 0 ? static_cast<UINT>(result) : 0;
-}
-
-UINT CLinuxSerial::WriteData(UCHAR* data, UINT length) {
-    if (!IsOpen() || data == nullptr || length == 0) {
-        return 0;
-    }
-    const ssize_t result = ::write(m_iSerialID, data, length);
-    return result > 0 ? static_cast<UINT>(result) : 0;
-}
-
-UINT CLinuxSerial::GetBytesInCom() {
-    if (!IsOpen()) {
-        return 0;
-    }
-    int available = 0;
-    if (::ioctl(m_iSerialID, FIONREAD, &available) != 0 || available <= 0) {
-        return 0;
-    }
-    return static_cast<UINT>(available);
-}
-
-unsigned char CLinuxSerial::CheckSum(unsigned char* buf, const int len) {
-    return CheckSum(static_cast<const unsigned char*>(buf), len);
-}
-
-unsigned char CLinuxSerial::CheckSum(const unsigned char* buf,
-                                     const int len) const {
-    if (len <= 0) {
-        return 0;
-    }
-    return ForceSensorFrameParser::ComputeChecksum(
-        reinterpret_cast<const std::uint8_t*>(buf),
-        static_cast<std::size_t>(len));
-}
-
-void CLinuxSerial::ProcessSensorData() {
-    if (!IsOpen()) {
-        return;
-    }
-    std::array<std::uint8_t, 512> bytes{};
-    const UINT count = ReadData(bytes.data(), static_cast<UINT>(bytes.size()));
-    if (count == 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    const auto samples = parser_.Feed(bytes.data(), count);
-    if (samples.empty()) {
-        return;
-    }
-
-    const WrenchSample& sample = samples.back();
-    latest_sample_ = sample;
-    for (std::size_t index = 0; index < sample.wrench_si.size(); ++index) {
-        sensor[index] = static_cast<float>(sample.wrench_si[index]);
-    }
-}
-
-WrenchSample CLinuxSerial::LatestSample(
-    std::chrono::milliseconds stale_after) const {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    WrenchSample result = latest_sample_;
-    result.stale = result.IsStale(stale_after);
-    return result;
-}
-
-ForceSensorStatistics CLinuxSerial::Statistics() const {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    return parser_.statistics();
 }
 
 // Haptron Modbus RTU protocol implementation. Kept in the sensor translation
@@ -1049,10 +827,6 @@ HaptronModbusStatistics HaptronModbusResponseParser::statistics() const noexcept
     HaptronModbusStatistics result = statistics_;
     result.buffered_bytes = receive_buffer_.size();
     return result;
-}
-
-std::size_t HaptronModbusResponseParser::buffered_bytes() const noexcept {
-    return receive_buffer_.size();
 }
 
 void HaptronModbusResponseParser::ParseAvailable(

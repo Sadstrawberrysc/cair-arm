@@ -166,8 +166,6 @@ const char *ContactEstimateErrorString(ContactEstimateError error) noexcept
         return "wrench contains a non-finite value";
     case ContactEstimateError::ForceTooSmall:
         return "force magnitude is below the estimation threshold";
-    case ContactEstimateError::DegenerateModel:
-        return "contact model has no non-degenerate triangle";
     case ContactEstimateError::IllConditionedSystem:
         return "contact equation is rank deficient or ill-conditioned";
     case ContactEstimateError::ResidualTooLarge:
@@ -180,10 +178,8 @@ const char *ContactEstimateErrorString(ContactEstimateError error) noexcept
 
 bool ContactLocation::LoadSTL(const std::string &filename)
 {
-    faceN = 0;
     normal.clear();
     vertex.clear();
-    facePara.clear();
     last_error_.clear();
 
     std::ifstream input(filename);
@@ -194,7 +190,6 @@ bool ContactLocation::LoadSTL(const std::string &filename)
 
     std::vector<Eigen::Vector3d> loaded_normals;
     std::vector<Eigen::Matrix3d> loaded_vertices;
-    std::vector<Eigen::Vector4d> loaded_planes;
     Eigen::Vector3d pending_normal = Eigen::Vector3d::Zero();
     Eigen::Matrix3d pending_vertices = Eigen::Matrix3d::Zero();
     bool in_facet = false;
@@ -254,12 +249,8 @@ bool ContactLocation::LoadSTL(const std::string &filename)
             if (!orientedTriangleNormal(pending_vertices, &pending_normal, unit_normal)) {
                 return fail("degenerate triangle");
             }
-            Eigen::Vector4d plane;
-            plane << unit_normal,
-                     -unit_normal.dot(pending_vertices.row(0).transpose());
             loaded_normals.push_back(unit_normal);
             loaded_vertices.push_back(pending_vertices);
-            loaded_planes.push_back(plane);
             in_facet = false;
             vertex_count = 0;
             continue;
@@ -287,8 +278,6 @@ bool ContactLocation::LoadSTL(const std::string &filename)
 
     normal = std::move(loaded_normals);
     vertex = std::move(loaded_vertices);
-    facePara = std::move(loaded_planes);
-    faceN = static_cast<int>(vertex.size());
     return true;
 }
 
@@ -317,16 +306,10 @@ ContactEstimate ContactLocation::estimateContactPoint(
         return estimate;
     }
 
-    bool found_nondegenerate_face = false;
     bool found_full_rank_system = false;
     bool found_excessive_residual = false;
     for (std::size_t i = 0; i < vertex.size(); ++i) {
-        const Eigen::Vector3d *supplied_normal = i < normal.size() ? &normal[i] : nullptr;
-        Eigen::Vector3d unit_normal;
-        if (!orientedTriangleNormal(vertex[i], supplied_normal, unit_normal)) {
-            continue;
-        }
-        found_nondegenerate_face = true;
+        const Eigen::Vector3d &unit_normal = normal[i];
 
         const Eigen::Vector3d first_vertex = vertex[i].row(0).transpose();
         const double plane_offset = -unit_normal.dot(first_vertex);
@@ -356,7 +339,6 @@ ContactEstimate ContactLocation::estimateContactPoint(
             estimate.residual = solution.residual;
             estimate.point_error_m = point_error_m;
             estimate.valid = true;
-            estimate.face_index = static_cast<int>(i);
             estimate.error = ContactEstimateError::None;
         }
     }
@@ -365,9 +347,7 @@ ContactEstimate ContactLocation::estimateContactPoint(
         return estimate;
     }
 
-    if (!found_nondegenerate_face) {
-        estimate.error = ContactEstimateError::DegenerateModel;
-    } else if (!found_full_rank_system) {
+    if (!found_full_rank_system) {
         estimate.error = ContactEstimateError::IllConditionedSystem;
     } else if (found_excessive_residual) {
         estimate.error = ContactEstimateError::ResidualTooLarge;
@@ -375,16 +355,4 @@ ContactEstimate ContactLocation::estimateContactPoint(
         estimate.error = ContactEstimateError::NoValidSurface;
     }
     return estimate;
-}
-
-bool ContactLocation::calContactPoint(Eigen::Matrix<double, 6, 1> &force,
-                                      Eigen::Vector3d &point)
-{
-    const ContactEstimate estimate = estimateContactPoint(force);
-    if (!estimate.valid) {
-        point.setZero();
-        return false;
-    }
-    point = estimate.point;
-    return true;
 }

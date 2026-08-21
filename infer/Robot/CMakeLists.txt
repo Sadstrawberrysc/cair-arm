@@ -9,17 +9,9 @@ find_package(OpenSSL REQUIRED)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_library(HIREDIS_LIB hiredis REQUIRED)
 
-option(BUILD_LEGACY_MAIN_NOMOVE
-       "Deprecated: legacy six-axis sources are retained as references only"
-       OFF)
 option(BUILD_MAINTENANCE_TOOLS
        "Build retained robot diagnostics and sensor calibration utilities"
        OFF)
-if(BUILD_LEGACY_MAIN_NOMOVE)
-    message(WARNING
-        "tests/legacy/six_axis is retained as an original six-axis reference; "
-        "it is not built against the RM75 seven-axis libraries.")
-endif()
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

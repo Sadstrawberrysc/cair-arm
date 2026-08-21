@@ -108,16 +108,24 @@ idle，`q` 发布 terminate 后退出。停止顺序为先在视觉端按 `t` �
 5. 控制、规划和运行安全参数以 `infer/Robot/include/rm75_control.hpp` 中的
    `Rm75ControlConfig`、`Rm75ServoPlannerConfig` 和 `Rm75RuntimeSafetyConfig` 为准。
    入口设备、路径、模式和生命周期参数由 `rm75_runtime_config.hpp` 的
-   `RobotRuntimeConfig` 持有。不要在 `main_rm75.cpp` 重复覆盖常规算法参数；该文件负责启动
-   编排和硬件 I/O，标定坐标转换由 `CalibratedFrameChain` 唯一提供。
+   `RobotRuntimeConfig` 持有；机械臂地址和端口通过 `RMConnectionConfig` 构造时单次注入
+   `RMCommand`。不要在 `main_rm75.cpp` 重复覆盖常规算法参数；该文件负责启动
+   编排和硬件 I/O，标定坐标转换由 `CalibratedFrameChain` 唯一提供。调用者不得访问
+   `RMCommand` 的 socket、协议缓冲或内部命令/错误缓存，只能使用其公共方法和快照。
 6. 保持生产模块边界：传感器协议/标定补偿属于 `force_sensor`，接触点算法属于
-   `contact_sensing`，运动学与控制属于 `realman_kinematics`/`rm75_control`，Redis I/O 属于
+   `contact_sensing`，FK/Jacobian 属于 `realman_kinematics`，IK、限位和奇异拒绝属于
+   `Rm75ServoPlanner`，Redis I/O 属于
    `redis_bridge`，异步 CSV 与 summary v2 属于 `rm75_runtime_logging`，`main_rm75` 只提交周期
    快照、最终运行结果并完成编排。Stop 确认重试和析构兜底属于 `realman_transport`，带 Probe
-   TCP 的物理静止判定及 runtime tare 采集/稳定门属于 `CalibratedFrameChain`；不得在入口复制
-   这些安全路径或 tare 阈值。
+   TCP 的物理静止判定属于 `CalibratedFrameChain`；传感器串口只能由 `ForceSensorReader`
+   持有，不得恢复同步 `CLinuxSerial` 旁路；不得在入口复制这些安全路径。`RMKinematics` 的
+   非零 MDH 参数和关节限位是内部模型状态，恒零模型参数不得重复保存为可变字段；外部只能
+   通过只读接口取得限位。传感器协议统计属于离线 parser seam，不得在 reader 热路径恢复
+   无消费的聚合统计镜像。
 7. `infer/Robot/tests/legacy/six_axis/` 仅作旧六轴参考，不得重新接入 RM75 七轴生产入口。
-   `infer/Robot/tests/tools/` 是会接触硬件的维护工具，不等同于自动化单元测试。
+   这些历史源码不保证针对当前生产头文件编译；生产与 maintenance 调用必须使用返回
+   `RMResult` 的 `RMCommand::Try*` API。`infer/Robot/tests/tools/` 是会接触硬件的维护工具，
+   不等同于自动化单元测试。
 8. 不得在 `main_rm75` 运行期间删除或清理 `infer/Robot/build/logs/`。修改控制参数时每次只改
    一个参数或门控条件，并保留对应 CSV 与 summary 供追溯。
 9. 不要提交生成的构建产物、运行日志、模型权重或本机设备路径产生的临时文件。不要覆盖用户

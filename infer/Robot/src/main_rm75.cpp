@@ -17,7 +17,6 @@
 #include <cctype>
 #include <cmath>
 #include <csignal>
-#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <iostream>
@@ -45,6 +44,14 @@ namespace {
 
 std::atomic<bool> g_stop_requested{false};
 // ServoJ 由异步发送线程执行；这里限制相邻两次真实 socket 写入的最小间隔。
+constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
+// RM75 pose feedback is quantized at roughly 0.001 rad. At the legacy
+// 188 mm probe TCP this can appear as about 0.19 mm of endpoint motion even
+// while joint feedback and the physical arm remain stationary. Keep the
+// independent orientation gate and allow a consistent endpoint envelope.
+constexpr double kRuntimeTareMaximumTcpSpanMm = 0.35;
+// RM75 静止反馈存在约 0.08° 的正常微抖；使用 0.10° 仍远小于真实姿态运动。
+constexpr double kRuntimeTareMaximumOrientationSpanDeg = 0.10;
 constexpr double kProvisionalTareMaximumForceNormN = 5.0;
 constexpr double kProvisionalTareMaximumTorqueNormNm = 0.5;
 // Provisional commissioning remains gated by the no-contact tare, old
@@ -301,6 +308,169 @@ double WrappedAngleDifference(double lhs, double rhs) {
 bool ServoOutstanding(const ServoSendSnapshot& status) {
     return status.submitted_sequence
         > std::max(status.sent_sequence, status.discarded_sequence);
+}
+
+struct RuntimeTareResult {
+    bool valid = false;
+    std::size_t samples = 0;
+    Eigen::Matrix<double, 6, 1> sensor_offset =
+        Eigen::Matrix<double, 6, 1>::Zero();
+    double maximum_force_norm_n = 0.0;
+    double maximum_torque_norm_nm = 0.0;
+    double maximum_force_deviation_n = 0.0;
+    double maximum_torque_deviation_nm = 0.0;
+    double maximum_joint_span_deg = 0.0;
+    double maximum_tcp_span_mm = 0.0;
+    double maximum_orientation_span_deg = 0.0;
+    std::string error;
+};
+
+RuntimeTareResult CollectRuntimeTare(
+    ForceSensorReader& force_reader,
+    RMStateReader& state_reader,
+    const ForceCalibration& calibration,
+    const CalibratedFrameChain& frame_chain,
+    int seconds,
+    double raw_force_limit_n,
+    double raw_torque_limit_nm) {
+    // tare 采集流程：
+    // 1. 只接受新鲜、校验正确且未超量程的传感器帧；
+    // 2. 使用机器人当前姿态执行零偏、工具重力和质心力矩补偿；
+    // 3. 同时确认七关节、探头 TCP 和姿态在整个窗口内保持静止；
+    // 4. 取补偿后 wrench 均值作为本次运行的固定传感器系偏置。
+    RuntimeTareResult result;
+    std::vector<Eigen::Matrix<double, 6, 1>> samples;
+    samples.reserve(static_cast<std::size_t>(seconds * 50));
+    std::uint64_t last_sensor_sequence = 0;
+    RobotStateSnapshot anchor;
+    bool have_anchor = false;
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds(seconds);
+
+    while (!g_stop_requested.load()
+           && std::chrono::steady_clock::now() < deadline) {
+        const RobotStateSnapshot robot = state_reader.Latest();
+        const WrenchSample sample = force_reader.LatestSample();
+        const RMResult reader_result = state_reader.LastResult();
+        if (!robot.valid || robot.stale || !reader_result
+            || robot.arm_err != 0 || robot.sys_err != 0) {
+            result.error = "runtime tare lost healthy robot feedback";
+            return result;
+        }
+        if (!sample.valid || sample.stale || !sample.checksum_valid
+            || sample.io_status != ForceSensorIoStatus::kStreaming
+            || sample.io_error != 0) {
+            result.error = "runtime tare lost healthy force-sensor data";
+            return result;
+        }
+        if (sample.sequence == 0 || sample.sequence == last_sensor_sequence) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        last_sensor_sequence = sample.sequence;
+        const Eigen::Matrix<double, 6, 1> raw =
+            ArrayToEigen(sample.wrench_si);
+        if (!RawWrenchWithinLimits(raw,
+                                   raw_force_limit_n,
+                                   raw_torque_limit_nm)) {
+            result.error = "runtime tare rejected raw sensor overrange";
+            return result;
+        }
+        const CompensatedWrench compensated = calibration.Compensate(
+            raw, frame_chain.RotationBaseFromTool(robot.pose));
+        if (!compensated.valid) {
+            result.error = "runtime tare compensation failed: "
+                + compensated.error;
+            return result;
+        }
+        if (!have_anchor) {
+            anchor = robot;
+            have_anchor = true;
+        }
+        result.maximum_joint_span_deg = std::max(
+            result.maximum_joint_span_deg,
+            MaximumWrappedJointDeltaDeg(robot.joints, anchor.joints));
+        result.maximum_tcp_span_mm = std::max(
+            result.maximum_tcp_span_mm,
+            (frame_chain.ProbeTcpBase(robot.pose)
+             - frame_chain.ProbeTcpBase(anchor.pose)).norm()
+                * 1000.0);
+        const Eigen::Matrix3d orientation_delta =
+            frame_chain.ArmTipOrientationDelta(robot.pose, anchor.pose);
+        result.maximum_orientation_span_deg = std::max(
+            result.maximum_orientation_span_deg,
+            Eigen::AngleAxisd(orientation_delta).angle() * 180.0 / M_PI);
+        // 这里记录的是“应用本次 tare 之前”的补偿残差。启动门使用它判断
+        // 当前装配/姿态是否仍与标定模型相符，不能靠大幅 tare 掩盖错误标定。
+        result.maximum_force_norm_n = std::max(
+            result.maximum_force_norm_n,
+            compensated.sensor.head<3>().norm());
+        result.maximum_torque_norm_nm = std::max(
+            result.maximum_torque_norm_nm,
+            compensated.sensor.tail<3>().norm());
+        samples.push_back(compensated.sensor);
+    }
+
+    result.samples = samples.size();
+    const std::size_t minimum_samples =
+        static_cast<std::size_t>(seconds * 20);
+    if (g_stop_requested.load()) {
+        result.error = "runtime tare interrupted";
+        return result;
+    }
+    if (samples.size() < minimum_samples) {
+        result.error = "runtime tare collected too few fresh samples";
+        return result;
+    }
+    for (const auto& sample : samples) result.sensor_offset += sample;
+    result.sensor_offset /= static_cast<double>(samples.size());
+    for (const auto& sample : samples) {
+        result.maximum_force_deviation_n = std::max(
+            result.maximum_force_deviation_n,
+            (sample.head<3>() - result.sensor_offset.head<3>()).norm());
+        result.maximum_torque_deviation_nm = std::max(
+            result.maximum_torque_deviation_nm,
+            (sample.tail<3>() - result.sensor_offset.tail<3>()).norm());
+    }
+    if (result.maximum_joint_span_deg > kRuntimeTareMaximumJointSpanDeg
+        || result.maximum_tcp_span_mm > kRuntimeTareMaximumTcpSpanMm
+        || result.maximum_orientation_span_deg
+               > kRuntimeTareMaximumOrientationSpanDeg) {
+        std::ostringstream message;
+        message << "runtime tare requires a stationary robot"
+                << " (joint_span_deg=" << result.maximum_joint_span_deg
+                << ", limit=" << kRuntimeTareMaximumJointSpanDeg
+                << "; tcp_span_mm=" << result.maximum_tcp_span_mm
+                << ", limit=" << kRuntimeTareMaximumTcpSpanMm
+                << "; orientation_span_deg="
+                << result.maximum_orientation_span_deg
+                << ", limit=" << kRuntimeTareMaximumOrientationSpanDeg
+                << ')';
+        result.error = message.str();
+        return result;
+    }
+    if (result.maximum_force_deviation_n > 0.25
+        || result.maximum_torque_deviation_nm > 0.02) {
+        std::ostringstream message;
+        message << "runtime tare residual wrench is not stable"
+                << " (force_deviation_n="
+                << result.maximum_force_deviation_n
+                << ", limit=0.25; torque_deviation_nm="
+                << result.maximum_torque_deviation_nm
+                << ", limit=0.02)";
+        result.error = message.str();
+        return result;
+    }
+    result.valid = true;
+    return result;
+}
+
+void ApplyRuntimeTare(const Eigen::Matrix<double, 6, 1>& sensor_offset,
+                      CompensatedWrench& compensated) {
+    // 运行时 tare 只消除当前悬空姿态下的固定偏置；它不能替代跨姿态的重力、
+    // 工具质量和质心标定。
+    if (!compensated.valid) return;
+    compensated.sensor -= sensor_offset;
 }
 
 // On this RM75 installation the logical Tool axes are coincident with the
@@ -588,15 +758,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    RMCommand command;
+    RMCommand command(RMConnectionConfig{
+        options.robot_ip,
+        options.robot_port,
+    });
     std::unique_ptr<RMStateReader> state_reader;
     BestEffortStopGuard execute_stop_guard;
     RobotStateSnapshot robot_state;
     if (!options.simulate) {
-        command.quiet = true;
-        command.rlm_port = options.robot_port;
-        std::strncpy(command.rlm_ip, options.robot_ip.c_str(), sizeof(command.rlm_ip) - 1);
-        command.rlm_ip[sizeof(command.rlm_ip) - 1] = '\0';
+        command.SetQuiet(true);
         RMResult result = command.TryConnectTCPSocket();
         if (!result) {
             std::cerr << "Robot connection failed: " << result.message << '\n';
@@ -676,7 +846,6 @@ int main(int argc, char** argv) {
             *state_reader,
             calibration,
             frame_chain,
-            g_stop_requested,
             warmup_seconds,
             safety_config.raw_force_limit_n,
             safety_config.raw_torque_limit_nm);
@@ -735,7 +904,6 @@ int main(int argc, char** argv) {
             *state_reader,
             calibration,
             frame_chain,
-            g_stop_requested,
             options.tare_no_contact_s,
             safety_config.raw_force_limit_n,
             safety_config.raw_torque_limit_nm);
@@ -1153,8 +1321,8 @@ int main(int argc, char** argv) {
                                                     model_joints[joint]))
                         * 180.0 / M_PI);
                 const double lower_margin = robot_state.joints[joint]
-                    - planner.Kinematics().joint_min[joint];
-                const double upper_margin = planner.Kinematics().joint_max[joint]
+                    - planner.Kinematics().JointMinimums()[joint];
+                const double upper_margin = planner.Kinematics().JointMaximums()[joint]
                     - robot_state.joints[joint];
                 minimum_actual_joint_margin_deg = std::min(
                     minimum_actual_joint_margin_deg,

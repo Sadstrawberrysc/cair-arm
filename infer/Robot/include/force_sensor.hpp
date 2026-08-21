@@ -12,14 +12,6 @@
 
 #include "haptron_modbus.hpp"
 
-#ifndef UINT
-typedef unsigned int UINT;
-#endif
-
-#ifndef UCHAR
-typedef unsigned char UCHAR;
-#endif
-
 // Order used by the sensor wire protocol and by WrenchSample::wrench_si.
 enum WrenchAxis : std::size_t {
     kForceX = 0,
@@ -66,11 +58,9 @@ struct WrenchSample {
     int io_error{0};
 
     bool IsStale(std::chrono::milliseconds maximum_age) const noexcept;
-    bool IsStaleAt(std::chrono::steady_clock::time_point now,
-                   std::chrono::milliseconds maximum_age) const noexcept;
 };
 
-/** Parser statistics reset on Reset(); reader statistics reset on Start(). */
+/** Parser statistics reset on Reset(). */
 struct ForceSensorStatistics {
     std::uint64_t bytes_received{0};
     std::uint64_t valid_frames{0};
@@ -82,14 +72,6 @@ struct ForceSensorStatistics {
     std::size_t buffered_bytes{0};
     std::size_t peak_buffered_bytes{0};
 
-    std::uint64_t read_calls{0};
-    std::uint64_t read_timeouts{0};
-    std::uint64_t requests_sent{0};
-    std::uint64_t response_timeouts{0};
-    std::uint64_t exception_responses{0};
-    std::uint64_t protocol_errors{0};
-    std::uint64_t io_errors{0};
-    ForceSensorIoStatus io_status{ForceSensorIoStatus::kDisconnected};
 };
 
 /**
@@ -120,8 +102,6 @@ public:
 
     void Reset();
     ForceSensorStatistics statistics() const noexcept;
-    std::size_t buffered_bytes() const noexcept;
-    std::size_t maximum_buffer_bytes() const noexcept;
 
     static std::uint8_t ComputeChecksum(const std::uint8_t* data,
                                         std::size_t length) noexcept;
@@ -168,13 +148,9 @@ public:
 
     bool Start();
     void Stop() noexcept;
-    bool IsRunning() const noexcept;
-    bool IsOpen() const noexcept;
 
     WrenchSample LatestSample() const;
-    ForceSensorStatistics Statistics() const;
     std::string LastError() const;
-    const ForceSensorConfig& config() const noexcept;
 
 private:
     void WorkerLoop();
@@ -183,9 +159,6 @@ private:
     void PublishIoStatus(ForceSensorIoStatus status,
                          int error_number,
                          const std::string& message);
-    void CopyParserStatistics(const ForceSensorStatistics& parser_statistics);
-    void CopyModbusStatistics(
-        const HaptronModbusStatistics& parser_statistics);
     void ClosePort() noexcept;
 
     ForceSensorConfig config_;
@@ -199,49 +172,5 @@ private:
     mutable std::mutex lifecycle_mutex_;
     mutable std::mutex state_mutex_;
     WrenchSample latest_sample_;
-    ForceSensorStatistics statistics_;
     std::string last_error_;
-};
-
-/**
- * Legacy serial API retained for main_nomove.cpp. New code should use
- * ForceSensorReader so samples cannot be torn between threads.
- */
-class CLinuxSerial {
-public:
-    float sensor[6]{};
-
-    CLinuxSerial();
-    explicit CLinuxSerial(UINT portNo, UINT baudRate = 115200);
-    explicit CLinuxSerial(const std::string& device,
-                          UINT baudRate = 115200);
-    ~CLinuxSerial();
-
-    CLinuxSerial(const CLinuxSerial&) = delete;
-    CLinuxSerial& operator=(const CLinuxSerial&) = delete;
-
-    bool InitPort(UINT portNo = 0, UINT baudRate = 115200);
-    bool InitPort(const std::string& device, UINT baudRate = 115200);
-    void ProcessSensorData();
-
-    bool IsOpen() const noexcept;
-    unsigned char CheckSum(unsigned char* buf, const int len);
-    unsigned char CheckSum(const unsigned char* buf, const int len) const;
-
-    UINT ReadData(UCHAR* data, UINT length);
-    UINT WriteData(UCHAR* data, UINT length);
-    UINT GetBytesInCom();
-
-    WrenchSample LatestSample(
-        std::chrono::milliseconds stale_after =
-            std::chrono::milliseconds(200)) const;
-    ForceSensorStatistics Statistics() const;
-
-private:
-    void ClosePort() noexcept;
-
-    int m_iSerialID{-1};
-    ForceSensorFrameParser parser_;
-    mutable std::mutex state_mutex_;
-    WrenchSample latest_sample_;
 };
