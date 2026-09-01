@@ -28,7 +28,7 @@ dry-run、标定或真机验收。
 ```bash
 redis-cli -h 127.0.0.1 -p 7777 ping
 # 没有返回 PONG 时再启动
-redis-server --bind 127.0.0.1 --port 7777 --daemonize yes
+    redis-server --bind 127.0.0.1 --port 7777 --daemonize yes
 ```
 ## 3. 启动 main_rm75
 
