@@ -38,6 +38,7 @@ struct Options {
     int velocity = 1;
     std::string target_pose_text;
     std::string target_position_text;
+    std::string target_inward_normal_text;
     std::string artery_path_base;
     std::string tool_calibration;
     double max_joint_delta_deg = 60.0;
@@ -47,6 +48,7 @@ struct Options {
     bool inspect_transform_only = false;
     bool confirm_single_movej = false;
     bool execute = false;
+    bool controller_movej_p = false;
 };
 
 struct ArteryTarget {
@@ -66,17 +68,24 @@ void PrintUsage(const char* program) {
         << "       --tool-calibration PATH [--ip A.B.C.D] [--port PORT]\n"
         << "       [--velocity 1..5] [--max-joint-delta-deg DEG]\n"
         << "       [--inspect-transform-only]\n"
+        << "       [--controller-movej-p] (initial positioning via controller IK)\n"
+        << "       [--target-inward-normal-base nx,ny,nz] (Base-position only)\n"
         << "       [--execute --confirm-single-movej]\n\n"
         << "Moves the RM75 so the Probe TCP reaches one complete pose. The target\n"
         << "is Base->Probe_TCP: x/y/z in metres and controller ZYX rx/ry/rz in\n"
         << "radians. Probe TCP axes are the calibrated physical Tool axes.\n"
         << "Base-position mode preserves the startup Probe TCP orientation and\n"
         << "uses the supplied x/y/z directly, without a position offset.\n"
+        << "With an inward normal, +Tool-Z aligns to it by the shortest rotation\n"
+        << "from startup orientation; an opposite direction uses startup Tool-X.\n"
         << "Artery-path mode implicitly selects the first point, offsets 50 mm\n"
         << "along its outward normal, and preserves the startup Probe TCP\n"
         << "orientation. No point, offset, or orientation option is exposed.\n"
         << "Default mode connects and plans but sends no motion command. Execution\n"
         << "requires a verified tool chain and both explicit execution flags.\n";
+    std::cout << "Controller MoveJ_P mode skips local IK and joint/path prechecks.\n"
+              << "Its dry-run prints the target only; reachability is not checked.\n"
+              << "Joint-delta and final-joint-error options do not apply in this mode.\n";
 }
 
 bool ParseInt(const char* text, int& value) {
@@ -177,6 +186,10 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* value = need_value(arg);
             if (!value) return false;
             options.target_position_text = value;
+        } else if (arg == "--target-inward-normal-base") {
+            const char* value = need_value(arg);
+            if (!value) return false;
+            options.target_inward_normal_text = value;
         } else if (arg == "--artery-path-base") {
             const char* value = need_value(arg);
             if (!value) return false;
@@ -199,6 +212,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             if (!value || !ParseDouble(value, options.max_final_joint_error_deg)) return false;
         } else if (arg == "--inspect-transform-only") {
             options.inspect_transform_only = true;
+        } else if (arg == "--controller-movej-p") {
+            options.controller_movej_p = true;
         } else if (arg == "--confirm-single-movej") {
             options.confirm_single_movej = true;
         } else if (arg == "--execute") {
@@ -227,6 +242,15 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         return false;
     }
     Eigen::Vector3d parsed_position = Eigen::Vector3d::Zero();
+    if (!options.target_inward_normal_text.empty()) {
+        Eigen::Vector3d normal;
+        if (!base_position_mode
+            || !ParseVector3(options.target_inward_normal_text, normal)
+            || !std::isfinite(normal.norm()) || normal.norm() < 1e-12) {
+            std::cerr << "Inward normal requires Base-position mode and a finite nonzero vector\n";
+            return false;
+        }
+    }
     if (base_position_mode
         && !ParseVector3(options.target_position_text, parsed_position)) {
         std::cerr << "Base target position must contain 3 finite, "
@@ -448,6 +472,30 @@ void PrintJoints(const char* label,
     std::cout << "]\n";
 }
 
+Eigen::Matrix3d AlignProbeZToNormal(const Eigen::Matrix3d& startup,
+                                   const Eigen::Vector3d& inward) {
+    const Eigen::Vector3d z = inward.normalized();
+    const Eigen::Vector3d old_z = startup.col(2);
+    const Eigen::Vector3d cross = old_z.cross(z);
+    const double sine = cross.norm();
+    const double cosine = std::clamp(old_z.dot(z), -1.0, 1.0);
+    Eigen::Matrix3d delta = Eigen::Matrix3d::Identity();
+    if (sine > 1e-12) {
+        delta = Eigen::AngleAxisd(std::atan2(sine, cosine), cross / sine).toRotationMatrix();
+    } else if (cosine < 0.0) {
+        delta = Eigen::AngleAxisd(M_PI, startup.col(0)).toRotationMatrix();
+    }
+    // Re-orthogonalize against the exact target axis, including near-antiparallel
+    // inputs where the cross-product rotation axis loses numerical precision.
+    const Eigen::Vector3d rotated_x = delta * startup.col(0);
+    const Eigen::Vector3d x = (rotated_x - z * z.dot(rotated_x)).normalized();
+    Eigen::Matrix3d result;
+    result.col(0) = x;
+    result.col(1) = z.cross(x);
+    result.col(2) = z;
+    return result;
+}
+
 Eigen::Matrix<double, 6, 1> ArmTipPoseForProbeTarget(
     const Eigen::Matrix<double, 6, 1>& target_probe_pose,
     const CalibratedFrameChain& frame_chain) {
@@ -624,7 +672,14 @@ int main(int argc, char** argv) {
     } else if (base_position_mode) {
         std::cout << "target_source: explicit_base_position\n";
         PrintVector("target_probe_tcp_base_m", target_probe_pose.head<3>());
-        std::cout << "target_orientation_source: startup_probe_tcp\n";
+        std::cout << "target_orientation_source: "
+                  << (options.target_inward_normal_text.empty()
+                      ? "startup_probe_tcp" : "inward_normal_minimum_rotation") << "\n";
+        if (!options.target_inward_normal_text.empty()) {
+            Eigen::Vector3d normal;
+            (void)ParseVector3(options.target_inward_normal_text, normal);
+            PrintVector("target_inward_normal_base", normal.normalized());
+        }
     } else {
         std::cout << "target_source: explicit_pose\n";
         PrintPose("target_probe_tcp", target_probe_pose);
@@ -682,114 +737,135 @@ int main(int argc, char** argv) {
                 frame_chain.ProbeTcpBase(current_controller_pose));
 
     if (preserve_startup_orientation) {
-        target_probe_pose.tail<3>() = ControllerEuler(
-            frame_chain.RotationBaseFromTool(current_controller_pose));
+        Eigen::Matrix3d target_rotation =
+            frame_chain.RotationBaseFromTool(current_controller_pose);
+        if (!options.target_inward_normal_text.empty()) {
+            Eigen::Vector3d normal;
+            (void)ParseVector3(options.target_inward_normal_text, normal);
+            target_rotation = AlignProbeZToNormal(target_rotation, normal);
+            PrintVector("target_tool_z_base", target_rotation.col(2));
+        }
+        target_probe_pose.tail<3>() = ControllerEuler(target_rotation);
         target_controller_armtip_pose =
             ArmTipPoseForProbeTarget(target_probe_pose, frame_chain);
         PrintPose("target_probe_tcp", target_probe_pose);
         PrintPose("target_controller_armtip", target_controller_armtip_pose);
     }
 
-    Rm75ServoPlannerConfig planner_config;
-    // Maintenance-only warning margin; production defaults stay unchanged.
-    planner_config.joint_limit_warning_deg = 3.0;
-    Rm75ServoPlanner planner(planner_config);
-    std::cout << "joint_limit_warning_deg: "
-              << planner.Config().joint_limit_warning_deg << "\n";
-    const Eigen::Matrix<double, 6, 1> current_model_pose =
-        planner.PoseFromJoints(current_joints);
-    const Eigen::Matrix3d current_controller_rotation =
-        frame_chain.RotationBaseFromArmTip(current_controller_pose);
-    const Eigen::Matrix3d current_model_rotation =
-        frame_chain.RotationBaseFromArmTip(current_model_pose);
-    const double model_position_error =
-        (current_controller_pose.head<3>() - current_model_pose.head<3>()).norm();
-    const double model_orientation_error = RotationDifferenceDeg(
-        current_controller_rotation, current_model_rotation);
-    std::cout << "controller_model_position_difference_mm: "
-              << model_position_error * 1000.0 << "\n";
-    std::cout << "controller_model_orientation_difference_deg: "
-              << model_orientation_error << "\n";
-    if (model_position_error > kMaximumControllerModelPositionErrorM
-        || model_orientation_error > kMaximumControllerModelOrientationErrorDeg) {
-        std::cerr << "Controller pose and local model disagree beyond the safety gate\n";
-        return 4;
-    }
-
-    const Eigen::Vector3d controller_minus_model =
-        current_controller_pose.head<3>() - current_model_pose.head<3>();
-    const Eigen::Matrix3d controller_from_model_rotation =
-        current_controller_rotation * current_model_rotation.transpose();
-    Eigen::Matrix<double, 6, 1> desired_model_pose;
-    desired_model_pose.head<3>() =
-        target_controller_armtip_pose.head<3>() - controller_minus_model;
-    const Eigen::Matrix3d desired_controller_rotation =
-        RotationBaseFromControllerEuler(target_controller_armtip_pose.tail<3>());
-    desired_model_pose.tail<3>() = ControllerEuler(
-        controller_from_model_rotation.transpose() * desired_controller_rotation);
-
     Eigen::Matrix<double, 7, 1> target_joints;
-    Eigen::Matrix<double, 6, 1> target_model_pose;
-    int ik_iterations = 0;
-    if (!SolveTarget(planner, current_joints, desired_model_pose,
-                     target_joints, target_model_pose, ik_iterations, error)) {
-        std::cerr << error << "\n";
-        return 4;
-    }
+    if (options.controller_movej_p) {
+        std::cout << "motion_backend: controller_movej_p\n"
+                  << "motion_purpose: initial_positioning\n"
+                  << "Local IK, model agreement, joint-margin, singularity and joint-path prechecks are not performed.\n"
+                  << "Controller-selected target joints are unavailable; joint-delta gates do not apply.\n";
+    } else {
+        Rm75ServoPlannerConfig planner_config;
+        // Maintenance-only warning margin; production defaults stay unchanged.
+        planner_config.joint_limit_warning_deg = 3.0;
+        Rm75ServoPlanner planner(planner_config);
+        std::cout << "joint_limit_warning_deg: "
+                  << planner.Config().joint_limit_warning_deg << "\n";
+        const Eigen::Matrix<double, 6, 1> current_model_pose =
+            planner.PoseFromJoints(current_joints);
+        const Eigen::Matrix3d current_controller_rotation =
+            frame_chain.RotationBaseFromArmTip(current_controller_pose);
+        const Eigen::Matrix3d current_model_rotation =
+            frame_chain.RotationBaseFromArmTip(current_model_pose);
+        const double model_position_error =
+            (current_controller_pose.head<3>() - current_model_pose.head<3>()).norm();
+        const double model_orientation_error = RotationDifferenceDeg(
+            current_controller_rotation, current_model_rotation);
+        std::cout << "controller_model_position_difference_mm: "
+                  << model_position_error * 1000.0 << "\n";
+        std::cout << "controller_model_orientation_difference_deg: "
+                  << model_orientation_error << "\n";
+        if (model_position_error > kMaximumControllerModelPositionErrorM
+            || model_orientation_error > kMaximumControllerModelOrientationErrorDeg) {
+            std::cerr << "Controller pose and local model disagree beyond the safety gate\n";
+            return 4;
+        }
 
-    const double maximum_joint_delta_deg =
-        MaximumWrappedJointDeltaDeg(target_joints, current_joints);
-    std::cout << "ik_iterations: " << ik_iterations << "\n";
-    std::cout << "maximum_joint_delta_deg_actual: "
-              << maximum_joint_delta_deg << "\n";
-    PrintJoints("target_joints7", target_joints);
-    if (maximum_joint_delta_deg > options.max_joint_delta_deg) {
-        std::cerr << "Target exceeds max-joint-delta-deg gate\n";
-        return 4;
-    }
+        const Eigen::Vector3d controller_minus_model =
+            current_controller_pose.head<3>() - current_model_pose.head<3>();
+        const Eigen::Matrix3d controller_from_model_rotation =
+            current_controller_rotation * current_model_rotation.transpose();
+        Eigen::Matrix<double, 6, 1> desired_model_pose;
+        desired_model_pose.head<3>() =
+            target_controller_armtip_pose.head<3>() - controller_minus_model;
+        const Eigen::Matrix3d desired_controller_rotation =
+            RotationBaseFromControllerEuler(target_controller_armtip_pose.tail<3>());
+        desired_model_pose.tail<3>() = ControllerEuler(
+            controller_from_model_rotation.transpose() * desired_controller_rotation);
 
-    const Eigen::Matrix3d planned_controller_rotation =
-        controller_from_model_rotation
-        * RotationBaseFromControllerEuler(target_model_pose.tail<3>());
-    const Eigen::Vector3d planned_controller_armtip =
-        target_model_pose.head<3>() + controller_minus_model;
-    const Eigen::Vector3d planned_probe_position = planned_controller_armtip
-        + planned_controller_rotation * frame_chain.ProbeTcpArmTipM();
-    const Eigen::Matrix3d planned_tool_rotation = planned_controller_rotation
-        * frame_chain.RotationArmTipFromTool();
-    const double planned_position_error_mm = 1000.0
-        * (planned_probe_position - target_probe_pose.head<3>()).norm();
-    const double planned_orientation_error_deg = RotationDifferenceDeg(
-        planned_tool_rotation,
-        RotationBaseFromControllerEuler(target_probe_pose.tail<3>()));
-    PrintVector("planned_probe_tcp_base_m", planned_probe_position);
-    std::cout << "planned_probe_tcp_position_error_mm: "
-              << planned_position_error_mm << "\n";
-    std::cout << "planned_probe_tcp_orientation_error_deg: "
-              << planned_orientation_error_deg << "\n";
-    if (planned_position_error_mm > 0.6 || planned_orientation_error_deg > 0.2) {
-        std::cerr << "IK target exceeds the fixed planning residual gate\n";
-        return 4;
-    }
+        Eigen::Matrix<double, 6, 1> target_model_pose;
+        int ik_iterations = 0;
+        if (!SolveTarget(planner, current_joints, desired_model_pose,
+                         target_joints, target_model_pose, ik_iterations, error)) {
+            std::cerr << error << "\n";
+            return 4;
+        }
 
-    double minimum_margin_deg = 0.0;
-    if (!ValidateMoveJSegment(planner, current_joints, target_joints,
-                              minimum_margin_deg, error)) {
-        std::cerr << error << "\n";
-        return 4;
+        const double maximum_joint_delta_deg =
+            MaximumWrappedJointDeltaDeg(target_joints, current_joints);
+        std::cout << "ik_iterations: " << ik_iterations << "\n";
+        std::cout << "maximum_joint_delta_deg_actual: "
+                  << maximum_joint_delta_deg << "\n";
+        PrintJoints("target_joints7", target_joints);
+        if (maximum_joint_delta_deg > options.max_joint_delta_deg) {
+            std::cerr << "Target exceeds max-joint-delta-deg gate\n";
+            return 4;
+        }
+
+        const Eigen::Matrix3d planned_controller_rotation =
+            controller_from_model_rotation
+            * RotationBaseFromControllerEuler(target_model_pose.tail<3>());
+        const Eigen::Vector3d planned_controller_armtip =
+            target_model_pose.head<3>() + controller_minus_model;
+        const Eigen::Vector3d planned_probe_position = planned_controller_armtip
+            + planned_controller_rotation * frame_chain.ProbeTcpArmTipM();
+        const Eigen::Matrix3d planned_tool_rotation = planned_controller_rotation
+            * frame_chain.RotationArmTipFromTool();
+        const double planned_position_error_mm = 1000.0
+            * (planned_probe_position - target_probe_pose.head<3>()).norm();
+        const double planned_orientation_error_deg = RotationDifferenceDeg(
+            planned_tool_rotation,
+            RotationBaseFromControllerEuler(target_probe_pose.tail<3>()));
+        PrintVector("planned_probe_tcp_base_m", planned_probe_position);
+        std::cout << "planned_probe_tcp_position_error_mm: "
+                  << planned_position_error_mm << "\n";
+        std::cout << "planned_probe_tcp_orientation_error_deg: "
+                  << planned_orientation_error_deg << "\n";
+        if (planned_position_error_mm > 0.6 || planned_orientation_error_deg > 0.2) {
+            std::cerr << "IK target exceeds the fixed planning residual gate\n";
+            return 4;
+        }
+
+        double minimum_margin_deg = 0.0;
+        if (!ValidateMoveJSegment(planner, current_joints, target_joints,
+                                  minimum_margin_deg, error)) {
+            std::cerr << error << "\n";
+            return 4;
+        }
+        std::cout << "movej_segment_samples: 201\n";
+        std::cout << "movej_minimum_joint_margin_deg: "
+                  << minimum_margin_deg << "\n";
     }
-    std::cout << "movej_segment_samples: 201\n";
-    std::cout << "movej_minimum_joint_margin_deg: "
-              << minimum_margin_deg << "\n";
     std::cout << "WARNING: no environment collision model is available.\n";
 
     if (!options.execute) {
+        if (options.controller_movej_p) {
+            std::cout << "Target preview only: controller IK and reachability have not been checked.\n";
+        }
         std::cout << "Dry-run only. Exactly zero motion commands were sent.\n";
         return 0;
     }
 
-    std::cout << "Executing exactly one MoveJ to the validated IK target.\n";
-    const RMResult move_result = command.TryMoveJ(target_joints, options.velocity);
+    std::cout << (options.controller_movej_p
+        ? "Executing exactly one controller MoveJ_P for initial positioning.\n"
+        : "Executing exactly one MoveJ to the validated IK target.\n");
+    const RMResult move_result = options.controller_movej_p
+        ? command.TryMoveJP(target_controller_armtip_pose, options.velocity)
+        : command.TryMoveJ(target_joints, options.velocity);
     if (!move_result) {
         std::cerr << "MoveJ failed: " << move_result.message << "\n";
         (void)command.TryStopMotion(1000);
@@ -814,14 +890,17 @@ int main(int argc, char** argv) {
         final_tool_rotation,
         RotationBaseFromControllerEuler(target_probe_pose.tail<3>()));
     const double final_joint_error_deg =
-        MaximumWrappedJointDeltaDeg(final_joints, target_joints);
+        options.controller_movej_p ? 0.0
+        : MaximumWrappedJointDeltaDeg(final_joints, target_joints);
     PrintVector("final_probe_tcp_base_m", final_probe_position);
     std::cout << "final_probe_tcp_position_error_mm: "
               << final_position_error_mm << "\n";
     std::cout << "final_probe_tcp_orientation_error_deg: "
               << final_orientation_error_deg << "\n";
-    std::cout << "maximum_final_joint_error_deg: "
-              << final_joint_error_deg << "\n";
+    if (!options.controller_movej_p) {
+        std::cout << "maximum_final_joint_error_deg: "
+                  << final_joint_error_deg << "\n";
+    }
     if (final_position_error_mm > options.max_final_position_error_mm
         || final_orientation_error_deg
             > options.max_final_orientation_error_deg

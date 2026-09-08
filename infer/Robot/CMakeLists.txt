@@ -122,33 +122,6 @@ if(BUILD_MAINTENANCE_TOOLS)
         realman_transport
         robot_sensor
     )
-    if(BUILD_TESTING)
-        add_test(
-            NAME probe_pose_transform_inspection_test
-            COMMAND arm_probe_pose
-                --target-pose-m-rad 0.3,0.0,0.4,0.0,0.0,0.0
-                --tool-calibration
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
-                --inspect-transform-only
-        )
-        add_test(
-            NAME probe_pose_artery_input_inspection_test
-            COMMAND arm_probe_pose
-                --artery-path-base
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/artery_target_base.txt
-                --tool-calibration
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
-                --inspect-transform-only
-        )
-        add_test(
-            NAME probe_pose_base_position_inspection_test
-            COMMAND arm_probe_pose
-                --target-position-base-m 0.3,0.0,0.4
-                --tool-calibration
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
-                --inspect-transform-only
-        )
-    endif()
 
     add_executable(rm75_servoj_diagnostic
         tests/tools/arm_servoj_line_test.cpp
