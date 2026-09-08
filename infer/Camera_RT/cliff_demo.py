@@ -1,3 +1,5 @@
+import atexit
+
 import cv2
 import pyrealsense2 as rs
 import torch
@@ -20,6 +22,16 @@ from common import constants
 from common.utils import strip_prefix_if_present, cam_crop2full, video_to_images
 from common.utils import estimate_focal_length
 from common.imutils import process_image
+
+
+def bottom_first_pixels(pixels):
+    """Order samples by image row, bottom first (not by camera-space Y)."""
+    pixels = np.asarray(pixels)
+    if pixels.ndim != 2 or pixels.shape[1] != 2 or len(pixels) == 0:
+        raise ValueError("sample pixels must be a nonempty Nx2 array")
+    if not np.isfinite(pixels).all():
+        raise ValueError("sample pixels must be finite")
+    return pixels[np.argsort(-pixels[:, 1], kind="stable")]
 
 
 def render_mesh(vertices, faces, translation, focal_length, height, width, device=None, red=True):
@@ -196,6 +208,11 @@ if __name__ == '__main__':
     # Create a config object
     config = rs.config()
 
+    # Configure the streams before starting the pipeline. These are the same
+    # stream requests used previously; only the initialization order changes.
+    config.enable_stream(rs.stream.depth, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color)
+
     # bag file
     # rs.config.enable_device_from_file(config, '/home/olefine/Documents/male_1.bag')
     # profile = pipeline.start(config)
@@ -204,6 +221,14 @@ if __name__ == '__main__':
 
     # # real-time
     profile = pipeline.start(config)
+    def close_camera_resources():
+        try:
+            pipeline.stop()
+        except RuntimeError:
+            pass
+        cv2.destroyAllWindows()
+
+    atexit.register(close_camera_resources)
 
     intr = profile.get_stream(
         rs.stream.color).as_video_stream_profile().get_intrinsics()
@@ -216,11 +241,6 @@ if __name__ == '__main__':
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_scale = depth_sensor.get_depth_scale()
     depth_scale_inv = 1 / depth_scale
-
-    # Configure the pipeline to stream the depth stream
-    # Change this parameters according to the recorded bag file resolution
-    config.enable_stream(rs.stream.depth, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color)
 
     skel_file = 'data/skel_params.pkl'
     artery_file = 'data/artery_params.pkl'
@@ -333,7 +353,7 @@ if __name__ == '__main__':
         image_vis = image_vis.astype(np.uint8)
         image_vis = cv2.cvtColor(image_vis, cv2.COLOR_RGB2BGR)
 
-        artery_pixel_coords = artery_pixel_coords.cpu().numpy()
+        artery_pixel_coords = bottom_first_pixels(artery_pixel_coords.cpu().numpy())
 
         # 像素坐标转换为相机坐标
         artery_camera_coords = kpt_2d_to_3d(artery_pixel_coords, np_depth, intr, depth_scale)
@@ -378,3 +398,9 @@ if __name__ == '__main__':
                 data_save = "{:.3f} {:.3f} {:.3f}\n".format(normal_vector[0],normal_vector[1],normal_vector[2])
                 f.write(data_save)
                 np.savetxt(f, artery_camera_coords, fmt='%.6f')
+
+        if key == 27 or key & 0xFF == ord('q'):
+            break
+
+    close_camera_resources()
+    atexit.unregister(close_camera_resources)

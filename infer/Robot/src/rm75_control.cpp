@@ -1158,6 +1158,7 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
     result.target_joints = current_joints + delta;
     result.joint_delta = delta;
     result.minimum_joint_margin_deg = std::numeric_limits<double>::infinity();
+    int minimum_margin_joint = -1;
     for (int joint = 0; joint < 7; ++joint) {
         if (result.target_joints[joint]
                 < kinematics_.JointMinimums()[joint]
@@ -1174,16 +1175,25 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
             kinematics_.JointMaximums()[joint]
                 - result.target_joints[joint])
             * kRadToDeg;
-        result.minimum_joint_margin_deg =
-            std::min(result.minimum_joint_margin_deg, margin);
+        if (margin < result.minimum_joint_margin_deg) {
+            result.minimum_joint_margin_deg = margin;
+            minimum_margin_joint = joint;
+        }
     }
     result.near_joint_limit =
         result.minimum_joint_margin_deg < config_.joint_limit_warning_deg;
     if (result.minimum_joint_margin_deg < config_.joint_limit_stop_deg) {
         result.error = Rm75PlanError::kJointLimitMargin;
         std::ostringstream detail;
-        detail << "minimum joint margin " << result.minimum_joint_margin_deg
-               << " deg is below stop threshold " << config_.joint_limit_stop_deg;
+        detail << "J" << (minimum_margin_joint + 1)
+               << " target=" << result.target_joints[minimum_margin_joint] * kRadToDeg
+               << " deg, limits=["
+               << kinematics_.JointMinimums()[minimum_margin_joint] * kRadToDeg
+               << ", "
+               << kinematics_.JointMaximums()[minimum_margin_joint] * kRadToDeg
+               << "] deg, minimum margin=" << result.minimum_joint_margin_deg
+               << " deg is below stop threshold="
+               << config_.joint_limit_stop_deg << " deg";
         result.detail = detail.str();
         return result;
     }

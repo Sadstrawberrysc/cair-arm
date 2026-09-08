@@ -53,10 +53,23 @@ python main.py
 
 **camera**
 ```bash
-cd infer/Camera_RT
-conda activate dvpath
+source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
+conda activate camera
+cd /home/cair-jacen/uspilot_ctrl-main/infer/Camera_RT
+python tools/preflight.py --static
+python tools/preflight.py --runtime
+# 只有两级预检均无 BLOCKED 后才启动功能入口
 python cliff_demo.py
 ```
+
+Camera_RT 当前只输出 RealSense 相机光学坐标，不提供已标定的机器人轨迹。环境、资产和
+新机器验证状态见 [Camera_RT 项目指南](infer/Camera_RT/AGENTS.md)。
+
+颈动脉单点链路采用文件快照：Camera_RT 中按 `s` 保存路径，再用 Calibration 的 `convert`
+生成 Base 路径与摘要。Robot 只通过维护工具读取第一点、沿外法向悬停 50 mm 并求解一次
+MoveJ 目标。当前 `arm_probe_pose --artery-path-base ...` 隐式使用首点、50 mm 偏置和启动
+Probe TCP 姿态；先用 `--inspect-transform-only` 做无连接检查，再在现场运行不带 `--execute` 的 dry-run；
+完整命令和当前阻塞见 [Calibration 项目指南](infer/Calibration/AGENTS.md)。
 
 ## 运行xiaokai
 ### redis服务

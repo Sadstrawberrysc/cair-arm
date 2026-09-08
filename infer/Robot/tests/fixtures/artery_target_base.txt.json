@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "frame": "rm75_base",
+  "translation_unit": "m",
+  "normal_semantics": "rotation_only_and_unit_normalized",
+  "source_camera_serial": "TEST-D455",
+  "calibration_path": "artery_camera_calibration.json",
+  "calibration_sha256": "7917011b2618105a3ed4cf99f0f514a558f9d30da130b24e52dfdf4f2303cbfa",
+  "output_path_sha256": "f56d091dc84d023aa3f10b7b86110e06de388ca926e3ca4796acf0dacaa0f64b",
+  "point_count": 2
+}

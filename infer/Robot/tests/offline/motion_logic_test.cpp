@@ -67,5 +67,52 @@ int main() {
     plan = planner.Plan(outside_limits, outside_pose, outside_pose);
     ok &= Check(!plan.valid && plan.error == Rm75PlanError::kJointLimit,
                 "planner rejects joint target outside hard limits");
+
+    Eigen::Matrix<double, 7, 1> near_limit = joints;
+    near_limit[0] = planner.Kinematics().JointMaximums()[0]
+        - 2.5 * M_PI / 180.0;
+    const Eigen::Matrix<double, 6, 1> near_limit_pose =
+        planner.PoseFromJoints(near_limit);
+    plan = planner.Plan(near_limit, near_limit_pose, near_limit_pose);
+    ok &= Check(!plan.valid
+                    && plan.error == Rm75PlanError::kJointLimitMargin
+                    && plan.detail.find("J1 target=") != std::string::npos
+                    && plan.detail.find("limits=[") != std::string::npos,
+                "joint margin rejection identifies joint, target and limits");
+
+    Rm75ServoPlannerConfig artery_planner_config;
+    artery_planner_config.allow_near_singularity = true;
+    artery_planner_config.joint_limit_warning_deg = 5.0;
+    Rm75ServoPlanner artery_planner(artery_planner_config);
+    Eigen::Matrix<double, 7, 1> outside_artery_warning = joints;
+    outside_artery_warning[0] = artery_planner.Kinematics().JointMaximums()[0]
+        - 6.0 * M_PI / 180.0;
+    Eigen::Matrix<double, 6, 1> artery_pose =
+        artery_planner.PoseFromJoints(outside_artery_warning);
+    plan = artery_planner.Plan(outside_artery_warning, artery_pose, artery_pose);
+    ok &= Check(plan.valid && !plan.near_joint_limit,
+                "artery maintenance planner accepts at least 5 deg margin");
+    Eigen::Matrix<double, 7, 1> inside_artery_warning = joints;
+    inside_artery_warning[0] = artery_planner.Kinematics().JointMaximums()[0]
+        - 4.0 * M_PI / 180.0;
+    artery_pose = artery_planner.PoseFromJoints(inside_artery_warning);
+    plan = artery_planner.Plan(inside_artery_warning, artery_pose, artery_pose);
+    ok &= Check(plan.valid && plan.near_joint_limit,
+                "artery maintenance planner warns below 5 deg margin");
+    Rm75ServoPlannerConfig probe_config;
+    probe_config.joint_limit_warning_deg = 3.0;
+    Rm75ServoPlanner probe_planner(probe_config);
+    Eigen::Matrix<double, 7, 1> probe_joints;
+    probe_joints << -23.919, -4.030, 55.033, 131.9, -102.653, 52.930, 85.403;
+    probe_joints *= M_PI / 180.0;
+    auto probe_pose = probe_planner.PoseFromJoints(probe_joints);
+    plan = probe_planner.Plan(probe_joints, probe_pose, probe_pose);
+    ok &= Check(plan.valid && !plan.near_joint_limit,
+                "probe planner accepts J4 margin 3.1 deg");
+    probe_joints[3] = 132.1 * M_PI / 180.0;
+    probe_pose = probe_planner.PoseFromJoints(probe_joints);
+    plan = probe_planner.Plan(probe_joints, probe_pose, probe_pose);
+    ok &= Check(!plan.valid && plan.error == Rm75PlanError::kJointLimitMargin,
+                "probe planner retains hard stop at J4 margin 2.9 deg");
     return ok ? 0 : 1;
 }

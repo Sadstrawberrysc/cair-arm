@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "accepted": true,
+  "transform": "d455_color_optical_to_rm75_base",
+  "camera": {
+    "serial": "TEST-D455"
+  }
+}

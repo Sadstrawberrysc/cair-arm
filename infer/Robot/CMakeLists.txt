@@ -95,7 +95,60 @@ if(BUILD_MAINTENANCE_TOOLS)
     target_link_libraries(arm_read_state PRIVATE realman_transport)
 
     add_executable(arm_preset_pose tests/tools/arm_preset_pose.cpp)
-    target_link_libraries(arm_preset_pose PRIVATE realman_transport)
+    target_link_libraries(arm_preset_pose PRIVATE
+        rm75_frame_chain
+        rm75_motion
+        realman_transport
+        robot_sensor
+    )
+    if(BUILD_TESTING)
+        add_test(
+            NAME artery_target_inspection_test
+            COMMAND arm_preset_pose
+                --artery-path-base
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/artery_target_base.txt
+                --target-calibration
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/artery_camera_calibration.json
+                --tool-calibration
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
+                --inspect-target-only
+        )
+    endif()
+
+    add_executable(arm_probe_pose tests/tools/arm_probe_pose.cpp)
+    target_link_libraries(arm_probe_pose PRIVATE
+        rm75_frame_chain
+        rm75_motion
+        realman_transport
+        robot_sensor
+    )
+    if(BUILD_TESTING)
+        add_test(
+            NAME probe_pose_transform_inspection_test
+            COMMAND arm_probe_pose
+                --target-pose-m-rad 0.3,0.0,0.4,0.0,0.0,0.0
+                --tool-calibration
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
+                --inspect-transform-only
+        )
+        add_test(
+            NAME probe_pose_artery_input_inspection_test
+            COMMAND arm_probe_pose
+                --artery-path-base
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/artery_target_base.txt
+                --tool-calibration
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
+                --inspect-transform-only
+        )
+        add_test(
+            NAME probe_pose_base_position_inspection_test
+            COMMAND arm_probe_pose
+                --target-position-base-m 0.3,0.0,0.4
+                --tool-calibration
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json
+                --inspect-transform-only
+        )
+    endif()
 
     add_executable(rm75_servoj_diagnostic
         tests/tools/arm_servoj_line_test.cpp

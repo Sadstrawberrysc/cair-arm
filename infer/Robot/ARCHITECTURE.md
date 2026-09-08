@@ -19,6 +19,8 @@ Redis 视觉意图、确定性控制律、七轴规划、安全监督和运行�
 | `rm75_runtime_logging` | `AsyncRuntimeLogger`、`RuntimeSummaryData`、`BuildRuntimeSummary()` | 有界异步 CSV、summary v2 构造/落盘及终端完成报告 | transport、sensor、motion |
 | `RedisBridge` | `LatestCommand`、`PublishSensor`、`PublishStatus` | Redis v1/legacy 边界、重连、回放保护和异步发布 | hiredis、nlohmann/json |
 | `main_rm75` | 进程入口 | 配置校验、线程生命周期、10 ms 编排、安全门、周期/最终快照提交 | 上述全部 |
+| `arm_preset_pose` | 维护 CLI | 预置关节姿态及颈动脉首点的摘要校验、Probe TCP IK、单次 MoveJ 安全门 | frame chain、motion、transport、sensor |
+| `arm_probe_pose` | 维护 CLI | 显式 Probe TCP 位姿、精确 Base 位置或颈动脉路径首点；启动姿态保持及单次 MoveJ 安全门 | frame chain、motion、transport、sensor |
 | `tests/offline` | CTest 可执行文件 | 有效配置、parser、freshness、控制/planner 拒绝边界和 schema characterization | 生产静态库，不访问设备 |
 
 CMake 依赖方向为 `main_rm75 → rm75_runtime_config + rm75_frame_chain + rm75_runtime_logging + realman_transport + robot_sensor + rm75_motion`。
@@ -106,16 +108,48 @@ ServoJ 使用单个待处理 mailbox，防止 10 ms 目标在 socket 队列中�
   不得自行追加平行的日志序列化路径。
 - `build/` 中标定、日志和二进制属于运行产物，不是模块 API。
 
+## 颈动脉单点维护流程
+
+`arm_probe_pose` 是当前 Base 路径入口。以下检查只读路径、sidecar、隐式定位的 accepted
+相机外参和 Tool 标定，不连接机械臂：
+
+```bash
+infer/Robot/build/arm_probe_pose \
+  --artery-path-base infer/Calibration/data/artery_path_base.txt \
+  --tool-calibration infer/Robot/build/rm75_force_calibration.json \
+  --inspect-transform-only
+```
+
+去掉 `--inspect-transform-only` 后，工具只连接 RM75、读取一次当前状态，将当时 Probe TCP
+姿态隐式设为目标姿态并执行 IK dry-run，不发送 MoveJ。它固定使用第一点和 50 mm 外法向
+偏置，不提供点号、偏置或姿态覆盖参数；接近限位/奇异、最大单关节变化超过默认 60°或
+规划残差超过 0.6 mm 时拒绝。工具不提供环境碰撞检测。
+
+真实运动还必须同时提供 `--execute --confirm-single-movej`，并把速度限制在 `1..5`。该组合
+最多调用一次 `TryMoveJ`。2026-09-04 用户确认并授权记录 Probe TCP/Tool 几何链有效；
+该入口没有笛卡尔距离门，但保留默认 60°最大单关节变化门，并须 dry-run 通过完整 IK及
+201点 MoveJ 关节路径检查。该检查不包含环境碰撞模型，必须人工确认整段空间净空。完成
+根级现场检查并取得当次明确运动授权后，才可重新评审执行命令。
+
+`arm_preset_pose` 颈动脉模式的局部预警裕量为5°；`arm_probe_pose` 全部输入模式为3°；
+生产 planner 默认仍为10°，3°硬停止门保持不变。IK 迭代和 MoveJ 的201个关节空间采样点任一点进入
+预警区都会拒绝。
+
+数字人只提供一个已由 `hand_eye_calibration-main` 新外参转换和核对的 Base 位置时，可使用
+`--target-position-base-m x,y,z`。该模式不添加法向偏置，连接后读取当前 Probe TCP 姿态，
+输出并规划完整 `Base→Probe_TCP` 六维目标；显式六维、Base位置和路径三种输入互斥。
+
 ## 构建与验证
 
 ```bash
-cmake -S infer/Robot -B infer/Robot/build -DCMAKE_BUILD_TYPE=Release
-cmake --build infer/Robot/build --target main_rm75 robot_offline_tests
+cmake -S infer/Robot -B infer/Robot/build -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_MAINTENANCE_TOOLS=ON
+cmake --build infer/Robot/build
 ctest --test-dir infer/Robot/build --output-on-failure
 ```
 
-当前注册 6 个纯离线 CTest，覆盖有效配置唯一来源、标定坐标链等价性、Redis
-parser/freshness 与输出 schema、
-AA55/Haptron frame parser、基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema
+启用维护工具时当前注册 9 个纯离线 CTest，覆盖有效配置唯一来源、标定坐标链等价性、Redis
+parser/freshness、颈动脉 Base 路径/外参/摘要的无连接检查、AA55/Haptron frame parser、
+基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema
 契约。测试不访问 Redis 服务、串口或机器人；通过仍不代表标定或真机运动验收完成。任何运行
 命令必须遵守根目录 `AGENTS.md` 的真机硬约束。

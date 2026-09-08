@@ -1,6 +1,6 @@
 # RM75 当前进度与运行边界
 
-更新日期：2026-08-20
+更新日期：2026-09-07
 
 本文记录当前工作树中 RM75 视觉力控闭环的实际实现、有效配置、已知分叉和待验收项。
 架构边界见 [ARCHITECTURE.md](ARCHITECTURE.md)，启动顺序见
@@ -17,6 +17,29 @@ recovery 意图；`main_rm75` 在 10 ms 周期内融合 RM75 与 Haptron 快照�
 已建立第一批纯离线 CTest，覆盖 Redis parser/freshness 与输出 schema、AA55/Haptron frame
 parser、基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema 契约。完整的
 session replay、反馈恢复、mailbox 并发和周期回放 harness 仍待补充。
+
+### 颈动脉单点 MoveJ 工具
+
+当前采用一次文件快照，不再使用实时 Redis target-track。`arm_probe_pose` 维护工具以
+`--artery-path-base` 作为唯一新增接口，从 sidecar 隐式校验 accepted 相机外参、Base 路径及
+摘要，固定选择第一点并沿单位外法向偏置 50 mm，读取 RM75 当前状态后保持 Probe TCP 姿态
+执行安全 IK。默认 dry-run 不发送运动；真实执行要求
+`--execute --confirm-single-movej`，只允许一次 MoveJ，并受关节限位、奇异和最终 2 mm
+误差门约束。9/9 CTest 已通过。2026-09-04 用户确认并授权记录
+ArmTip→Probe TCP 的 188 mm 长度与安装旋转有效，部署文件现为 `tool_chain_verified=true`；
+该新入口没有笛卡尔距离门，但保留默认 60°最大单关节变化门；2026-09-07 按用户要求将其
+局部限位预警改为3°，与3°硬停止门一致（生产 planner 默认仍为10°）；
+长距离 MoveJ 的环境碰撞风险只能现场人工检查。旧 `arm_preset_pose` 颈动脉入口的历史门控
+调整不自动继承到新入口；生产 planner 默认值和3°硬停止门不变。
+
+数字人单点新增分层接口：`hand_eye_calibration-main/transform_point.py` 使用用户确认的新
+外参把 D455 光学坐标点变为 Base 位置，`arm_probe_pose --target-position-base-m` 再保持
+连接时的 Probe TCP 姿态组成六维目标。新外参目前记录为用户确认、尚无独立验证报告，
+真机前必须 dry-run 并核对 Base 方向和已知点。
+
+`hand_eye_calibration-main/run_probe_target.py` 已串联数字人采样、新外参首点转换和
+Robot 位置模式；未更新快照或相机异常退出会终止流程。按用户要求，编排入口默认速度1、
+自动传入双执行参数执行单次 MoveJ；`--dry-run` 只规划。仅做离线验证，尚未完成本入口的真机验收。
 
 ### 配置所有权已统一并通过真机复核
 
@@ -115,8 +138,8 @@ RM75 TCP 状态线程 ───────────────────�
 | Torque RMS | `0.02095 N·m` | — |
 | Torque max | `0.05099 N·m` | `0.1 N·m` |
 
-`residuals_verified=false` 且 `tool_chain_verified=false`。“唯一部署/最终选用”仅表示当前不再保留
-其他版本文件，不表示已通过正式计量验收。当前文件只能在显式 provisional
+`residuals_verified=false`；`tool_chain_verified=true` 只记录用户对 188 mm Probe TCP 长度和
+安装旋转的确认。“唯一部署/最终选用”不表示力标定已通过正式计量验收。当前文件只能在显式 provisional
 commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏置，不能替代多姿态重力、
 质量、质心以及 R/t/TCP 验证。
 

@@ -31,6 +31,10 @@ flowchart LR
     Sono -->|TCP 30-byte frames| Ultrasound[超声主机]
 
     RealSense[Intel RealSense] --> CameraRT[人体/解剖相机服务]
+    CameraRT -->|数字人 Camera xyz| HandEye[hand_eye_calibration-main\n新外参/单点转换]
+    HandEye -->|Base xyz| SinglePoint[RM75 单点维护工具]
+    SinglePoint -.->|默认只读状态 + IK dry-run\n授权后单次 MoveJ| RM75
+    RM75 -.->|人工/可信只读 Base→ArmTip 位姿| Calibration
 ```
 
 ## 在线服务目录
@@ -39,11 +43,21 @@ flowchart LR
 | --- | --- | --- | --- |
 | RM75 控制 | `infer/Robot/build/main_rm75` | Redis `:7777`、RM75 TCP、Haptron 串口 | [infer/Robot/ARCHITECTURE.md](infer/Robot/ARCHITECTURE.md) |
 | 超声视觉推理 | `intergrate_infer/main_redis_seg_newphase_recovery_mode.py` | Redis Pub/Sub v1 | [intergrate_infer/ARCHITECTURE.md](intergrate_infer/ARCHITECTURE.md) |
-| 人体/解剖相机 | `infer/Camera_RT/cliff_demo.py` | RealSense 输入、本地可视化 | — |
+| 人体/解剖相机 | `infer/Camera_RT/cliff_demo.py` | RealSense 输入、本地可视化、临时相机坐标路径 | [infer/Camera_RT/ARCHITECTURE.md](infer/Camera_RT/ARCHITECTURE.md) |
 | 接触点显示 | `infer/ContactPointShow/main.py` | 只读订阅 `sensor_data` | — |
 | 传感器监视 | `infer/SensorMonitor/main.py` | 自动选择独占直连 Haptron 或只读订阅 `robot:sensor:v1` | [infer/SensorMonitor/ARCHITECTURE.md](infer/SensorMonitor/ARCHITECTURE.md) |
 | SonoScape API | `SonoScape_api/redis_service.py` | Redis 队列/结果键、超声 TCP | — |
 | 语音/UI 客户端 | `py-xiaokai/main.py` | WebSocket/MQTT、Redis `:6379` | — |
+
+数字人单点当前使用 `infer/hand_eye_calibration-main/transform_point.py` 和同目录的新
+外参进行转换；`run_probe_target.py` 可统一启动数字人并在本次快照保存、正常退出后选取
+第一采样点（相机按像素 y 降序保存，对应画面最低红点），调用 Robot 位置模式。编排入口默认速度1并自动传入双执行参数，`--dry-run` 可只规划；Robot 直接调用仍默认 dry-run。具体
+变换数据保存在
+`d455_to_rm75_base.json`，将 D455 光学坐标变为 Base 位置；Robot 的
+`arm_probe_pose --target-position-base-m` 再读取启动 Probe TCP 姿态组成六维目标。
+该离线转换不连接 RM75，也不授权真机运动。旧 `infer/Calibration` 外参不再用于该单点链路。
+本机离线产物由 `artery_path_base.txt`、其 `.json` 元数据和
+`d455_to_rm75_base.json` 组成；三者共同定义来源路径、相机身份、外参摘要和 Base 坐标语义。
 
 ## API 层架构决策
 
@@ -82,6 +96,10 @@ flowchart LR
 `0..1`，`mask_lr_majority` 为 `-1..2`。可选的 `parameters.desired_force_n` 仅接受
 `-3.0..-0.1 N`；协议解析范围不是允许绕过运行安全门的授权。
 
+颈动脉单点不使用 Redis。Camera_RT 快照由 Calibration 转为 Base 文件，元数据绑定相机身份、
+外参 SHA-256 与路径内容 SHA-256。Robot 维护工具重新计算“第一点 + 单位法向 × 50 mm”，
+保持启动姿态做 IK；摘要、距离、关节限位、奇异或 Probe TCP 验收失败时拒绝 MoveJ。
+
 ### 3. 控制 API 与硬件 I/O 分离
 
 `Rm75ControlLaw::Step` 是确定性控制边界：只接收快照和 `ControlIntent`，不访问 Redis、
@@ -99,6 +117,8 @@ socket 或串口。`Rm75ServoPlanner::Plan` 是第二道边界，将笛卡尔目
 - C++ 公共数据统一使用 SI：位置 m、关节/姿态 rad、力 N、力矩 N·m、单调时钟用于陈旧判定。
 - 视觉命令的 `rz` 是协议层特例，单位为度，进入控制层后转换。
 - 坐标链为 `Base → Arm_Tip → Tool/Sensor → Probe TCP`。
+- 相机扩展链由离线 Calibration 单独提供 `D455 color optical → Base`；只有携带设备身份、
+  输入摘要和独立验证结果的 `accepted` 外参才允许生成离线 Base 坐标文件。
 - `robot:sensor:v1` 的接触点以 Probe TCP 为原点；legacy `sensor_data` 保持传感器原点语义。
 - 新字段名必须包含单位或由同一 payload 的 `units` 明确声明，不允许靠调用方猜测。
 

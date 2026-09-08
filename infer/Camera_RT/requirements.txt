@@ -1,22 +1,18 @@
-matplotlib==3.7.1
+# The CUDA-enabled Torch wheels use the PyTorch package index. Install
+# PyTorch3D as described in tools/README.md before installing this file in a
+# fresh environment.
+--extra-index-url https://download.pytorch.org/whl/cu117
+
 numpy==1.22.0
 open3d==0.17.0
-opencv_contrib_python==4.8.1.78
-opencv_python==4.8.1.78
-opencv_python_headless==4.9.0.80
-pandas==1.4.2
+opencv-python==4.8.1.78
 Pillow==9.4.0
-Pillow==11.1.0
 pyrealsense2==2.54.2.5684
-pyrender==0.1.45
-pytorch3d.egg==info
-scipy==1.15.2
+pytorch3d==0.7.5
+scipy==1.8.1
 smplx==0.1.28
-torch==1.13.1
 torch==1.13.1+cu117
 torchgeometry==0.1.2
-torchvision==0.14.1
 torchvision==0.14.1+cu117
 tqdm==4.66.1
-trimesh==4.6.2
 yacs==0.1.8

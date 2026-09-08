@@ -1,20 +1,32 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <Eigen/Dense>
+#include <json.hpp>
 
+#include <calibrated_frame_chain.hpp>
+#include <force_calibration.hpp>
 #include <realman_command.hpp>
+#include <rm75_control.hpp>
 
 namespace {
 
 constexpr double kDegToRad = M_PI / 180.0;
 constexpr double kRadToDeg = 180.0 / M_PI;
+constexpr double kArteryStandoffM = 0.050;
+constexpr double kArteryJointLimitWarningDeg = 5.0;
+constexpr double kMaximumControllerModelPositionErrorM = 0.025;
+constexpr double kMaximumControllerModelOrientationErrorDeg = 5.0;
+constexpr int kMaximumIkIterations = 10000;
 
 struct Preset {
     const char* name;
@@ -30,9 +42,24 @@ struct Options {
     double max_final_error_deg = 1.0;
     std::string preset;
     std::string target_deg_text;
+    std::string artery_path_base;
+    std::string target_calibration;
+    std::string tool_calibration;
+    double max_final_position_error_mm = 2.0;
     bool list_presets = false;
     bool allow_multistep = false;
+    bool inspect_target_only = false;
+    bool confirm_single_movej = false;
     bool execute = false;
+};
+
+struct ArteryTarget {
+    Eigen::Vector3d normal_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d surface_point_base_m = Eigen::Vector3d::Zero();
+    Eigen::Vector3d probe_tcp_target_base_m = Eigen::Vector3d::Zero();
+    std::string camera_serial;
+    std::string path_sha256;
+    std::string calibration_sha256;
 };
 
 const std::vector<Preset>& Presets() {
@@ -103,11 +130,18 @@ void PrintUsage(const char* program) {
         << "       [--velocity V] [--max-joint-delta-deg DEG]\n"
         << "       [--max-final-error-deg DEG]\n"
         << "       [--allow-multistep] [--execute]\n\n"
+        << "       --artery-path-base PATH --target-calibration PATH\n"
+        << "       --tool-calibration PATH [--inspect-target-only]\n"
+        << "       [--max-final-position-error-mm MM]\n"
+        << "       [--execute --confirm-single-movej]\n\n"
         << "RM75 joint-pose target tool.\n"
         << "Default controller address is 192.168.50.254:8080.\n"
         << "The program first reads the current joint pose as the initial state,\n"
         << "then plans to the target joint pose from --preset or --target-deg.\n"
-        << "Default mode is dry-run. Motion is sent only when --execute is set.\n";
+        << "Artery mode always selects the first point, adds 50 mm along the\n"
+        << "stored outward normal, preserves the current Probe TCP orientation,\n"
+        << "and plans exactly one MoveJ. Default mode is dry-run. Artery motion\n"
+        << "requires both --execute and --confirm-single-movej.\n";
 }
 
 bool ParseInt(const char* text, int& value) {
@@ -222,6 +256,9 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         } else if (arg == "--max-final-error-deg") {
             const char* value = need_value(arg);
             if (value == nullptr || !ParseDouble(value, options.max_final_error_deg)) return false;
+        } else if (arg == "--max-final-position-error-mm") {
+            const char* value = need_value(arg);
+            if (value == nullptr || !ParseDouble(value, options.max_final_position_error_mm)) return false;
         } else if (arg == "--preset") {
             const char* value = need_value(arg);
             if (value == nullptr) return false;
@@ -230,10 +267,26 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* value = need_value(arg);
             if (value == nullptr) return false;
             options.target_deg_text = value;
+        } else if (arg == "--artery-path-base") {
+            const char* value = need_value(arg);
+            if (value == nullptr) return false;
+            options.artery_path_base = value;
+        } else if (arg == "--target-calibration") {
+            const char* value = need_value(arg);
+            if (value == nullptr) return false;
+            options.target_calibration = value;
+        } else if (arg == "--tool-calibration") {
+            const char* value = need_value(arg);
+            if (value == nullptr) return false;
+            options.tool_calibration = value;
         } else if (arg == "--list-presets") {
             options.list_presets = true;
         } else if (arg == "--allow-multistep") {
             options.allow_multistep = true;
+        } else if (arg == "--inspect-target-only") {
+            options.inspect_target_only = true;
+        } else if (arg == "--confirm-single-movej") {
+            options.confirm_single_movej = true;
         } else if (arg == "--execute") {
             options.execute = true;
         } else {
@@ -262,8 +315,46 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         std::cerr << "max-final-error-deg must be in 0..10\n";
         return false;
     }
+    if (options.max_final_position_error_mm <= 0.0
+        || options.max_final_position_error_mm > 5.0) {
+        std::cerr << "max-final-position-error-mm must be in 0..5\n";
+        return false;
+    }
     if (!options.preset.empty() && !options.target_deg_text.empty()) {
         std::cerr << "Use either --preset or --target-deg, not both\n";
+        return false;
+    }
+    const bool artery_mode = !options.artery_path_base.empty()
+        || !options.target_calibration.empty() || !options.tool_calibration.empty();
+    if (artery_mode
+        && (options.artery_path_base.empty()
+            || options.target_calibration.empty()
+            || options.tool_calibration.empty())) {
+        std::cerr << "artery mode requires --artery-path-base, "
+                     "--target-calibration and --tool-calibration\n";
+        return false;
+    }
+    if (artery_mode && (!options.preset.empty()
+                        || !options.target_deg_text.empty()
+                        || options.allow_multistep)) {
+        std::cerr << "artery mode is mutually exclusive with preset/manual "
+                     "targets and --allow-multistep\n";
+        return false;
+    }
+    if (options.inspect_target_only && (!artery_mode || options.execute)) {
+        std::cerr << "--inspect-target-only requires artery mode and forbids --execute\n";
+        return false;
+    }
+    if (options.confirm_single_movej && !artery_mode) {
+        std::cerr << "--confirm-single-movej is only valid in artery mode\n";
+        return false;
+    }
+    if (artery_mode && options.execute && !options.confirm_single_movej) {
+        std::cerr << "artery execution requires --execute --confirm-single-movej\n";
+        return false;
+    }
+    if (artery_mode && options.velocity > 5) {
+        std::cerr << "artery mode velocity must be in 1..5\n";
         return false;
     }
     return true;
@@ -325,6 +416,422 @@ void PrintWaypointPlan(const Eigen::Matrix<double, 7, 1>& current_deg,
     }
 }
 
+bool ParseVector3Line(const std::string& line, Eigen::Vector3d& value) {
+    std::istringstream stream(line);
+    std::string trailing;
+    return static_cast<bool>(stream >> value.x() >> value.y() >> value.z())
+        && !(stream >> trailing) && value.array().isFinite().all();
+}
+
+bool LoadJsonObject(const std::string& path,
+                    nlohmann::json& output,
+                    std::string& error) {
+    std::ifstream stream(path);
+    if (!stream) {
+        error = "cannot open JSON: " + path;
+        return false;
+    }
+    output = nlohmann::json::parse(stream, nullptr, false);
+    if (output.is_discarded() || !output.is_object()) {
+        error = "invalid JSON object: " + path;
+        return false;
+    }
+    return true;
+}
+
+bool LoadArteryTarget(const Options& options,
+                      ArteryTarget& target,
+                      std::string& error) {
+    std::ifstream path_stream(options.artery_path_base);
+    if (!path_stream) {
+        error = "cannot open Base path: " + options.artery_path_base;
+        return false;
+    }
+    std::string line;
+    if (!std::getline(path_stream, line)
+        || !ParseVector3Line(line, target.normal_base)) {
+        error = "Base path first line must be one finite 3D normal";
+        return false;
+    }
+    const double normal_norm = target.normal_base.norm();
+    if (!std::isfinite(normal_norm) || normal_norm < 1e-12) {
+        error = "Base path normal is zero";
+        return false;
+    }
+    target.normal_base /= normal_norm;
+
+    std::vector<Eigen::Vector3d> points;
+    while (std::getline(path_stream, line)) {
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        Eigen::Vector3d point;
+        if (!ParseVector3Line(line, point)) {
+            error = "Base path contains a malformed point line";
+            return false;
+        }
+        points.push_back(point);
+    }
+    if (points.empty()) {
+        error = "Base path must contain at least one 3D point after the normal";
+        return false;
+    }
+    target.surface_point_base_m = points.front();
+    target.probe_tcp_target_base_m = target.surface_point_base_m
+        + kArteryStandoffM * target.normal_base;
+
+    if (!ComputeFileSha256(options.artery_path_base,
+                           target.path_sha256, &error)) {
+        return false;
+    }
+    if (!ComputeFileSha256(options.target_calibration,
+                           target.calibration_sha256, &error)) {
+        return false;
+    }
+
+    nlohmann::json calibration;
+    if (!LoadJsonObject(options.target_calibration, calibration, error)) {
+        return false;
+    }
+    try {
+        if (calibration.value("schema_version", 0) != 1
+            || !calibration.value("accepted", false)
+            || calibration.value("transform", std::string())
+                != "d455_color_optical_to_rm75_base") {
+            error = "camera calibration is not an accepted camera-to-Base result";
+            return false;
+        }
+        target.camera_serial = calibration.at("camera").at("serial").get<std::string>();
+        if (target.camera_serial.empty()) {
+            error = "camera calibration serial is empty";
+            return false;
+        }
+    } catch (const std::exception& exception) {
+        error = std::string("camera calibration field error: ") + exception.what();
+        return false;
+    }
+
+    nlohmann::json metadata;
+    const std::string metadata_path = options.artery_path_base + ".json";
+    if (!LoadJsonObject(metadata_path, metadata, error)) return false;
+    try {
+        if (metadata.value("schema_version", 0) != 1
+            || metadata.value("frame", std::string()) != "rm75_base"
+            || metadata.value("translation_unit", std::string()) != "m"
+            || metadata.value("normal_semantics", std::string())
+                != "rotation_only_and_unit_normalized") {
+            error = "Base path metadata frame, unit or normal semantics is invalid";
+            return false;
+        }
+        if (metadata.at("point_count").get<std::size_t>() != points.size()) {
+            error = "Base path point count does not match metadata";
+            return false;
+        }
+        if (metadata.at("source_camera_serial").get<std::string>()
+                != target.camera_serial
+            || metadata.at("calibration_sha256").get<std::string>()
+                != target.calibration_sha256) {
+            error = "Base path provenance does not match camera calibration";
+            return false;
+        }
+        const std::string recorded_path_hash =
+            metadata.value("output_path_sha256", std::string());
+        if (recorded_path_hash.empty() || recorded_path_hash != target.path_sha256) {
+            error = "Base path content hash is absent or does not match metadata; rerun calibrate.py convert";
+            return false;
+        }
+    } catch (const std::exception& exception) {
+        error = std::string("Base path metadata field error: ") + exception.what();
+        return false;
+    }
+    return true;
+}
+
+double RotationDifferenceDeg(const Eigen::Matrix3d& lhs,
+                             const Eigen::Matrix3d& rhs) {
+    const Eigen::AngleAxisd difference(lhs * rhs.transpose());
+    return std::abs(difference.angle()) * kRadToDeg;
+}
+
+bool SolveFixedOrientationTarget(
+    Rm75ServoPlanner& planner,
+    const Eigen::Matrix<double, 7, 1>& initial_joints,
+    const Eigen::Matrix<double, 6, 1>& desired_model_pose,
+    Eigen::Matrix<double, 7, 1>& target_joints,
+    Eigen::Matrix<double, 6, 1>& target_model_pose,
+    int& iterations,
+    double& minimum_joint_margin_deg,
+    std::string& error) {
+    target_joints = initial_joints;
+    target_model_pose = planner.PoseFromJoints(target_joints);
+    Eigen::Matrix<double, 7, 1> previous_delta =
+        Eigen::Matrix<double, 7, 1>::Zero();
+    minimum_joint_margin_deg = std::numeric_limits<double>::infinity();
+    for (iterations = 0; iterations < kMaximumIkIterations; ++iterations) {
+        const double position_error_m =
+            (desired_model_pose.head<3>() - target_model_pose.head<3>()).norm();
+        const double orientation_error_deg = RotationDifferenceDeg(
+            RotationBaseFromControllerEuler(desired_model_pose.tail<3>()),
+            RotationBaseFromControllerEuler(target_model_pose.tail<3>()));
+        if (position_error_m <= 0.0005 && orientation_error_deg <= 0.1) {
+            return true;
+        }
+        const Rm75ServoPlan plan = planner.Plan(
+            target_joints, target_model_pose, desired_model_pose, previous_delta);
+        if (!plan.valid) {
+            error = std::string("IK rejected: ")
+                + Rm75PlanErrorString(plan.error) + ": " + plan.detail;
+            return false;
+        }
+        if (plan.near_joint_limit) {
+            int minimum_margin_joint = 0;
+            double minimum_margin_deg = std::numeric_limits<double>::infinity();
+            for (int joint = 0; joint < 7; ++joint) {
+                const double margin_deg = std::min(
+                    plan.target_joints[joint]
+                        - planner.Kinematics().JointMinimums()[joint],
+                    planner.Kinematics().JointMaximums()[joint]
+                        - plan.target_joints[joint]) * kRadToDeg;
+                if (margin_deg < minimum_margin_deg) {
+                    minimum_margin_deg = margin_deg;
+                    minimum_margin_joint = joint;
+                }
+            }
+            std::ostringstream detail;
+            detail << "IK entered joint-limit warning region: J"
+                   << (minimum_margin_joint + 1) << " target="
+                   << plan.target_joints[minimum_margin_joint] * kRadToDeg
+                   << " deg, limits=["
+                   << planner.Kinematics().JointMinimums()[minimum_margin_joint]
+                          * kRadToDeg
+                   << ", "
+                   << planner.Kinematics().JointMaximums()[minimum_margin_joint]
+                          * kRadToDeg
+                   << "] deg, margin=" << minimum_margin_deg
+                   << " deg is below warning threshold="
+                   << planner.Config().joint_limit_warning_deg << " deg";
+            error = detail.str();
+            return false;
+        }
+        if (plan.near_singularity) {
+            error = "IK entered singularity warning region";
+            return false;
+        }
+        minimum_joint_margin_deg = std::min(
+            minimum_joint_margin_deg, plan.minimum_joint_margin_deg);
+        target_joints = plan.target_joints;
+        target_model_pose = plan.model_pose;
+        previous_delta = plan.joint_delta;
+    }
+    error = "IK did not converge within the fixed iteration limit";
+    return false;
+}
+
+bool ValidateMoveJSegment(
+    Rm75ServoPlanner& planner,
+    const Eigen::Matrix<double, 7, 1>& current_joints,
+    const Eigen::Matrix<double, 7, 1>& target_joints,
+    double& minimum_joint_margin_deg,
+    std::string& error) {
+    constexpr int kSegmentSamples = 200;
+    minimum_joint_margin_deg = std::numeric_limits<double>::infinity();
+    for (int sample = 0; sample <= kSegmentSamples; ++sample) {
+        const double fraction = static_cast<double>(sample) / kSegmentSamples;
+        const Eigen::Matrix<double, 7, 1> joints =
+            current_joints + fraction * (target_joints - current_joints);
+        const Eigen::Matrix<double, 6, 1> pose = planner.PoseFromJoints(joints);
+        const Rm75ServoPlan check = planner.Plan(joints, pose, pose);
+        if (!check.valid || check.near_joint_limit || check.near_singularity) {
+            std::ostringstream detail;
+            detail << "MoveJ joint-space segment rejected at "
+                   << 100.0 * fraction << "%: "
+                   << Rm75PlanErrorString(check.error) << ": " << check.detail;
+            error = detail.str();
+            return false;
+        }
+        minimum_joint_margin_deg = std::min(
+            minimum_joint_margin_deg, check.minimum_joint_margin_deg);
+    }
+    return true;
+}
+
+void PrintVector3(const char* label, const Eigen::Vector3d& value) {
+    std::cout << label << ": [" << value.x() << ", " << value.y()
+              << ", " << value.z() << "]\n";
+}
+
+int RunArteryMode(const Options& options,
+                  const ArteryTarget& artery,
+                  const ForceCalibration& tool_calibration,
+                  RMCommand& command,
+                  const Eigen::Matrix<double, 7, 1>& current_joints,
+                  const Eigen::Matrix<double, 6, 1>& current_controller_pose) {
+    const CalibratedFrameChain frame_chain(tool_calibration);
+    Rm75ServoPlannerConfig planner_config;
+    planner_config.joint_limit_warning_deg = kArteryJointLimitWarningDeg;
+    Rm75ServoPlanner planner(planner_config);
+    const Eigen::Matrix<double, 6, 1> current_model_pose =
+        planner.PoseFromJoints(current_joints);
+    const double model_position_difference_m =
+        (current_controller_pose.head<3>() - current_model_pose.head<3>()).norm();
+    const double model_orientation_difference_deg = RotationDifferenceDeg(
+        frame_chain.RotationBaseFromArmTip(current_controller_pose),
+        frame_chain.RotationBaseFromArmTip(current_model_pose));
+
+    std::cout << "\nArtery single-point plan\n";
+    std::cout << "point_index: 0\n";
+    std::cout << "frame: rm75_base\n";
+    std::cout << "translation_unit: m\n";
+    std::cout << "joint_limit_warning_deg: "
+              << planner.Config().joint_limit_warning_deg << "\n";
+    std::cout << "joint_limit_stop_deg: "
+              << planner.Config().joint_limit_stop_deg << "\n";
+    std::cout << "camera_serial: " << artery.camera_serial << "\n";
+    std::cout << "path_sha256: " << artery.path_sha256 << "\n";
+    std::cout << "camera_calibration_sha256: "
+              << artery.calibration_sha256 << "\n";
+    PrintVector3("surface_point_base_m", artery.surface_point_base_m);
+    PrintVector3("outward_normal_base", artery.normal_base);
+    std::cout << "standoff_m: " << kArteryStandoffM << "\n";
+    PrintVector3("target_probe_tcp_base_m",
+                 artery.probe_tcp_target_base_m);
+    std::cout << "tool_chain_verified: "
+              << (tool_calibration.tool_chain_verified ? "true" : "false")
+              << "\n";
+    std::cout << "controller_model_position_difference_mm: "
+              << 1000.0 * model_position_difference_m << "\n";
+    std::cout << "controller_model_orientation_difference_deg: "
+              << model_orientation_difference_deg << "\n";
+    if (model_position_difference_m > kMaximumControllerModelPositionErrorM
+        || model_orientation_difference_deg
+            > kMaximumControllerModelOrientationErrorDeg) {
+        std::cerr << "Controller pose and local RM75 model disagree beyond the "
+                     "fixed safety gate. Refusing IK.\n";
+        return 4;
+    }
+
+    const Eigen::Vector3d current_probe_tcp_base_m =
+        frame_chain.ProbeTcpBase(current_controller_pose);
+    const double requested_travel_m =
+        (artery.probe_tcp_target_base_m - current_probe_tcp_base_m).norm();
+    PrintVector3("current_probe_tcp_base_m", current_probe_tcp_base_m);
+    std::cout << "requested_probe_tcp_travel_mm: "
+              << 1000.0 * requested_travel_m << "\n";
+    std::cout << "distance_gate_enabled: false\n";
+    std::cout << "WARNING: no Cartesian distance gate; this tool has no "
+                 "environment collision model.\n";
+
+    // Preserve the current orientation. A bounded local translation offset
+    // aligns the controller-reported pose with the local FK model at the
+    // measured start state; rotations must already agree via the gate above.
+    const Eigen::Vector3d controller_minus_model =
+        current_controller_pose.head<3>() - current_model_pose.head<3>();
+    const Eigen::Matrix3d current_rotation =
+        frame_chain.RotationBaseFromArmTip(current_controller_pose);
+    const Eigen::Vector3d desired_controller_armtip =
+        artery.probe_tcp_target_base_m
+        - current_rotation * frame_chain.ProbeTcpArmTipM();
+    Eigen::Matrix<double, 6, 1> desired_model_pose = current_model_pose;
+    desired_model_pose.head<3>() =
+        desired_controller_armtip - controller_minus_model;
+
+    Eigen::Matrix<double, 7, 1> target_joints;
+    Eigen::Matrix<double, 6, 1> target_model_pose;
+    int ik_iterations = 0;
+    double minimum_joint_margin_deg = 0.0;
+    std::string ik_error;
+    if (!SolveFixedOrientationTarget(planner, current_joints,
+                                     desired_model_pose, target_joints,
+                                     target_model_pose, ik_iterations,
+                                     minimum_joint_margin_deg, ik_error)) {
+        std::cerr << ik_error << "\n";
+        return 4;
+    }
+
+    const double maximum_joint_delta_deg =
+        MaximumWrappedJointDeltaDeg(target_joints, current_joints);
+    const Eigen::Vector3d planned_probe_tcp_base_m =
+        target_model_pose.head<3>() + controller_minus_model
+        + frame_chain.RotationBaseFromArmTip(target_model_pose)
+            * frame_chain.ProbeTcpArmTipM();
+    const double planned_position_error_m =
+        (planned_probe_tcp_base_m - artery.probe_tcp_target_base_m).norm();
+    std::cout << "ik_iterations: " << ik_iterations << "\n";
+    std::cout << "minimum_joint_margin_deg: "
+              << minimum_joint_margin_deg << "\n";
+    std::cout << "maximum_joint_delta_deg_actual: "
+              << maximum_joint_delta_deg << "\n";
+    std::cout << "joint_delta_gate_enabled: false\n";
+    PrintVector3("planned_probe_tcp_base_m", planned_probe_tcp_base_m);
+    std::cout << "planned_probe_tcp_error_mm: "
+              << 1000.0 * planned_position_error_m << "\n";
+    PrintVectorRadDeg("target_joints7", target_joints);
+    if (planned_position_error_m > 0.0006) {
+        std::cerr << "IK target exceeds the fixed 0.6 mm planning residual.\n";
+        return 4;
+    }
+    double movej_minimum_joint_margin_deg = 0.0;
+    std::string movej_segment_error;
+    if (!ValidateMoveJSegment(planner, current_joints, target_joints,
+                              movej_minimum_joint_margin_deg,
+                              movej_segment_error)) {
+        std::cerr << movej_segment_error << "\n";
+        return 4;
+    }
+    std::cout << "movej_segment_samples: 201\n";
+    std::cout << "movej_minimum_joint_margin_deg: "
+              << movej_minimum_joint_margin_deg << "\n";
+
+    if (!options.execute) {
+        std::cout << "\nDry-run only. Exactly zero motion commands were sent.\n";
+        if (!tool_calibration.tool_chain_verified) {
+            std::cout << "BLOCKED_FOR_EXECUTION: tool_chain_verified=false\n";
+        } else {
+            std::cout << "Execution still requires onsite checks plus both "
+                         "--execute and --confirm-single-movej.\n";
+        }
+        return 0;
+    }
+
+    std::cout << "\nExecuting exactly one MoveJ to the validated IK target.\n";
+    const RMResult move_result = command.TryMoveJ(target_joints, options.velocity);
+    if (!move_result) {
+        std::cerr << "MoveJ failed: " << move_result.message << "\n";
+        (void)command.TryStopMotion(1000);
+        return 5;
+    }
+
+    Eigen::Matrix<double, 7, 1> final_joints;
+    Eigen::Matrix<double, 6, 1> final_pose;
+    int arm_err = 0;
+    int sys_err = 0;
+    const RMResult final_result = command.TryReadArmState(
+        final_joints, final_pose, arm_err, sys_err);
+    if (!final_result || arm_err != 0 || sys_err != 0) {
+        std::cerr << "Final state is unavailable or reports a robot error.\n";
+        (void)command.TryStopMotion(1000);
+        return 5;
+    }
+    const Eigen::Vector3d final_probe_tcp_base_m =
+        frame_chain.ProbeTcpBase(final_pose);
+    const double final_position_error_mm = 1000.0
+        * (final_probe_tcp_base_m - artery.probe_tcp_target_base_m).norm();
+    const double final_joint_error_deg =
+        MaximumWrappedJointDeltaDeg(final_joints, target_joints);
+    std::cout << "\nFinal state\n";
+    PrintVector3("final_probe_tcp_base_m", final_probe_tcp_base_m);
+    std::cout << "final_probe_tcp_error_mm: "
+              << final_position_error_mm << "\n";
+    std::cout << "maximum_final_joint_error_deg: "
+              << final_joint_error_deg << "\n";
+    if (final_position_error_mm > options.max_final_position_error_mm
+        || final_joint_error_deg > options.max_final_error_deg) {
+        std::cerr << "Final Probe TCP or joint error exceeds its acceptance gate.\n";
+        (void)command.TryStopMotion(1000);
+        return 6;
+    }
+    std::cout << "target_reached: true\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -337,6 +844,52 @@ int main(int argc, char** argv) {
     if (options.list_presets) {
         PrintPresets();
         return 0;
+    }
+
+    const bool artery_mode = !options.artery_path_base.empty();
+    ArteryTarget artery_target;
+    ForceCalibration tool_calibration;
+    if (artery_mode) {
+        std::string error;
+        if (!LoadArteryTarget(options, artery_target, error)) {
+            std::cerr << "Invalid artery target: " << error << "\n";
+            return 2;
+        }
+        if (!tool_calibration.LoadJson(options.tool_calibration, &error)) {
+            std::cerr << "Invalid Probe TCP/tool calibration: " << error << "\n";
+            return 2;
+        }
+        std::string tool_calibration_sha256;
+        if (!ComputeFileSha256(options.tool_calibration,
+                               tool_calibration_sha256, &error)) {
+            std::cerr << "Cannot hash Probe TCP/tool calibration: "
+                      << error << "\n";
+            return 2;
+        }
+        std::cout << std::fixed << std::setprecision(6);
+        std::cout << "artery_target_valid: true\n";
+        std::cout << "selected_point_index: 0\n";
+        PrintVector3("surface_point_base_m",
+                     artery_target.surface_point_base_m);
+        PrintVector3("outward_normal_base", artery_target.normal_base);
+        PrintVector3("target_probe_tcp_base_m",
+                     artery_target.probe_tcp_target_base_m);
+        std::cout << "standoff_m: " << kArteryStandoffM << "\n";
+        std::cout << "tool_calibration_sha256: "
+                  << tool_calibration_sha256 << "\n";
+        std::cout << "tool_chain_verified: "
+                  << (tool_calibration.tool_chain_verified ? "true" : "false")
+                  << "\n";
+        if (options.inspect_target_only) {
+            std::cout << "offline_inspection_only: true\n";
+            std::cout << "robot_connection_attempted: false\n";
+            return 0;
+        }
+        if (options.execute && !tool_calibration.tool_chain_verified) {
+            std::cerr << "BLOCKED: Probe TCP/tool chain has not been independently "
+                         "verified; execution is forbidden.\n";
+            return 4;
+        }
     }
 
     // Reject malformed or unknown targets before opening the robot socket.
@@ -403,6 +956,11 @@ int main(int argc, char** argv) {
     if (arm_err != 0 || sys_err != 0) {
         std::cerr << "Robot reports an error. Refusing to plan motion.\n";
         return 3;
+    }
+
+    if (artery_mode) {
+        return RunArteryMode(options, artery_target, tool_calibration,
+                             command, current_joints, current_pose);
     }
 
     if (options.preset.empty() && options.target_deg_text.empty()) {

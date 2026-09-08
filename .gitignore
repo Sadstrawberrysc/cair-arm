@@ -97,6 +97,13 @@ segmentation/carotid/inference_results
 segmentation/carotid/masks
 segmentation/carotid/test_results
 infer/Camera_RT/data
+infer/Camera_RT/artery_path.txt
+infer/Camera_RT/artery_path_rbt.txt
+infer/Calibration/data/
+infer/hand_eye_calibration-main/data/
+infer/hand_eye_calibration-main/RobotToolPose.csv
+infer/hand_eye_calibration-main/d455_to_rm75_base.json
+infer/hand_eye_calibration-main/libs/web-log
 infer/ContactPointShow/model
 # 忽略备份文件夹或文件 (通常以 bk, back 结尾)
 *.mp4
