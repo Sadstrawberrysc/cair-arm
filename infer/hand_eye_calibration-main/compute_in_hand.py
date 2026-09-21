@@ -1,124 +1,144 @@
 # coding=utf-8
+"""离线眼在手上求解：输出 Camera -> ArmTip 的旋转和平移（米）。"""
 
-"""
-眼在手上 用采集到的图片信息和机械臂位姿信息计算 相机坐标系相对于机械臂末端坐标系的 旋转矩阵和平移向量
-A2^{-1}*A1*X=X*B2*B1^{−1}
-"""
+import argparse
+from pathlib import Path
+import sys
 
-import os
-import logging
-
-import  yaml
 import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+import yaml
+from scipy.spatial.transform import Rotation
 
-from libs.auxiliary import find_latest_data_folder
-from libs.log_setting import CommonLog
+from save_poses import pose_to_homogeneous_matrix
 
-from save_poses import poses_main
-
-np.set_printoptions(precision=8,suppress=True)
-
-logger_ = logging.getLogger(__name__)
-logger_ = CommonLog(logger_)
+ROOT = Path(__file__).resolve().parent
 
 
-current_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),"eye_hand_data")
+def select_data_dir(data_dir=None):
+    if data_dir is not None:
+        path = Path(data_dir).expanduser().resolve()
+    else:
+        # 优先选择新版采集目录；不跳过损坏的新一轮数据去静默求解旧数据。
+        candidates = sorted(p for p in (ROOT / "data").glob("gemini_*") if p.is_dir())
+        if not candidates:
+            candidates = sorted(p for p in (ROOT / "eye_hand_data").glob("data*") if p.is_dir())
+        if not candidates:
+            raise ValueError("未找到采样目录，请使用 --data-dir 指定含图片和 poses.txt 的目录")
+        path = candidates[-1]
+    if not path.is_dir():
+        raise ValueError(f"采样目录不存在：{path}")
+    return path
 
-images_path = os.path.join("eye_hand_data",find_latest_data_folder(current_path))
-file_path = os.path.join(images_path,"poses.txt")  #采集标定板图片时对应的机械臂末端的位姿 从 第一行到最后一行 需要和采集的标定板的图片顺序进行对应
+
+def load_samples(path):
+    images = list(path.glob("*.jpg"))
+    if not images:
+        raise ValueError(f"目录中没有 JPG 图像：{path}；请检查是否选中了旧的空目录")
+    if any(not f.stem.isdigit() or int(f.stem) < 1 for f in images):
+        raise ValueError("图像必须以 1.jpg、2.jpg 等正整数编号，编号对应 poses.txt 行号")
+    pose_path = path / "poses.txt"
+    if not pose_path.is_file():
+        raise ValueError(f"缺少机器人位姿文件：{pose_path}")
+    poses = np.loadtxt(pose_path, delimiter=",", ndmin=2)
+    if poses.shape[1] != 6 or not np.isfinite(poses).all():
+        raise ValueError("poses.txt 每行必须包含六个有限数值 x,y,z,rx,ry,rz（m、rad）")
+    images.sort(key=lambda f: int(f.stem))
+    ids = [int(f.stem) for f in images]
+    if ids != list(range(1, len(poses) + 1)):
+        raise ValueError("图片编号与位姿行数不一致；需要从 1 开始连续编号且一图一行，不能猜测配对")
+    return images, poses
 
 
-with open("config.yaml", 'r', encoding='utf-8') as file:
-    data = yaml.safe_load(file)
+def load_board(config_path):
+    with open(config_path, encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    if not isinstance(config, dict) or not isinstance(config.get("checkerboard_args"), dict):
+        raise ValueError("配置缺少 checkerboard_args")
+    board = config["checkerboard_args"]
+    xx, yy, length = board.get("XX"), board.get("YY"), board.get("L")
+    if type(xx) is not int or type(yy) is not int or xx < 2 or yy < 2:
+        raise ValueError("XX、YY 必须是大于等于 2 的内部角点数")
+    if isinstance(length, bool) or not isinstance(length, (int, float)) or not np.isfinite(length) or length <= 0:
+        raise ValueError("L 必须为正的有限格长，单位米")
+    return xx, yy, float(length)
 
-XX = data.get("checkerboard_args").get("XX") #标定板的中长度对应的角点的个数
-YY = data.get("checkerboard_args").get("YY") #标定板的中宽度对应的角点的个数
-L = data.get("checkerboard_args").get("L")   #标定板一格的长度  单位为米
 
-
-def func():
-
-    path = os.path.dirname(__file__)
-
-    # 设置寻找亚像素角点的参数，采用的停止准则是最大循环次数30和最大误差容限0.001
+def func(data_dir=None, config_path=None):
+    path = select_data_dir(data_dir)
+    print(f"采样目录：{path}", flush=True)
+    images, poses = load_samples(path)
+    xx, yy, length = load_board(config_path or ROOT / "config.yaml")
+    print(f"样本数：{len(images)}；内部角点：{xx}x{yy}；格长：{length:g} m", flush=True)
     criteria = (cv2.TERM_CRITERIA_MAX_ITER | cv2.TERM_CRITERIA_EPS, 30, 0.001)
+    objp = np.zeros((xx * yy, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:xx, 0:yy].T.reshape(-1, 2)
+    objp *= length
+    obj_points, img_points, transforms, accepted, rejected = [], [], [], [], []
+    size = None
+    for image in images:
+        sample_id = int(image.stem)
+        img = cv2.imread(str(image))
+        if img is None:
+            raise ValueError(f"无法解码图像：{image}")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        image_size = gray.shape[::-1]
+        if size is not None and image_size != size:
+            raise ValueError(f"图像尺寸不一致：{image.name} 为 {image_size}，预期 {size}")
+        size = image_size
+        found, corners = cv2.findChessboardCorners(gray, (xx, yy), None)
+        if not found:
+            rejected.append(sample_id)
+            print(f"跳过 {image.name} 及第 {sample_id} 行位姿：棋盘角点检测失败", flush=True)
+            continue
+        refined = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
+        obj_points.append(objp.copy())
+        img_points.append(refined)
+        # 保留真实编号对应的位姿，绝不使用“前 N 行”替代成功图片的配对。
+        transforms.append(pose_to_homogeneous_matrix(poses[sample_id - 1]))
+        accepted.append(sample_id)
+    print(f"有效样本 ID：{accepted}；未检测到棋盘的 ID：{rejected}", flush=True)
+    if len(accepted) < 3:
+        raise ValueError(f"有效棋盘样本不足 3 组（当前 {len(accepted)}）；请检查 XX/YY、图像清晰度和数据目录")
+    relative_rotations = np.array([
+        Rotation.from_matrix(transforms[0][:3, :3].T @ t[:3, :3]).as_rotvec()
+        for t in transforms[1:]
+    ])
+    if np.linalg.matrix_rank(relative_rotations, tol=1e-6) < 2:
+        raise ValueError("有效样本缺少非平行旋转轴的运动，无法可靠求解手眼变换")
+    rms, intrinsics, distortion, rvecs, tvecs = cv2.calibrateCamera(
+        obj_points, img_points, size, None, None
+    )
+    if not all(np.isfinite(v).all() for v in (rms, intrinsics, distortion, np.array(rvecs), np.array(tvecs))):
+        raise ValueError("相机标定返回非有限数值")
+    rotation, translation = cv2.calibrateHandEye(
+        [t[:3, :3] for t in transforms],
+        [t[:3, 3] for t in transforms],
+        rvecs, tvecs,
+        method=cv2.CALIB_HAND_EYE_TSAI,
+    )
+    if not np.isfinite(rotation).all() or not np.isfinite(translation).all():
+        raise ValueError("手眼求解返回非有限数值，请检查运动多样性和配对")
+    print(f"相机重投影 RMS：{rms:.6f} px", flush=True)
+    print("当前为求解结果，尚未经过独立验证，不代表标定验收通过。", flush=True)
+    return rotation, translation
 
-    # 获取标定板角点的位置
-    objp = np.zeros((XX * YY, 3), np.float32)
-    objp[:, :2] = np.mgrid[0:XX, 0:YY].T.reshape(-1, 2)     # 将世界坐标系建在标定板上，所有点的Z坐标全部为0，所以只需要赋值x和y
-    objp = L*objp
 
-    obj_points = []     # 存储3D点
-    img_points = []     # 存储2D点
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, help="本轮采样目录；默认最新 Gemini 目录，无则使用旧 eye_hand_data")
+    parser.add_argument("--config", type=Path, default=ROOT / "config.yaml", help="棋盘格配置文件")
+    args = parser.parse_args()
+    np.set_printoptions(precision=8, suppress=True)
+    rotation, translation = func(args.data_dir, args.config)
+    print(f"R_armtip_camera：\n{rotation}")
+    print(f"t_armtip_camera_m：\n{translation}")
+    print(f"四元数 xyzw：\n{Rotation.from_matrix(rotation).as_quat()}")
 
-    images_num = [f for f in os.listdir(images_path) if f.endswith('.jpg')]
 
-    for i in range(1, len(images_num) + 1):   #标定好的图片在images_path路径下，从0.jpg到x.jpg
-
-        image_file = os.path.join(images_path,f"{i}.jpg")
-
-        if os.path.exists(image_file):
-
-            logger_.info(f'读 {image_file}')
-
-            img = cv2.imread(image_file)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            size = gray.shape[::-1]
-            ret, corners = cv2.findChessboardCorners(gray, (XX, YY), None)
-
-            if ret:
-
-                obj_points.append(objp)
-
-                corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)  # 在原角点的基础上寻找亚像素角点
-                if [corners2]:
-                    img_points.append(corners2)
-                else:
-                    img_points.append(corners)
-
-    N = len(img_points)
-
-    # 标定,得到图案在相机坐标系下的位姿
-    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(obj_points, img_points, size, None, None)
-
-    # logger_.info(f"内参矩阵:\n:{mtx}" ) # 内参数矩阵
-    # logger_.info(f"畸变系数:\n:{dist}")  # 畸变系数   distortion cofficients = (k_1,k_2,p_1,p_2,k_3)
-
-    print("-----------------------------------------------------")
-
-    poses_main(file_path)
-    # 机器人末端在基座标系下的位姿
-
-    csv_file = os.path.join(path,"RobotToolPose.csv")
-    tool_pose = np.loadtxt(csv_file,delimiter=',')
-
-    R_tool = []
-    t_tool = []
-
-    for i in range(int(N)):
-
-        R_tool.append(tool_pose[0:3,4*i:4*i+3])
-        t_tool.append(tool_pose[0:3,4*i+3])
-
-    R, t = cv2.calibrateHandEye(R_tool, t_tool, rvecs, tvecs, cv2.CALIB_HAND_EYE_TSAI)
-
-    return R,t
-
-if __name__ == '__main__':
-
-    # 旋转矩阵
-    rotation_matrix, translation_vector = func()
-
-    # 将旋转矩阵转换为四元数
-    rotation = R.from_matrix(rotation_matrix)
-    quaternion = rotation.as_quat()
-    x, y, z = translation_vector.flatten()
-
-    logger_.info(f"旋转矩阵是:\n {            rotation_matrix}")
-
-    logger_.info(f"平移向量是:\n {            translation_vector}")
-
-    logger_.info(f"四元数是：\n {             quaternion}")
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, cv2.error) as exc:
+        print(f"标定失败：{exc}", file=sys.stderr)
+        sys.exit(1)

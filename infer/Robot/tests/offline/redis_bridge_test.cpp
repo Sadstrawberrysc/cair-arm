@@ -113,5 +113,23 @@ int main() {
         "state", "status", "timestamp_unix_ms", "version"};
     ok &= Check(Keys(status) == expected_status_keys,
                 "robot:status:channel top-level schema");
+
+    nlohmann::json wp={{"version",1},{"runtime_session_id","run"},{"producer_id","camera"},
+        {"target_id","click"},{"sequence",1},{"timestamp_monotonic_ns",1000000000LL},
+        {"capture_monotonic_ns",950000000LL},{"boot_id","boot"},{"calibration_sha256","hash"},
+        {"frame","gemini305_color_optical"},{"length_unit","m"},{"valid",true},
+        {"point_camera_m",{0,0,.1}},{"normal_out_camera",{0,0,-1}},
+        {"quality",{{"surface_points",100},{"feature_inliers",20},{"plane_rms_m",.001},{"plane_inlier_ratio",.9}}}};
+    WristPacket packet; std::string wrist_error;
+    auto parse_wrist=[&](){return RedisBridge::ParseWristPacket(wp.dump(),true,"run","hash","boot",1000000000LL,packet,wrist_error);};
+    ok &= Check(parse_wrist(), "wrist valid optical observation accepted");
+    wp["capture_monotonic_ns"]=700000000LL;
+    ok &= Check(!parse_wrist(), "wrist old capture not refreshed by new message time");
+    wp["capture_monotonic_ns"]=950000000LL; wp["runtime_session_id"]="old";
+    ok &= Check(!parse_wrist(), "wrist runtime session isolation");
+    wp["runtime_session_id"]="run"; wp["normal_out_camera"]={0,0,1};
+    ok &= Check(!parse_wrist(), "wrist normal must face camera");
+    wp["normal_out_camera"]={0,0,-1}; wp["quality"]["plane_rms_m"]=.003;
+    ok &= Check(!parse_wrist(), "wrist plane quality gate enforced by consumer");
     return ok ? 0 : 1;
 }

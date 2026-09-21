@@ -97,6 +97,8 @@ int main() {
     data.control.safety.raw_force_limit_n = 50.0;
     data.control.safety.raw_torque_limit_nm = 5.0;
     const nlohmann::json summary = BuildRuntimeSummary(data);
+    ok &= Check(summary["control"]["force_sensor_enabled"] == true,
+                "default summary retains force acquisition enabled");
     std::set<std::string_view> built_keys;
     for (const auto& item : summary.items()) built_keys.insert(item.key());
     ok &= Check(built_keys == summary_keys,

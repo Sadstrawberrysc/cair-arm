@@ -1,0 +1,7 @@
+# Official SDK archives and extracted local dependencies.
+/sdk/
+__pycache__/
+*.pyc
+
+# Local camera and robot runtime logs
+/log/

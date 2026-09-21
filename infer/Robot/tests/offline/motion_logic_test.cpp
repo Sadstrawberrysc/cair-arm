@@ -114,5 +114,73 @@ int main() {
     plan = probe_planner.Plan(probe_joints, probe_pose, probe_pose);
     ok &= Check(!plan.valid && plan.error == Rm75PlanError::kJointLimitMargin,
                 "probe planner retains hard stop at J4 margin 2.9 deg");
+
+    {
+        WristFollowController filtered;
+        WristFollowInput input;
+        input.fresh=true; input.target_id="noise"; input.request_token="begin"; input.action="begin";
+        input.normal_base=Eigen::Vector3d(0,0,-1);
+        auto first=filtered.Step(input);
+        filtered.Commit(first.tcp_reference);
+        input.action="heartbeat";
+        input.normal_base=Eigen::AngleAxisd(4.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
+        auto small=filtered.Step(input);
+        ok &= Check((small.tcp_goal.topLeftCorner<3,3>()-first.tcp_goal.topLeftCorner<3,3>()).norm()<1e-12,
+                    "four-degree normal change retains orientation goal");
+        input.normal_base=Eigen::AngleAxisd(6.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
+        auto large=filtered.Step(input);
+        ok &= Check((large.tcp_goal.topLeftCorner<3,3>().col(2)+input.normal_base).norm()<1e-12,
+                    "real tilt beyond deadband updates orientation goal");
+        ok &= Check(Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
+                    Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()))<=5.*M_PI/180.*input.cycle_s+1e-12,
+                    "filtered orientation retains angular speed bound");
+    }
+
+    WristFollowController wrist;
+    WristFollowInput wi;
+    wi.fresh=true; wi.target_id="target1"; wi.request_token="producer:1"; wi.action="begin";
+    wi.normal_base=Eigen::Vector3d(0,0,-1);
+    wi.surface_base=Eigen::Vector3d(.01,0,.10);
+    auto wo=wrist.Step(wi);
+    ok &= Check(wo.following && wo.reference_reset, "wrist explicit begin resets measured reference");
+    ok &= Check((wo.tcp_goal.topRightCorner<3,1>()-Eigen::Vector3d(.01,0,.05)).norm()<1e-12,
+                "wrist adds exactly 50 mm outward");
+    ok &= Check(wo.tcp_reference.topRightCorner<3,1>().norm()<=.000050001,
+                "wrist speed at most 5 mm/s");
+    ok &= Check((wo.tcp_goal.topLeftCorner<3,3>().col(2)-Eigen::Vector3d(0,0,1)).norm()<1e-12,
+                "wrist Tool Z points inward");
+    wrist.Commit(wo.tcp_reference);
+    wi.fresh=false; wi.reject_reason="camera_lost";
+    ok &= Check(!wrist.Step(wi).following, "wrist loss holds");
+    wi.fresh=true;
+    ok &= Check(!wrist.Step(wi).following, "old begin cannot auto resume");
+    wi.action="resume"; wi.request_token="producer:2";
+    ok &= Check(!wrist.Step(wi).following, "resume needs a new click");
+    wi.target_id="target2"; wi.request_token="producer:3"; wi.actual_tcp(0,3)=.2;
+    wo=wrist.Step(wi);
+    ok &= Check(wo.following && wo.reference_reset && std::abs(wo.tcp_reference(0,3)-.2)<.000051,
+                "wrist resume rebases on actual TCP");
+    wi.request_token="producer:4"; wi.action="pause";
+    ok &= Check(!wrist.Step(wi).following, "pause remains explicit Hold");
+    wi.action="resume"; wi.target_id="target3"; wi.request_token="producer:5";
+    wi.normal_base=Eigen::Vector3d(.1,0,-1).normalized();
+    wo=wrist.Step(wi);
+    ok &= Check(wo.following && Eigen::AngleAxisd(wo.tcp_reference.topLeftCorner<3,3>()).angle()
+                <=5*M_PI/180.*.01+1e-9, "angular reference limited to 5 deg/s");
+    wrist.Hold("planner_rejected");
+    ok &= Check(!wrist.Step(wi).following, "planner rejection is latched");
+    wi.normal_base=Eigen::Vector3d(1,0,0); wi.target_id="degenerate";
+    wi.request_token="producer:6";
+    wo=wrist.Step(wi);
+    ok &= Check(!wo.following && wo.reason=="tangent_orientation_degenerate",
+                "degenerate Tool-X projection holds");
+    wi.normal_base=Eigen::Vector3d(0,0,-1);
+    WristFollowController early;
+    wi.action="begin"; wi.request_token="early:1"; wi.target_id="early"; wi.fresh=false;
+    ok &= Check(!early.Step(wi).following && early.ResumeRequired(), "premature request rejected explicitly");
+    wi.fresh=true;
+    ok &= Check(!early.Step(wi).following, "premature begin cannot activate on later frames");
+    wi.action="resume"; wi.request_token="early:2"; wi.target_id="new_click";
+    ok &= Check(early.Step(wi).following, "rejected start can recover with explicit new click");
     return ok ? 0 : 1;
 }

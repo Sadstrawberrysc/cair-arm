@@ -68,3 +68,23 @@ source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh && conda activate carot
 ```text
 视觉窗口按 t（结束本轮）或 q（terminate 并退出）→ main_rm75 终端按 Ctrl+C
 ```
+# 腕部投影 observe 扩展（2026-09-15）
+
+新增 `--wrist-projection-calibration FILE --wrist-global-calibration FILE`，
+仅允许与 `--observe`、启用 Redis、`--publish-every 1` 或 `2` 一起使用。
+启动前要求 `robot:wrist:seed:v1` 有本轮成功粗定位产生的有效种子且标定摘要匹配。
+此选项只发布相机位姿用于投影，不启用腕部跟踪或 ServoJ。
+
+完整先后顺序、硬件运行前置条件与相机入口见
+[腕部投影操作说明](../infer/Camera_wrist/USAGE.md)。
+
+## 腕部点击跟随模式（2026-09-16）
+
+最小联动入口改为 Gemini 画面左键点击，不需要全局相机、数字人或60秒seed。
+完整独立观察、Redis观察、dry-run和有条件执行命令见
+[腕部点击启动说明](../infer/Camera_wrist/USAGE.md)，
+[接口](../infer/Camera_wrist/ARCHITECTURE.md)。
+Robot 显式参数为 `--wrist-follow FILE --publish-every 1`，结合 `--observe` 或
+`--dry-run-control`；纯离线测试使用 `--simulate --redis-enabled`。
+真实执行另需 `--execute-wrist-follow --confirm-wrist-follow` 和现场确认、独立标定验收。
+原显式模式5mm/5°总运动包络与全部安全门保留；不要同时启动其他机器人运动控制者。

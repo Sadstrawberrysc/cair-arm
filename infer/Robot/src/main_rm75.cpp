@@ -123,6 +123,14 @@ void Usage(const char* program) {
         << "    envelope applies only before contact, not to the Tool-X scan.\n\n"
         << "Safe modes (default is observe):\n"
         << "  --observe             acquire/publish only; never plan or send motion\n"
+        << "  --wrist-unlimited-excursion  candidate trial only: disable total displacement/rotation gates\n"
+        << "  --wrist-candidate-trial  unverified-extrinsic wrist experiment (0=continuous or 1..30 s)\n"
+        << "  --wrist-no-force      explicit wrist-only mode without force acquisition/protection\n"
+        << "  --wrist-follow FILE   click target mode, no global seed\n"
+        << "  --execute-wrist-follow --confirm-wrist-follow   explicit verified wrist execution\n"
+        << "  --redis-enabled      enable Redis with --simulate (place after --simulate)\n"
+        << "  --wrist-projection-calibration FILE --wrist-global-calibration FILE\n"
+        << "                        projection state only; requires observe, Redis, publish-every <= 2\n"
         << "  --dry-run-control     plan and log motion; never send ServoJ\n"
         << "  --simulate            no hardware; implies dry-run and --no-redis\n\n"
         << "Hardware/configuration:\n"
@@ -189,6 +197,25 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
             std::exit(0);
         } else if (argument == "--observe") {
             options.mode = ControllerMode::kObserve;
+        } else if (argument == "--wrist-unlimited-excursion") {
+            options.wrist_unlimited_excursion=true;
+        } else if (argument == "--wrist-candidate-trial") {
+            options.wrist_candidate_trial=true;
+        } else if (argument == "--wrist-no-force") {
+            options.wrist_no_force=true;
+        } else if (argument == "--wrist-follow") {
+            const char* item=value(); if (!item) return false; options.wrist_follow_calibration=item;
+        } else if (argument == "--execute-wrist-follow") {
+            options.mode=ControllerMode::kExecute;
+            options.wrist_execute_requested=true;
+        } else if (argument == "--confirm-wrist-follow") {
+            options.confirm_wrist_follow=true;
+        } else if (argument == "--redis-enabled") {
+            options.redis_enabled=true;
+        } else if (argument == "--wrist-projection-calibration") {
+            const char* item=value(); if (!item) return false; options.wrist_projection_calibration=item;
+        } else if (argument == "--wrist-global-calibration") {
+            const char* item=value(); if (!item) return false; options.wrist_global_calibration=item;
         } else if (argument == "--dry-run-control") {
             options.mode = ControllerMode::kDryRun;
         } else if (argument == "--simulate") {
@@ -507,7 +534,7 @@ int main(int argc, char** argv) {
     }
     const Rm75ControlConfig& effective_control = options.control;
     const Rm75ServoPlannerConfig& effective_planner = options.planner;
-    const Rm75RuntimeSafetyConfig& effective_safety = options.safety;
+    const Rm75RuntimeSafetyConfig& effective_safety = options.EffectiveSafety();
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
     const bool provisional_execute =
@@ -670,12 +697,12 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (options.mode == ControllerMode::kExecute) {
-        if (options.expected_sensor_id.empty()) {
+        if (!options.wrist_no_force && options.expected_sensor_id.empty()) {
             std::cerr << "Execute rejected: --expected-sensor-id is required\n";
             return 3;
         }
         if (!calibration.tool_chain_verified
-            || !calibration.calibration_residuals_verified
+            || (!options.wrist_no_force && !calibration.calibration_residuals_verified)
             || calibration_probe_sha256.empty()) {
             if (!provisional_execute || calibration_probe_sha256.empty()) {
                 std::cerr << "Execute rejected: verified residuals, R/t/TCP and "
@@ -711,12 +738,34 @@ int main(int argc, char** argv) {
     // 力控、视觉、扫描和 IK 的生产参数分别定义在其模块配置结构中；本入口
     // 只注入运行时标定得到的坐标关系，不再逐项覆盖模块默认参数。
     Rm75ControlConfig control_config = options.control;
-    Rm75RuntimeSafetyConfig safety_config = options.safety;
+    Rm75RuntimeSafetyConfig safety_config = options.EffectiveSafety();
     control_config.cycle_s = options.period_ms / 1000.0;
     // RMState pose is Base -> Arm_Tip. The current hardware Tool frame is
     // coincident with Sensor, while Arm_Tip and Tool differ by the calibrated
     // fixed 30-degree Z mount rotation. Keep control deltas in Tool/Sensor.
     const CalibratedFrameChain frame_chain(calibration);
+    Eigen::Matrix4d wrist_arm_camera=Eigen::Matrix4d::Identity();
+    std::string wrist_hash, wrist_global_hash;
+    if (!options.wrist_follow_calibration.empty()) {
+        try {
+            wrist_arm_camera=CalibratedFrameChain::LoadCameraTransform(
+                options.wrist_follow_calibration,"gemini305_color_optical_to_rm75_armtip",
+                "T_armtip_camera",wrist_hash,options.mode==ControllerMode::kExecute && !options.wrist_candidate_trial);
+        } catch (const std::exception& exception) {
+            std::cerr << "Wrist follow rejected: " << exception.what() << '\n'; return 3;
+        }
+    }
+    if (!options.wrist_projection_calibration.empty()) {
+        try {
+            wrist_arm_camera=CalibratedFrameChain::LoadCameraTransform(
+                options.wrist_projection_calibration, "gemini305_color_optical_to_rm75_armtip",
+                "T_armtip_camera", wrist_hash);
+            CalibratedFrameChain::LoadCameraTransform(options.wrist_global_calibration,
+                "d455_color_optical_to_rm75_base", "T_base_camera", wrist_global_hash);
+        } catch (const std::exception& exception) {
+            std::cerr << "Wrist projection rejected: " << exception.what() << '\n'; return 3;
+        }
+    }
     control_config.rotation_pose_from_tool =
         frame_chain.RotationArmTipFromTool();
     control_config.probe_tcp_tool_m = frame_chain.ProbeTcpToolM();
@@ -734,14 +783,24 @@ int main(int argc, char** argv) {
     redis_config.enabled = options.redis_enabled;
     redis_config.host = options.redis_host;
     redis_config.port = options.redis_port;
+    redis_config.wrist_follow = !options.wrist_follow_calibration.empty();
     RedisBridge redis(redis_config);
+    if (redis_config.wrist_follow) redis.ConfigureWristFollow(wrist_hash);
+    if (!options.wrist_projection_calibration.empty()
+        && !redis.LoadWristProjectionSeed(wrist_global_hash, wrist_hash, &error)) {
+        std::cerr << "Wrist projection rejected: " << error << '\n'; return 3;
+    }
 
     AsyncRuntimeLogger logger;
-    if (!logger.Start(options.runtime_log_path, &error)) {
+    if (!logger.Start(options.runtime_log_path, &error, redis_config.wrist_follow)) {
         std::cerr << error << '\n';
         return 3;
     }
 
+    if (options.wrist_candidate_trial) {
+        std::cout << "CANDIDATE WRIST TRIAL: unverified extrinsic; no force acquisition/protection; "
+                     "calibration sha256=" << wrist_hash << '\n';
+    }
     // 4.4 启动传感器与机械臂 I/O 所有者。
     // 两类读取均在独立线程中进行，10 ms 主循环只消费线程安全快照。
     ForceSensorConfig sensor_config;
@@ -750,7 +809,7 @@ int main(int argc, char** argv) {
     sensor_config.query_period = std::chrono::milliseconds(options.period_ms);
     sensor_config.stale_after = std::chrono::milliseconds(options.sensor_stale_ms);
     std::unique_ptr<ForceSensorReader> force_reader;
-    if (!options.simulate) {
+    if (!options.simulate && !options.wrist_no_force) {
         force_reader = std::make_unique<ForceSensorReader>(sensor_config);
         if (!force_reader->Start()) {
             std::cerr << "Force sensor start failed: " << force_reader->LastError() << '\n';
@@ -794,7 +853,7 @@ int main(int argc, char** argv) {
             std::chrono::milliseconds(options.robot_stale_ms));
         state_reader = std::make_unique<RMStateReader>(
             command,
-            std::chrono::milliseconds(40),
+            std::chrono::milliseconds(options.StatePollPeriodMs()),
             std::chrono::milliseconds(options.robot_stale_ms));
         result = state_reader->Start();
         if (!result) {
@@ -836,6 +895,7 @@ int main(int argc, char** argv) {
             std::cerr << "Execute cancelled before force warm-up\n";
             return 130;
         }
+        if (!options.wrist_no_force) {
         const int warmup_seconds = provisional_execute
             ? options.tare_no_contact_s
             : options.execute_warmup_s;
@@ -895,6 +955,7 @@ int main(int argc, char** argv) {
                       << " (required <= 0.5 N / 0.05 N*m)\n";
             return 5;
         }
+        } // Force warmup is absent only in explicit wrist-no-force mode.
         robot_state = state_reader->Latest();
     } else if (options.tare_no_contact_s > 0) {
         std::cout << "Running explicit stationary no-contact tare for "
@@ -956,6 +1017,7 @@ int main(int argc, char** argv) {
               << "sensor_protocol: "
               << ForceSensorProtocolName(sensor_config.protocol) << '\n'
               << "sensor_stale_ms: " << options.sensor_stale_ms << '\n'
+              << "robot_state_poll_ms: " << options.StatePollPeriodMs() << '\n'
               << "robot_stale_ms: " << options.robot_stale_ms << '\n'
               << "redis_enabled: "
               << (options.redis_enabled ? "yes" : "no") << '\n'
@@ -1019,10 +1081,11 @@ int main(int argc, char** argv) {
               << (control_config.legacy_contact_roll_enabled
                       ? "enabled" : "disabled")
               << '\n'
-              << "maximum_no_contact_approach_distance_mm: "
+              << "wrist_total_excursion_limits: " << (options.wrist_unlimited_excursion ? "disabled" : "enabled") << '\n'
+              << "configured_maximum_no_contact_approach_distance_mm: "
               << safety_config.maximum_no_contact_approach_distance_m * 1000.0
               << '\n'
-              << "maximum_orientation_excursion_deg: "
+              << "configured_maximum_orientation_excursion_deg: "
               << safety_config.maximum_orientation_excursion_deg << '\n'
               << "controller_pose_frame: arm_tip\n"
               << "control_tool_frame: sensor\n"
@@ -1200,6 +1263,9 @@ int main(int argc, char** argv) {
     // 每周期顺序固定为：读取快照 -> 校验 -> wrench 补偿 -> Redis 意图 ->
     // 状态机/力控 -> IK 规划 -> ServoJ/Hold -> 发布与日志 -> 周期调度。
     // ---------------------------------------------------------------------
+    WristFollowController wrist_controller;
+    std::deque<CalibratedFrameChain::CameraSample> wrist_history;
+    std::uint64_t wrist_rejection_generation = 0;
     while (!g_stop_requested.load()) {
         const auto cycle_started = std::chrono::steady_clock::now();
         if (options.duration_s > 0
@@ -1225,6 +1291,9 @@ int main(int argc, char** argv) {
             robot_state.received_at = cycle_started;
             robot_state.sequence = cycle;
             robot_state.stale = false;
+            if (redis_config.wrist_follow) {
+                robot_state.pose=model_pose; robot_state.joints=model_joints;
+            }
         }
         const bool robot_feedback_stale_only =
             robot_state.valid && robot_state.stale
@@ -1234,6 +1303,15 @@ int main(int argc, char** argv) {
             && robot_state.arm_err == 0 && robot_state.sys_err == 0
             && static_cast<bool>(asynchronous_robot_result);
         bool robot_feedback_recovered_this_cycle = false;
+        if (redis_config.wrist_follow) {
+            if (!robot_valid) wrist_history.clear();
+            else {
+                const auto stamp=MonotonicNs(robot_state.received_at);
+                if (wrist_history.empty() || stamp>wrist_history.back().time_ns)
+                    wrist_history.push_back({stamp,frame_chain.CameraPoseBase(robot_state.pose,wrist_arm_camera)});
+                while (wrist_history.size()>100) wrist_history.pop_front();
+            }
+        }
         bool robot_feedback_hold_started_this_cycle = false;
         if (!robot_valid && options.mode == ControllerMode::kExecute) {
             if (robot_feedback_stale_only) {
@@ -1285,12 +1363,15 @@ int main(int argc, char** argv) {
         bool visual_y_tracking_reference_rebased = false;
         if (robot_valid && options.mode == ControllerMode::kExecute
             && !options.simulate
+            && options.wrist_follow_calibration.empty()
             && robot_model_tool_y_error_m
                    >= control_config.visual_y_tracking_rebase_error_m
             && robot_model_position_error_m > 0.0
             && robot_model_tool_y_error_m / robot_model_position_error_m
                    >= control_config.visual_y_tracking_rebase_dominance_ratio) {
-            // 仅处理由视觉 Tool-Y 参考领先造成的横向跟踪落后：以实际关节
+            // 仅用于原超声视觉 Tool-Y 模式；腕部模式由自己的控制器管理参考，
+            // 不在这里重置模型或清零 previous_joint_delta，误差仍由下方安全门监督。
+            // 处理由视觉 Tool-Y 参考领先造成的横向跟踪落后：以实际关节
             // 反馈重建模型与笛卡尔参考，并在下一周期从实体当前位置重新积累。
             // 非 Tool-Y 主导的关节/位置/姿态故障仍保留原有 Stop 路径。
             model_joints = robot_state.joints;
@@ -1350,13 +1431,13 @@ int main(int argc, char** argv) {
                     < planner.Config().joint_limit_stop_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_joint_limit_margin_exceeded";
-            } else if (!contact_established
+            } else if (!options.wrist_unlimited_excursion && !contact_established
                        && actual_approach_distance_mm
                        > safety_config.maximum_no_contact_approach_distance_m
                              * 1000.0) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_maximum_approach_distance_exceeded";
-            } else if (safety_config.maximum_orientation_excursion_deg > 0.0
+            } else if (!options.wrist_unlimited_excursion && safety_config.maximum_orientation_excursion_deg > 0.0
                        && actual_total_orientation_deg
                               > safety_config.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
@@ -1381,10 +1462,10 @@ int main(int argc, char** argv) {
         WrenchSample force_sample;
         Eigen::Matrix<double, 6, 1> raw_wrench =
             Eigen::Matrix<double, 6, 1>::Zero();
-        if (!options.simulate) {
+        if (!options.simulate && !options.wrist_no_force) {
             force_sample = force_reader->LatestSample();
             raw_wrench = ArrayToEigen(force_sample.wrench_si);
-        } else {
+        } else if (!options.wrist_no_force) {
             force_sample.valid = true;
             force_sample.stale = false;
             force_sample.checksum_valid = true;
@@ -1436,7 +1517,7 @@ int main(int argc, char** argv) {
         }
         stale_wrench_cycles = wrench_valid ? 0 : stale_wrench_cycles + 1;
         if (options.mode == ControllerMode::kExecute
-            && stale_wrench_cycles * options.period_ms > 500) {
+            && !options.wrist_no_force && stale_wrench_cycles * options.period_ms > 500) {
             fatal_fault = true;
             fatal_fault_code = "force_sensor_stale_over_500ms";
         }
@@ -1466,10 +1547,25 @@ int main(int argc, char** argv) {
         intent.action_enabled = options.manual_action;
         intent.terminate = options.manual_terminate;
         RedisCommandSnapshot redis_command;
+        const WristRedisSnapshot wrist_snapshot = redis_config.wrist_follow ? redis.LatestWrist() : WristRedisSnapshot{};
+        const auto wrist_snapshot_time_ns=MonotonicNs(std::chrono::steady_clock::now());
         const bool redis_publisher_connected =
             options.redis_enabled && redis.PublisherConnected();
         RedisCommandDecision command_decision;
-        if (options.redis_enabled) {
+        if (redis_config.wrist_follow) {
+            redis_command.session_id=wrist_snapshot.command.producer;
+            redis_command.producer_sequence=wrist_snapshot.command.sequence;
+            redis_command.subscriber_connected=wrist_snapshot.connected;
+            intent.sequence=wrist_snapshot.command.sequence;
+            intent.action_enabled=false;
+            command_decision.present=wrist_snapshot.command.sequence!=0;
+            command_decision.age_ms=(wrist_snapshot_time_ns-wrist_snapshot.command.time_ns)/1e6;
+            command_decision.valid=wrist_snapshot.connected && wrist_snapshot.command.valid
+                && command_decision.age_ms>=0 && command_decision.age_ms<=500;
+            command_decision.fresh=command_decision.valid;
+            command_decision.intent=intent;
+            if (!command_decision.valid) command_decision.hold_reason="wrist_command_missing_or_stale";
+        } else if (options.redis_enabled) {
             redis_command = redis.LatestCommand();
             command_decision = RedisBridge::EvaluateCommandForControl(
                 redis_command,
@@ -1629,10 +1725,18 @@ int main(int argc, char** argv) {
         } else {
             // 恢复后的第一个周期以 motion_armed=false 清空导纳速度、接触锁存
             // 和未完成视觉修正；下一周期才从最新实测位姿恢复正常闭环。
-            control_output = control_law.Step(
+            if (options.wrist_no_force) {
+                // Do not fabricate a valid zero wrench or run the force state machine.
+                control_output.desired_pose=cartesian_reference_pose;
+                control_output.state=Rm75SupervisorState::kObserve;
+                if (!robot_valid) {
+                    control_output.state=Rm75SupervisorState::kHold;
+                    control_output.fault="robot_state_invalid_or_stale";
+                }
+            } else control_output = control_law.Step(
                 control_input,
                 intent,
-                arm_control && !robot_feedback_recovered_this_cycle
+                arm_control && !redis_config.wrist_follow && !robot_feedback_recovered_this_cycle
                     && !recoverable_command_hold);
             if (robot_feedback_recovered_this_cycle) {
                 control_output.state = Rm75SupervisorState::kHold;
@@ -1658,6 +1762,52 @@ int main(int argc, char** argv) {
                                ? "new_command_received_reference_rebased"
                                : "waiting_for_new_command_after_recoverable_hold");
                 }
+            }
+        }
+        WristFollowOutput wrist_output;
+        WristFollowInput wrist_input;
+        double wrist_age_ms=0., wrist_span_ms=0.;
+        if (redis_config.wrist_follow) {
+            const auto now=wrist_snapshot_time_ns;
+            const auto& obs=wrist_snapshot.observation;
+            const auto& req=wrist_snapshot.request;
+            wrist_age_ms=(now-obs.capture_ns)/1e6;
+            Eigen::Matrix4d capture_pose=Eigen::Matrix4d::Identity();
+            const bool pose_matched=CalibratedFrameChain::InterpolateCamera(wrist_history,obs.capture_ns,capture_pose,wrist_span_ms);
+            wrist_input.fresh=obs.valid && wrist_snapshot.connected && command_decision.valid
+                && wrist_age_ms>=0 && wrist_age_ms<=200 && pose_matched
+                && obs.target==wrist_snapshot.command.target && obs.producer==wrist_snapshot.command.producer;
+            wrist_input.reject_reason=pose_matched?"wrist_observation_missing_stale_or_mismatched":"wrist_pose_time_unmatched";
+            wrist_input.external_hold=fatal_fault || !control_output.fault.empty() || !robot_valid
+                || pause_for_robot_feedback || recoverable_command_hold
+                || wrist_snapshot.rejection_generation!=wrist_rejection_generation;
+            if (wrist_snapshot.rejection_generation!=wrist_rejection_generation)
+                wrist_input.reject_reason=wrist_snapshot.error;
+            wrist_rejection_generation=wrist_snapshot.rejection_generation;
+            wrist_input.target_id=obs.target;
+            if (req.valid && now>=req.time_ns && now-req.time_ns<=500000000) {
+                wrist_input.request_token=req.producer+":"+std::to_string(req.sequence);
+                wrist_input.action=req.action;
+                if (req.action=="begin" || req.action=="resume")
+                    wrist_input.fresh=wrist_input.fresh && req.producer==obs.producer && req.target==obs.target;
+            }
+            CalibratedFrameChain::CameraObservationBase(capture_pose,obs.point,obs.normal,
+                wrist_input.surface_base,wrist_input.normal_base);
+            wrist_input.actual_tcp=frame_chain.ToolTcpPoseBase(robot_state.pose);
+            wrist_input.cycle_s=options.period_ms/1000.;
+            wrist_output=wrist_controller.Step(wrist_input);
+            if (wrist_output.reference_reset) {
+                model_joints=robot_state.joints;
+                model_pose=planner.PoseFromJoints(model_joints);
+                cartesian_reference_pose=model_pose;
+                previous_joint_delta.setZero();
+            }
+            if (control_output.fault.empty()) {
+                control_output.state=wrist_output.following?Rm75SupervisorState::kApproach:Rm75SupervisorState::kHold;
+                control_output.command_motion=wrist_output.following && arm_control;
+                control_output.desired_pose=control_output.command_motion
+                    ?frame_chain.ArmTipPoseFromTcp(wrist_output.tcp_reference):cartesian_reference_pose;
+                control_output.fault=wrist_output.reason;
             }
         }
         bool target_force_reference_rebased = false;
@@ -1757,6 +1907,7 @@ int main(int argc, char** argv) {
         // 默认先构造“保持当前模型”的有效计划；只有 command_motion 或独立回退
         // 请求出现时才真正求解下一组关节目标。
         Rm75ServoPlan servo_plan;
+        bool wrist_plan_attempted=false;
         servo_plan.target_joints = model_joints;
         servo_plan.model_pose = model_pose;
         servo_plan.valid = true;
@@ -1860,6 +2011,7 @@ int main(int argc, char** argv) {
             }
         } else if (!retreat_active && !fatal_fault
                    && control_output.command_motion) {
+            wrist_plan_attempted=redis_config.wrist_follow;
             // 正常路径：desired_pose 已包含 Tool-X 扫描、视觉 Tool-Y/RZ 修正和
             // Tool-Z 力导纳，由规划器统一转换为一个七关节 ServoJ 目标。
             servo_plan = planner.Plan(model_joints,
@@ -1867,10 +2019,16 @@ int main(int argc, char** argv) {
                                       control_output.desired_pose,
                                       previous_joint_delta);
             if (!servo_plan.valid) {
-                fatal_fault = true;
-                fatal_fault_code = std::string("servo_plan_")
-                    + Rm75PlanErrorString(servo_plan.error);
-                control_output.fault = servo_plan.detail;
+                if (redis_config.wrist_follow) {
+                    wrist_controller.Hold(std::string("planner_rejected:")+Rm75PlanErrorString(servo_plan.error));
+                    control_output.command_motion=false;
+                    control_output.state=Rm75SupervisorState::kHold;
+                    control_output.fault=wrist_controller.Reason();
+                } else {
+                    fatal_fault = true;
+                    fatal_fault_code = std::string("servo_plan_")+Rm75PlanErrorString(servo_plan.error);
+                    control_output.fault = servo_plan.detail;
+                }
             }
         }
 
@@ -1910,12 +2068,12 @@ int main(int argc, char** argv) {
                 frame_chain.RotationBaseFromArmTip(servo_plan.model_pose);
             const Eigen::AngleAxisd orientation_excursion(
                 planned_rotation * initial_tool_rotation.transpose());
-            if (safety_config.maximum_orientation_excursion_deg > 0.0
+            if (!options.wrist_unlimited_excursion && safety_config.maximum_orientation_excursion_deg > 0.0
                 && orientation_excursion.angle() * 180.0 / M_PI
                        > safety_config.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "maximum_orientation_excursion_exceeded";
-            } else if (!contact_established
+            } else if (!options.wrist_unlimited_excursion && !contact_established
                        && (frame_chain.ProbeTcpBase(servo_plan.model_pose)
                  - approach_origin_probe_tcp).norm()
                 > safety_config.maximum_no_contact_approach_distance_m) {
@@ -1947,6 +2105,7 @@ int main(int argc, char** argv) {
                         // Advance the ideal reference only after planning (and
                         // hardware submission in execute mode) succeeds.
                         cartesian_reference_pose = control_output.desired_pose;
+                        if (redis_config.wrist_follow) wrist_controller.Commit(wrist_output.tcp_reference);
                     }
                 }
             }
@@ -2037,6 +2196,29 @@ int main(int argc, char** argv) {
         if (legacy_completion_pending
             || cycle % static_cast<std::uint64_t>(options.publish_every) == 0) {
             RedisSensorMessage message;
+            if (!options.wrist_projection_calibration.empty() || redis_config.wrist_follow) {
+                message.wrist_projection_enabled=true;
+                message.wrist_pose_valid=robot_valid;
+                message.wrist_pose_sequence=robot_state.sequence;
+                message.wrist_pose_timestamp_ns=MonotonicNs(robot_state.received_at);
+                message.wrist_camera_pose=frame_chain.CameraPoseBase(robot_state.pose, wrist_arm_camera);
+                if (redis_config.wrist_follow) {
+                    message.wrist_follow_state=wrist_controller.Following()?"following":"hold";
+                    message.wrist_follow_reason=control_output.fault;
+                    message.wrist_target_id=wrist_input.target_id;
+                    message.wrist_resume_required=wrist_controller.ResumeRequired();
+                    const auto& req=wrist_snapshot.request;
+                    if (wrist_controller.RequestToken()==req.producer+":"+std::to_string(req.sequence)) {
+                        message.wrist_request_sequence=req.sequence;
+                        message.wrist_request_producer=req.producer;
+                    }
+                    message.wrist_actual_gap_m=wrist_output.actual_gap_m;
+                    message.wrist_age_ms=wrist_age_ms; message.wrist_pose_span_ms=wrist_span_ms;
+                    message.wrist_surface_base=wrist_input.surface_base;
+                    message.wrist_normal_base=wrist_input.normal_base;
+                    message.wrist_goal_tcp=wrist_output.tcp_goal.topRightCorner<3,1>();
+                }
+            }
             message.sequence = force_sample.sequence;
             message.timestamp_ns = force_sample.monotonic_timestamp
                     == std::chrono::steady_clock::time_point{}
@@ -2074,6 +2256,19 @@ int main(int argc, char** argv) {
         // 5.10 把本周期所有输入、命令、状态、目标和误差复制到日志行。
         // PushAndMeasure 只入队；后台线程负责 CSV 格式化和落盘。
         RuntimeLogRow row;
+        if (redis_config.wrist_follow) {
+            row.wrist_enabled=true; row.wrist_valid=wrist_input.fresh;
+            row.wrist_age_ms=wrist_age_ms; row.wrist_span_ms=wrist_span_ms;
+            row.wrist_gap_m=wrist_output.actual_gap_m; row.wrist_target=wrist_input.target_id;
+            row.wrist_reason=control_output.fault;
+            row.wrist_plan_attempted=wrist_plan_attempted; row.wrist_plan_valid=servo_plan.valid;
+            row.wrist_plan_error=wrist_plan_attempted?Rm75PlanErrorString(servo_plan.error):"not_run";
+            row.wrist_observation_sequence=wrist_snapshot.observation.sequence;
+            row.wrist_capture_ns=wrist_snapshot.observation.capture_ns;
+            row.wrist_point_camera=wrist_snapshot.observation.point;
+            row.wrist_surface_base=wrist_input.surface_base; row.wrist_normal_base=wrist_input.normal_base;
+            row.wrist_goal_tcp=wrist_output.tcp_goal.topRightCorner<3,1>();
+        }
         row.cycle = cycle;
         row.monotonic_ns = MonotonicNs();
         row.cycle_interval_us = cycle_interval_us;
@@ -2307,6 +2502,9 @@ int main(int argc, char** argv) {
     RuntimeSummaryData summary_data;
     summary_data.mode = ModeName(options.mode);
     summary_data.simulated = options.simulate;
+    summary_data.force_sensor_enabled = !options.wrist_no_force;
+    summary_data.wrist_candidate_trial = options.wrist_candidate_trial;
+    summary_data.wrist_unlimited_excursion = options.wrist_unlimited_excursion;
     summary_data.fatal_fault = fatal_fault;
     summary_data.completion_reason = completion_reason;
     summary_data.fault_code = fatal_fault_code;

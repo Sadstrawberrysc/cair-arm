@@ -73,6 +73,15 @@ int main() {
                 "Tool-Y Base direction remains unchanged");
 
     Eigen::Matrix<double, 6, 1> reference = pose;
+    Eigen::Matrix4d camera=Eigen::Matrix4d::Identity();
+    camera.topLeftCorner<3,3>()=Eigen::AngleAxisd(.4, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    camera.topRightCorner<3,1>()=Eigen::Vector3d(.03,.02,.16);
+    const auto projected=chain.CameraPoseBase(pose, camera);
+    ok &= Check(Near(projected.topRightCorner<3,1>(), pose.head<3>()
+                     +rotation_base_from_arm_tip*camera.topRightCorner<3,1>()),
+                "wrist camera translation uses ArmTip, not Probe TCP");
+    ok &= Check(Near(projected.topLeftCorner<3,3>(), rotation_base_from_arm_tip*camera.topLeftCorner<3,3>()),
+                "wrist camera rotation multiplication order");
     reference.tail<3>() += Eigen::Vector3d(0.01, -0.02, 0.03);
     ok &= Check(Near(chain.ArmTipOrientationDelta(pose, reference),
                      rotation_base_from_arm_tip
@@ -89,5 +98,20 @@ int main() {
                          - 0.02 * 180.0 / M_PI) <= 1e-10,
                 "stationary joint delta keeps wrapped-angle semantics");
 
+
+    ok &= Check(Near(chain.ArmTipPoseFromTcp(chain.ToolTcpPoseBase(pose)),pose,1e-10),
+                "TCP-to-ArmTip roundtrip includes mount and lever arm");
+    std::deque<CalibratedFrameChain::CameraSample> history;
+    Eigen::Matrix4d ta=Eigen::Matrix4d::Identity(), tb=ta, ti;
+    tb(0,3)=.02;
+    history.push_back({1000000000,ta}); history.push_back({1020000000,tb});
+    double span=0;
+    ok &= Check(CalibratedFrameChain::InterpolateCamera(history,1010000000,ti,span)
+                && std::abs(ti(0,3)-.01)<1e-12 && span==20, "wrist camera pose interpolation");
+    ok &= Check(!CalibratedFrameChain::InterpolateCamera(history,1030000000,ti,span),
+                "wrist history never extrapolates");
+    history.back().time_ns=1051000000;
+    ok &= Check(!CalibratedFrameChain::InterpolateCamera(history,1010000000,ti,span),
+                "wrist pose span above 50 ms rejected");
     return ok ? 0 : 1;
 }

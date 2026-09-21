@@ -21,6 +21,17 @@
 #include <rm75_control.hpp>
 
 struct RuntimeLogRow {
+    bool wrist_enabled = false, wrist_valid = false;
+    bool wrist_plan_attempted = false, wrist_plan_valid = false;
+    std::string wrist_plan_error;
+    std::uint64_t wrist_observation_sequence = 0;
+    std::int64_t wrist_capture_ns = 0;
+    double wrist_age_ms = 0., wrist_span_ms = 0., wrist_gap_m = 0.;
+    std::string wrist_target, wrist_reason;
+    Eigen::Vector3d wrist_point_camera = Eigen::Vector3d::Zero();
+    Eigen::Vector3d wrist_surface_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d wrist_normal_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d wrist_goal_tcp = Eigen::Vector3d::Zero();
     std::uint64_t cycle = 0;
     std::int64_t monotonic_ns = 0;
     double work_us = 0.0;
@@ -117,7 +128,7 @@ struct CycleTimingResult {
 
 class AsyncRuntimeLogger {
 public:
-    bool Start(const std::string& path, std::string* error);
+    bool Start(const std::string& path, std::string* error, bool wrist = false);
     CycleTimingResult PushAndMeasure(
         RuntimeLogRow row,
         std::chrono::steady_clock::time_point cycle_started,
@@ -134,6 +145,7 @@ private:
     static constexpr std::size_t kMaximumRows = 8192;
     std::string path_;
     std::ofstream stream_;
+    std::ofstream wrist_stream_;
     std::atomic<bool> running_{false};
     std::thread thread_;
     mutable std::mutex mutex_;
@@ -194,6 +206,9 @@ struct RuntimeTimingSummary {
 struct RuntimeSummaryData {
     std::string mode;
     bool simulated = false;
+    bool force_sensor_enabled = true;
+    bool wrist_candidate_trial = false;
+    bool wrist_unlimited_excursion = false;
     bool fatal_fault = false;
     std::string completion_reason;
     std::string fault_code;

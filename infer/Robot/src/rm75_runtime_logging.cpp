@@ -8,7 +8,7 @@
 
 #include <runtime_schema.hpp>
 
-bool AsyncRuntimeLogger::Start(const std::string& path, std::string* error) {
+bool AsyncRuntimeLogger::Start(const std::string& path, std::string* error, bool wrist) {
     if (path.empty()) return true;
     path_ = path;
     const std::filesystem::path output(path);
@@ -26,6 +26,13 @@ bool AsyncRuntimeLogger::Start(const std::string& path, std::string* error) {
         return false;
     }
     stream_ << kRuntimeCsvHeader << '\n';
+    if (wrist) {
+        wrist_stream_.open(path+".wrist.csv");
+        if (!wrist_stream_) { if (error) *error="cannot open wrist log"; return false; }
+        wrist_stream_ << "cycle,monotonic_ns,valid,age_ms,pose_span_ms,actual_gap_m,target,reason,"
+            "camera_x,camera_y,camera_z,base_x,base_y,base_z,normal_x,normal_y,normal_z,goal_x,goal_y,goal_z,observation_sequence,capture_monotonic_ns,planner_attempted,planner_valid,planner_error\n";
+        wrist_stream_ << std::fixed << std::setprecision(9);
+    }
     queue_.resize(kMaximumRows);
     queue_head_ = 0;
     queue_size_ = 0;
@@ -86,6 +93,7 @@ void AsyncRuntimeLogger::Stop() {
     condition_.notify_all();
     if (thread_.joinable()) thread_.join();
     stream_.close();
+    if (wrist_stream_.is_open()) wrist_stream_.close();
 }
 
 AsyncRuntimeLogger::~AsyncRuntimeLogger() { Stop(); }
@@ -192,8 +200,20 @@ void AsyncRuntimeLogger::ThreadMain() {
         for (int i = 0; i < 7; ++i) stream_ << ',' << row.target_joints[i];
         std::replace(row.fault.begin(), row.fault.end(), ',', ';');
         stream_ << ',' << row.fault << '\n';
+        if (row.wrist_enabled && wrist_stream_.is_open()) {
+            std::replace(row.wrist_reason.begin(),row.wrist_reason.end(),',',';');
+            std::replace(row.wrist_target.begin(),row.wrist_target.end(),',',';');
+            wrist_stream_ << row.cycle << ',' << row.monotonic_ns << ',' << row.wrist_valid
+                << ',' << row.wrist_age_ms << ',' << row.wrist_span_ms << ',' << row.wrist_gap_m
+                << ',' << row.wrist_target << ',' << row.wrist_reason;
+            for (const auto* vector : {&row.wrist_point_camera,&row.wrist_surface_base,&row.wrist_normal_base,&row.wrist_goal_tcp})
+                for (int i=0;i<3;++i) wrist_stream_ << ',' << (*vector)[i];
+            wrist_stream_ << ',' << row.wrist_observation_sequence << ',' << row.wrist_capture_ns
+                << ',' << row.wrist_plan_attempted << ',' << row.wrist_plan_valid << ',' << row.wrist_plan_error << '\n';
+        }
     }
     stream_.flush();
+    if (wrist_stream_.is_open()) wrist_stream_.flush();
 }
 
 nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
@@ -411,6 +431,9 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
                             : static_cast<int>(servo.result.code)},
         {"mailbox_pending", servo.pending()},
         {"outstanding", data.servo_outstanding}};
+    summary["control"]["force_sensor_enabled"] = data.force_sensor_enabled;
+    summary["control"]["wrist_candidate_trial"] = data.wrist_candidate_trial;
+    summary["control"]["wrist_total_excursion_limits_enabled"] = !data.wrist_unlimited_excursion;
     return summary;
 }
 

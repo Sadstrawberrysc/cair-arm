@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <deque>
 
 #include <force_calibration.hpp>
 #include <realman_command.hpp>
@@ -12,6 +13,20 @@
 class CalibratedFrameChain {
 public:
     explicit CalibratedFrameChain(const ForceCalibration& calibration);
+    // Preview-only camera calibration; reading and hashing occur at startup.
+    static Eigen::Matrix4d LoadCameraTransform(const std::string& path,
+        const std::string& transform_name, const std::string& matrix_key,
+        std::string& sha256, bool require_verified = false);
+    Eigen::Matrix4d CameraPoseBase(const Eigen::Matrix<double, 6, 1>& pose,
+                                  const Eigen::Matrix4d& arm_tip_camera) const;
+    Eigen::Matrix4d ToolTcpPoseBase(const Eigen::Matrix<double,6,1>& pose) const;
+    Eigen::Matrix<double,6,1> ArmTipPoseFromTcp(const Eigen::Matrix4d& tcp) const;
+    static void CameraObservationBase(const Eigen::Matrix4d& camera_pose,
+        const Eigen::Vector3d& point_camera, const Eigen::Vector3d& normal_camera,
+        Eigen::Vector3d& point_base, Eigen::Vector3d& normal_base);
+    struct CameraSample { std::int64_t time_ns; Eigen::Matrix4d pose; };
+    static bool InterpolateCamera(const std::deque<CameraSample>& history,
+                                  std::int64_t time_ns, Eigen::Matrix4d& pose, double& span_ms);
 
     const Eigen::Matrix3d& RotationArmTipFromTool() const noexcept;
     const Eigen::Vector3d& TranslationSensorToToolM() const noexcept;

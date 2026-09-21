@@ -1212,3 +1212,79 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
     result.valid = true;
     return result;
 }
+
+void WristFollowController::Hold(const std::string& reason) {
+    following_ = false; reason_ = reason;
+}
+WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
+    WristFollowOutput out;
+    out.tcp_reference = reference_;
+    if (in.fresh && in.actual_tcp.allFinite() && in.surface_base.allFinite()
+        && in.normal_base.allFinite() && std::abs(in.normal_base.norm()-1.) <= .01) {
+        const Eigen::Vector3d n=in.normal_base.normalized();
+        out.actual_gap_m=(in.actual_tcp.topRightCorner<3,1>()-in.surface_base).dot(n);
+        out.tcp_goal.topRightCorner<3,1>()=in.surface_base+.050*n;
+    }
+    const bool new_request = !in.request_token.empty() && in.request_token != token_;
+    if (new_request && (in.action == "pause" || in.action == "end")) {
+        token_ = in.request_token;
+        Hold(in.action == "end" ? "operator_ended" : "operator_paused");
+    }
+    if (in.external_hold || !in.fresh || !in.actual_tcp.allFinite()
+        || !in.surface_base.allFinite() || !in.normal_base.allFinite()
+        || std::abs(in.normal_base.norm()-1.) > .01
+        || !std::isfinite(in.cycle_s) || in.cycle_s <= 0 || in.cycle_s > .05) {
+        if (following_ || (new_request && (in.action == "begin" || in.action == "resume")))
+            Hold(in.reject_reason.empty() ? "invalid_wrist_input" : in.reject_reason);
+        if (new_request && (in.action == "begin" || in.action == "resume")) {
+            // A rejected request never becomes actionable later on a heartbeat.
+            token_ = in.request_token; ever_started_ = true; target_ = in.target_id;
+        }
+        out.reason = reason_; return out;
+    }
+    if (new_request && (in.action == "begin" || in.action == "resume")) {
+        token_ = in.request_token;
+        if (following_) Hold("pause_before_target_change");
+        else if ((!ever_started_ && in.action != "begin")
+                   || (ever_started_ && (in.action != "resume" || in.target_id == target_)))
+            Hold("resume_requires_new_click");
+        else {
+            following_ = true; ever_started_ = true; target_ = in.target_id;
+            reference_ = in.actual_tcp; out.reference_reset = true; reason_.clear();
+        }
+    }
+    if (!following_) { out.reason = reason_; return out; }
+    if (in.target_id != target_) {
+        Hold("target_changed_while_following"); out.reason = reason_; return out;
+    }
+    const Eigen::Vector3d n = in.normal_base.normalized(), z = -n;
+    Eigen::Vector3d x = reference_.topLeftCorner<3,3>().col(0);
+    x -= x.dot(z)*z;
+    if (x.norm() < 1e-3) {
+        Hold("tangent_orientation_degenerate"); out.reason = reason_; return out;
+    }
+    x.normalize();
+    Eigen::Matrix3d rotation;
+    rotation.col(0)=x; rotation.col(1)=z.cross(x).normalized(); rotation.col(2)=z;
+    // Compare with the last accepted goal, not the moving reference: otherwise
+    // reference lag would continuously defeat the deadband. Resume resets it.
+    if (out.reference_reset
+        || Eigen::Quaterniond(orientation_goal_).angularDistance(Eigen::Quaterniond(rotation))
+               > kOrientationDeadbandRad) {
+        orientation_goal_ = rotation;
+    }
+    rotation = orientation_goal_;
+    out.tcp_goal.topLeftCorner<3,3>() = rotation;
+    out.tcp_goal.topRightCorner<3,1>() = in.surface_base + .050*n;
+    out.actual_gap_m = (in.actual_tcp.topRightCorner<3,1>() - in.surface_base).dot(n);
+    Eigen::Vector3d delta = out.tcp_goal.topRightCorner<3,1>() - reference_.topRightCorner<3,1>();
+    const double distance = delta.norm();
+    if (distance > .005*in.cycle_s) delta *= .005*in.cycle_s/distance;
+    out.tcp_reference = reference_;
+    out.tcp_reference.topRightCorner<3,1>() += delta;
+    Eigen::Quaterniond current(reference_.topLeftCorner<3,3>()), desired(rotation);
+    const double angle = current.angularDistance(desired);
+    const double fraction = angle < 1e-12 ? 1. : std::min(1., (5.*M_PI/180.)*in.cycle_s/angle);
+    out.tcp_reference.topLeftCorner<3,3>() = current.slerp(fraction, desired).normalized().toRotationMatrix();
+    out.following = true; return out;
+}

@@ -121,9 +121,10 @@ def render_mesh(vertices, faces, translation, focal_length, height, width, devic
 
         # indices = [11497, 11520, 11474, 35429, 11432, 35352, 35351] # 右颈动脉
         # indices = [11474, 35429, 11432, 35352, 35351, 11440] # 右颈动脉
-        indices = [35429, 11432, 35352, 35351, 11440] # 右颈动脉
+        # indices = [35429, 11432, 35352, 35351, 11440] # 右颈动脉
         # indices = [16054, 44076, 16008, 43976, 43975, 15973, 43908, 43907, 5163]  # 左颈动脉
         # indices = [44076, 16008, 43976, 43975, 15973, 43908, 43907, 5163]  # 左颈动脉
+        indices = [43976, 43975, 15973, 43908, 43907, 5163]  # 左颈动脉
 
         vertices = vertices[indices]
         pixels = cameras.transform_points_screen(vertices, image_size=(height, width))

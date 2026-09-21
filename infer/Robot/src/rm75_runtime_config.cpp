@@ -50,6 +50,56 @@ RobotRuntimeConfig MakeImplicitRm75ProductionConfig(
 
 bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
                                 std::string* error) {
+    if (config.wrist_unlimited_excursion && !config.wrist_candidate_trial) {
+        SetError(error, "wrist-unlimited-excursion requires explicit wrist-candidate-trial");
+        return false;
+    }
+    if (config.wrist_candidate_trial && (!config.wrist_no_force
+        || config.wrist_follow_calibration.empty() || config.implicit_commissioning_profile
+        || config.duration_s < 0 || config.duration_s > 30
+        || config.safety.maximum_no_contact_approach_distance_m <= 0
+        || config.safety.maximum_no_contact_approach_distance_m > .005
+        || config.safety.maximum_orientation_excursion_deg <= 0
+        || config.safety.maximum_orientation_excursion_deg > 5
+        || (config.mode == ControllerMode::kExecute && !config.wrist_execute_requested))) {
+        SetError(error, "candidate trial requires wrist-no-force, duration 0 (continuous) or 1..30 s, configured envelope and explicit wrist execution");
+        return false;
+    }
+    if (config.wrist_no_force && (config.wrist_follow_calibration.empty()
+        || config.tare_no_contact_s != 0 || config.allow_provisional_force_control
+        || (config.simulate && config.mode == ControllerMode::kExecute))) {
+        SetError(error, "wrist-no-force requires wrist mode, no tare/provisional, and no simulated execute");
+        return false;
+    }
+    if (config.wrist_execute_requested && (config.wrist_follow_calibration.empty() || !config.confirm_wrist_follow)) {
+        SetError(error, "execute-wrist-follow requires wrist calibration and explicit confirmation"); return false;
+    }
+    if (!config.wrist_follow_calibration.empty()
+        && (!config.wrist_projection_calibration.empty() || !config.wrist_global_calibration.empty()
+            || !config.redis_enabled || config.publish_every > 2 || config.period_ms != 10
+            || config.manual_action || config.manual_terminate || config.manual_phase != -1
+            || config.manual_y_m != 0 || config.manual_rz_deg != 0
+            || (config.mode == ControllerMode::kExecute
+                && (!config.confirm_wrist_follow || config.execute_warmup_s < 1
+                    || config.allow_provisional_force_control
+                    || (config.duration_s < 1 && !(config.wrist_candidate_trial && config.duration_s == 0))
+                    || config.duration_s > 60)))) {
+        SetError(error, "wrist follow requires Redis, 10 ms, publish-every<=2; execute requires confirmation, no-contact warmup, verified calibration and duration 1..60 (candidate trial also accepts 0)");
+        return false;
+    }
+    if (config.confirm_wrist_follow && config.wrist_follow_calibration.empty()) {
+        SetError(error, "wrist confirmation requires wrist follow mode"); return false;
+    }
+    if (config.wrist_projection_calibration.empty() != config.wrist_global_calibration.empty()) {
+        SetError(error, "both wrist projection calibration paths are required");
+        return false;
+    }
+    if (!config.wrist_projection_calibration.empty()
+        && (config.mode != ControllerMode::kObserve || !config.redis_enabled
+            || config.wrist_global_calibration.empty() || config.publish_every > 2)) {
+        SetError(error, "wrist projection requires observe, Redis, both calibrations and publish-every <= 2");
+        return false;
+    }
     const auto& control = config.control;
     const auto& planner = config.planner;
     const auto& safety = config.safety;
@@ -99,6 +149,9 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
         || safety.max_tracking_joint_error_deg > 20.0
         || safety.max_tracking_position_error_mm <= 0.0
         || safety.max_tracking_position_error_mm > 25.0
+        || !std::isfinite(safety.wrist_max_tracking_position_error_mm)
+        || safety.wrist_max_tracking_position_error_mm <= 0.0
+        || safety.wrist_max_tracking_position_error_mm > 50.0
         || safety.max_tracking_orientation_error_deg < 0.0
         || safety.max_tracking_orientation_error_deg > 10.0
         || safety.maximum_no_contact_approach_distance_m <= 0.0

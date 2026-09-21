@@ -6,14 +6,16 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import json
 
 import numpy as np
 
 from transform_point import DEFAULT_CALIBRATION, load_transform, transform_point
 
 ROOT = Path(__file__).resolve().parents[2]
-INITIAL_STANDOFF_M = 0.050
-
+sys.path.insert(0, str(ROOT / "infer/Camera_wrist"))
+from wrist_projection import calibration, make_seed, SEED_KEY
+INITIAL_TOOL_Z_OFFSET_M = -0.050
 
 def signature(path):
     try:
@@ -78,6 +80,18 @@ def controller_euler(rotation):
 
 
 def run(args, root=ROOT, runner=subprocess.run):
+    handoff = getattr(args, "wrist_handoff", False)
+    redis_client = None
+    hashes = None
+    if handoff:
+        import redis
+        redis_client = redis.Redis(host="127.0.0.1", port=7777,
+                                   socket_timeout=1, socket_connect_timeout=1)
+        # Remove a previous actionable seed BEFORE any possible failure.
+        redis_client.delete(SEED_KEY)
+        _, global_hash = calibration(args.calibration, "T_base_camera", "d455_color_optical_to_rm75_base")
+        _, wrist_hash = calibration(args.wrist_calibration, "T_armtip_camera", "gemini305_color_optical_to_rm75_armtip")
+        hashes = {"global": global_hash, "wrist": wrist_hash}
     camera_dir = root / "infer/Camera_RT"
     snapshot = camera_dir / "artery_path.txt"
     robot = root / "infer/Robot/build/arm_probe_pose"
@@ -96,27 +110,31 @@ def run(args, root=ROOT, runner=subprocess.run):
     if result.returncode != 0:
         raise ValueError("数字人程序异常退出，流程终止")
     camera_point, outward_camera, tangent_camera = first_point(snapshot, previous)
+    sample_unix_ns = snapshot.stat().st_mtime_ns
     surface_point_base = transform_point(camera_point, transform)
     # cliff_demo saves the camera-facing outward normal (camera Z <= 0).
     # Directions use rotation only; +Tool-Z must point into the body.
     inward_base = -(transform[:3, :3] @ outward_camera)
     inward_base /= np.linalg.norm(inward_base)
-    # Offset the Probe TCP outward from the sampled surface, before ArmTip conversion.
-    base_point = surface_point_base - INITIAL_STANDOFF_M * inward_base
     tangent_base = transform[:3, :3] @ tangent_camera
     rotation = short_axis_rotation(inward_base, tangent_base)
+    # Target Tool +Z points inward; negative offset keeps the TCP outside.
+    base_point = (surface_point_base
+                  + INITIAL_TOOL_Z_OFFSET_M * rotation[:, 2]
+                  )
     if not np.isfinite(base_point).all():
         raise ValueError("转换后的 Base 位置无效")
     target = ",".join("{:.9f}".format(v) for v in base_point)
     print("first_camera_point_m:", camera_point.tolist(), flush=True)
     print("surface_point_base_m:", surface_point_base.tolist(), flush=True)
-    print("initial_standoff_mm:", INITIAL_STANDOFF_M * 1000.0, flush=True)
+    print("initial_tool_z_offset_mm:", INITIAL_TOOL_Z_OFFSET_M * 1000.0, flush=True)
+    print("target_tool_z_base:", rotation[:, 2].tolist(), flush=True)
     print("target_position_base_m:", target, flush=True)
     normal = ",".join("{:.9f}".format(v) for v in inward_base)
     print("target_inward_normal_base:", normal, flush=True)
     print("target_tool_y_base:", rotation[:, 1].tolist(), flush=True)
     print("target_imaging_view: short_axis", flush=True)
-    print("Tool-YZ 为短轴成像平面；-X 沿血管投影切向，+Z 朝内；目标沿外法向后退50 mm。", flush=True)
+    print("Tool-YZ 为短轴成像平面；-X 沿血管投影切向，Tool +Z 朝内；目标 Tool -Z 后退50 mm；位置转换使用所选相机外参。", flush=True)
     pose = ",".join("{:.9f}".format(v) for v in
                     np.concatenate((base_point, controller_euler(rotation))))
     print("target_probe_tcp_m_rad:", pose, flush=True)
@@ -125,7 +143,17 @@ def run(args, root=ROOT, runner=subprocess.run):
                "--controller-movej-p"]
     if not args.dry_run:
         command += ["--execute", "--confirm-single-movej"]
-    return runner(command, cwd=str(root)).returncode
+    code = runner(command, cwd=str(root)).returncode
+    if handoff and code == 0 and not args.dry_run:
+        # The child has exited: coarse motion no longer owns the controller.
+        _, global_hash = calibration(args.calibration, "T_base_camera", "d455_color_optical_to_rm75_base")
+        _, wrist_hash = calibration(args.wrist_calibration, "T_armtip_camera", "gemini305_color_optical_to_rm75_armtip")
+        if hashes != {"global": global_hash, "wrist": wrist_hash}:
+            raise ValueError("标定文件在粗定位期间发生变化，不发布腕部目标")
+        seed = make_seed(surface_point_base, rotation, hashes, sample_unix_ns, args.wrist_serial)
+        redis_client.set(SEED_KEY, json.dumps(seed, allow_nan=False), ex=60)
+        print("腕部投影交接已发布（60秒）：", seed["target_id"], flush=True)
+    return code
 
 
 def build_parser():
@@ -133,6 +161,9 @@ def build_parser():
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--velocity", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--dry-run", action="store_true", help="只读取状态并预览目标，不检查可达性、不发送运动命令")
+    parser.add_argument("--wrist-handoff", action="store_true", help="粗定位成功退出后发布60秒腕部投影种子；dry-run不发布")
+    parser.add_argument("--wrist-calibration", type=Path, default=ROOT / "infer/Camera_wrist/gemini305_to_rm75_armtip.json")
+    parser.add_argument("--wrist-serial", default="CV2L360000HZ")
     return parser
 
 

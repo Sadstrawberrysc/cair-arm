@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#include <fstream>
 
 #include <hiredis/hiredis.h>
 #include <json.hpp>
@@ -129,6 +130,48 @@ RedisBridge::RedisBridge(RedisBridgeConfig config) : config_(std::move(config)) 
 
 RedisBridge::~RedisBridge() {
     Stop();
+}
+
+bool RedisBridge::LoadWristProjectionSeed(const std::string& global_hash,
+                                         const std::string& wrist_hash,
+                                         std::string* error) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (running_.load()) { SetError(error, "wrist seed must be loaded before Start"); return false; }
+    try {
+        auto context=Connect(config_);
+        if (!context) throw std::runtime_error("cannot connect to Redis for wrist seed");
+        ReplyPtr reply(static_cast<redisReply*>(redisCommand(context.get(), "GET robot:wrist:seed:v1")));
+        if (!reply || reply->type!=REDIS_REPLY_STRING || reply->len>16384)
+            throw std::runtime_error("missing wrist seed");
+        auto seed=json::parse(std::string(reply->str, reply->len));
+        std::string boot;
+        std::ifstream("/proc/sys/kernel/random/boot_id") >> boot;
+        const auto now=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto created=seed.at("timestamp_monotonic_ns").get<std::int64_t>();
+        if (boot.empty() || seed.at("boot_id")!=boot || seed.at("version")!=1 || seed.at("sequence")!=1
+            || seed.at("frame")!="rm75_base" || seed.at("length_unit")!="m"
+            || seed.at("coarse_positioning_succeeded")!=true
+            || seed.at("scope")!="projection_preview_only"
+            || seed.at("session_id").get<std::string>().empty()
+            || seed.at("target_id").get<std::string>().empty()
+            || seed.at("calibration_sha256").at("global")!=global_hash
+            || seed.at("calibration_sha256").at("wrist")!=wrist_hash
+            || created>now || now-created>=60000000000LL
+            || seed.at("expires_monotonic_ns").get<std::int64_t>()<=now)
+            throw std::runtime_error("wrist seed expired or calibration/identity mismatch");
+        json identity={{"version",1},{"session_id",seed.at("session_id")},
+            {"target_id",seed.at("target_id")},{"boot_id",boot},
+            {"runtime_session_id",boot+":"+std::to_string(getpid())+":"+std::to_string(now)},
+            {"calibration_sha256",seed.at("calibration_sha256")},
+            {"frame","gemini305_color_optical"},{"length_unit","m"},
+            {"scope","projection_preview_only"},
+            {"pose_time_basis","host_feedback_receive_not_controller_exposure"}};
+        wrist_identity_json_=identity.dump();
+        return true;
+    } catch (const std::exception& exception) {
+        wrist_identity_json_.clear(); SetError(error, exception.what()); return false;
+    }
 }
 
 bool RedisBridge::Start(std::string* error) {
@@ -532,6 +575,7 @@ std::string RedisBridge::BuildStatusJson(Rm75SupervisorState state,
 }
 
 void RedisBridge::SubscriberLoop() {
+    if (config_.wrist_follow) { WristSubscriberLoop(); return; }
     // Sequence numbers are monotonic within one producer session. A restarted
     // vision process deliberately creates a new UUID and starts again at 1,
     // so replay protection must be scoped by session_id rather than shared
@@ -745,6 +789,34 @@ void RedisBridge::PublisherLoop() {
                                BuildLegacySensorJson(sensor));
             items.emplace_back(config_.sensor_v1_channel,
                                BuildSensorV1Json(sensor));
+            if (sensor.wrist_projection_enabled && !wrist_identity_json_.empty()) {
+                auto state=json::parse(wrist_identity_json_);
+                state["sequence"]=sensor.wrist_pose_sequence;
+                state["timestamp_monotonic_ns"]=sensor.wrist_pose_timestamp_ns;
+                state["valid"]=sensor.wrist_pose_valid;
+                state["control_state"]=sensor.control_state;
+                if (config_.wrist_follow) {
+                    state["follow_state"]=sensor.wrist_follow_state;
+                    state["follow_reason"]=sensor.wrist_follow_reason;
+                    state["resume_required"]=sensor.wrist_resume_required;
+                    state["target_id"]=sensor.wrist_target_id;
+                    state["request_sequence"]=sensor.wrist_request_sequence;
+                    state["request_producer_id"]=sensor.wrist_request_producer;
+                    state["actual_normal_gap_m"]=sensor.wrist_actual_gap_m;
+                    state["target_normal_gap_m"]=.050;
+                    state["observation_age_ms"]=sensor.wrist_age_ms;
+                    state["pose_span_ms"]=sensor.wrist_pose_span_ms;
+                    state["surface_base_m"]=VectorJson(sensor.wrist_surface_base);
+                    state["normal_base"]=VectorJson(sensor.wrist_normal_base);
+                    state["goal_tcp_base_m"]=VectorJson(sensor.wrist_goal_tcp);
+                }
+                state["T_base_camera"]=json::array();
+                for (int i=0; i<4; ++i) {
+                    state["T_base_camera"].push_back({sensor.wrist_camera_pose(i,0),
+                        sensor.wrist_camera_pose(i,1),sensor.wrist_camera_pose(i,2),sensor.wrist_camera_pose(i,3)});
+                }
+                items.emplace_back("robot:wrist:state:v1", state.dump());
+            }
         }
 
         if (items.empty()) continue;
@@ -778,4 +850,156 @@ void RedisBridge::PublisherLoop() {
         }
     }
     publisher_connected_.store(false);
+}
+
+void RedisBridge::ConfigureWristFollow(const std::string& hash) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (running_.load()) throw std::runtime_error("configure wrist before Start");
+    std::ifstream("/proc/sys/kernel/random/boot_id") >> wrist_boot_;
+    if (wrist_boot_.empty()) throw std::runtime_error("cannot identify monotonic clock boot");
+    wrist_hash_=hash;
+    wrist_runtime_session_=wrist_boot_+":"+std::to_string(getpid())+":"+std::to_string(MonotonicNowNs());
+    wrist_identity_json_=json({{"version",1},{"scope","click_follow"},
+        {"runtime_session_id",wrist_runtime_session_},{"boot_id",wrist_boot_},
+        {"calibration_sha256",hash},{"frame","gemini305_color_optical"},{"length_unit","m"},
+        {"pose_time_basis","host_feedback_receive_not_controller_sample"}}).dump();
+}
+WristRedisSnapshot RedisBridge::LatestWrist() const {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    return latest_wrist_;
+}
+bool RedisBridge::ParseWristPacket(const std::string& payload, bool observation,
+    const std::string& session, const std::string& hash, const std::string& boot,
+    std::int64_t now, WristPacket& out, std::string& error) {
+    out=WristPacket{};
+    try {
+        if (payload.size()>32768) throw std::runtime_error("wrist packet oversized");
+        const auto j=json::parse(payload);
+        if (j.at("version")!=1 || j.at("runtime_session_id")!=session
+            || j.at("calibration_sha256")!=hash || j.at("boot_id")!=boot
+            || j.at("frame")!="gemini305_color_optical" || j.at("length_unit")!="m")
+            throw std::runtime_error("wrist identity/frame mismatch");
+        out.producer=j.at("producer_id").get<std::string>();
+        out.target=j.at("target_id").get<std::string>();
+        if (out.producer.empty() || out.producer.size()>128 || out.target.size()>128)
+            throw std::runtime_error("invalid wrist identity length");
+        if (!j.at("sequence").is_number_unsigned() || !j.at("timestamp_monotonic_ns").is_number_integer())
+            throw std::runtime_error("invalid wrist sequence/time type");
+        out.sequence=j.at("sequence").get<std::uint64_t>();
+        out.time_ns=j.at("timestamp_monotonic_ns").get<std::int64_t>();
+        if (!out.sequence || out.time_ns<=0 || out.time_ns>now || now-out.time_ns>500000000)
+            throw std::runtime_error("wrist message stale/future");
+        if (observation) {
+            out.valid=j.at("valid").get<bool>();
+            if (out.target.empty()) throw std::runtime_error("missing observation target");
+            if (!out.valid) return true;
+            if (!j.at("capture_monotonic_ns").is_number_integer()) throw std::runtime_error("capture time type");
+            out.capture_ns=j.at("capture_monotonic_ns").get<std::int64_t>();
+            if (out.capture_ns<=0 || out.capture_ns>now || now-out.capture_ns>200000000)
+                throw std::runtime_error("wrist capture stale/future");
+            auto vector=[&](const char* key) {
+                const auto& a=j.at(key);
+                if (!a.is_array() || a.size()!=3) throw std::runtime_error("wrist vector shape");
+                return Eigen::Vector3d(a[0].get<double>(),a[1].get<double>(),a[2].get<double>());
+            };
+            out.point=vector("point_camera_m"); out.normal=vector("normal_out_camera");
+            if (!out.point.allFinite() || !out.normal.allFinite() || out.point.z()<=0
+                || std::abs(out.normal.norm()-1.)>.01 || out.point.dot(out.normal)>=0)
+                throw std::runtime_error("wrist point/normal invalid");
+            const auto& q=j.at("quality");
+            const double rms=q.at("plane_rms_m").get<double>();
+            const double ratio=q.at("plane_inlier_ratio").get<double>();
+            if (!std::isfinite(rms) || rms<0 || rms>.002 || !std::isfinite(ratio) || ratio<.7 || ratio>1.
+                || q.at("surface_points").get<int>()<50 || q.at("feature_inliers").get<int>()<12)
+                throw std::runtime_error("wrist quality rejected");
+        } else {
+            out.action=j.at("action").get<std::string>();
+            if (out.action!="begin" && out.action!="resume" && out.action!="pause"
+                && out.action!="end" && out.action!="heartbeat") throw std::runtime_error("wrist action invalid");
+            if (out.target.empty() && out.action!="pause" && out.action!="end") throw std::runtime_error("missing command target");
+            out.valid=true;
+        }
+        error.clear(); return true;
+    } catch (const std::exception& e) { out.valid=false; error=e.what(); return false; }
+}
+void RedisBridge::WristSubscriberLoop() {
+    std::unordered_map<std::string,std::uint64_t> sequences;
+    std::unordered_map<std::string,std::int64_t> captures;
+    while (running_.load()) {
+        auto context=Connect(config_);
+        bool subscribed=false;
+        if (context) {
+            ReplyPtr first(static_cast<redisReply*>(redisCommand(context.get(),
+                "SUBSCRIBE robot:wrist:observation:v1 robot:wrist:command:v1")));
+            redisReply* raw=nullptr;
+            if (ValidSubscribeReply(first.get(),"robot:wrist:observation:v1")
+                && redisGetReply(context.get(),reinterpret_cast<void**>(&raw))==REDIS_OK) {
+                ReplyPtr second(raw); subscribed=ValidSubscribeReply(second.get(),"robot:wrist:command:v1");
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            latest_wrist_.connected=subscribed;
+            latest_wrist_.observation.valid=false; latest_wrist_.command.valid=false;
+            latest_wrist_.request=WristPacket{};
+            ++latest_wrist_.rejection_generation;
+            latest_wrist_.error="wrist subscription requires new explicit request";
+            subscriber_connected_.store(subscribed);
+        }
+        if (!subscribed) { WaitForReconnectOrStop(running_,config_.reconnect_ms); continue; }
+        bool failed=false;
+        while (running_.load() && !failed) {
+            pollfd fd{context->fd,POLLIN,0};
+            const int ready=poll(&fd,1,100);
+            if (ready<0 && errno==EINTR) continue;
+            if (ready<0 || (fd.revents&(POLLERR|POLLHUP|POLLNVAL))) break;
+            if (ready==0) continue;
+            if (redisBufferRead(context.get())!=REDIS_OK) break;
+            for (;;) {
+                redisReply* raw=nullptr;
+                if (redisGetReplyFromReader(context.get(),reinterpret_cast<void**>(&raw))!=REDIS_OK) {failed=true;break;}
+                ReplyPtr reply(raw);
+                if (!reply) break;
+                if (reply->type!=REDIS_REPLY_ARRAY || reply->elements!=3
+                    || !reply->element[0]->str || std::strcmp(reply->element[0]->str,"message")!=0
+                    || !reply->element[1]->str || !reply->element[2]->str) continue;
+                const bool obs=std::string(reply->element[1]->str)=="robot:wrist:observation:v1";
+                WristPacket packet; std::string error;
+                bool valid=ParseWristPacket(std::string(reply->element[2]->str,reply->element[2]->len),obs,
+                    wrist_runtime_session_,wrist_hash_,wrist_boot_,MonotonicNowNs(),packet,error);
+                const std::string key=packet.producer+(obs?":obs":":cmd");
+                if (valid) {
+                    if (sequences.size()>=64 && !sequences.count(key)) {valid=false;error="too many wrist producers";}
+                    else if (packet.sequence<=sequences[key]) {valid=false;error="wrist replay/out of order";}
+                    else if (obs && packet.valid && packet.capture_ns<=captures[packet.producer]) {
+                        valid=false; error="wrist capture replay";
+                    } else {
+                        sequences[key]=packet.sequence;
+                        if (obs && packet.valid) captures[packet.producer]=packet.capture_ns;
+                    }
+                }
+                std::lock_guard<std::mutex> lock(command_mutex_);
+                if (!valid || (obs && !packet.valid)) {
+                    ++latest_wrist_.rejection_generation;
+                    latest_wrist_.error=error.empty()?"invalid wrist observation":error;
+                    if (obs) latest_wrist_.observation.valid=false;
+                    else latest_wrist_.command.valid=false;
+                } else if (obs) latest_wrist_.observation=packet;
+                else {
+                    latest_wrist_.command=packet;
+                    if (packet.action!="heartbeat") latest_wrist_.request=packet;
+                    if (packet.action=="pause" || packet.action=="end") {
+                        ++latest_wrist_.rejection_generation; latest_wrist_.error="operator_"+packet.action;
+                    }
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            latest_wrist_.connected=false; latest_wrist_.command.valid=false;
+            latest_wrist_.observation.valid=false; ++latest_wrist_.rejection_generation;
+            latest_wrist_.error="wrist subscription disconnected"; subscriber_connected_.store(false);
+        }
+        if (running_.load()) WaitForReconnectOrStop(running_,config_.reconnect_ms);
+    }
 }

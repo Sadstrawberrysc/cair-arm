@@ -123,3 +123,9 @@ intergrate_infer/runs_ConvNeXtBase_single/*.pth
 intergrate_infer/output/
 intergrate_infer/dump.rdb
 intergrate_infer/cca.json
+
+# Local camera tools and generated diagnostic artifacts.
+/Log/
+/infer/Camera_wrist/OrbbecViewer/
+/infer/hand_eye_calibration-main/cap_%d
+/infer/runs/

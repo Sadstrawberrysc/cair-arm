@@ -334,6 +334,7 @@ struct Rm75RuntimeSafetyConfig {
     // 实际反馈相对 ServoJ 模型目标的跟踪故障门。
     double max_tracking_joint_error_deg = 20.0;
     double max_tracking_position_error_mm = 25.0;
+    double wrist_max_tracking_position_error_mm = 50.0;
     // 0 表示不单独以笛卡尔姿态残差终止；关节与位置误差仍受监督。
     double max_tracking_orientation_error_deg = 0.0;
     // 悬空接近相对起点的 Probe-TCP 行程和姿态包络。
@@ -381,4 +382,38 @@ private:
 
     Rm75ServoPlannerConfig config_;
     RMKinematics kinematics_;
+};
+
+// Wrist commissioning is independent of ultrasound motion states.
+struct WristFollowInput {
+    bool fresh = false, external_hold = false;
+    std::string reject_reason, target_id, request_token, action;
+    Eigen::Vector3d surface_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d normal_base = Eigen::Vector3d::UnitZ();
+    Eigen::Matrix4d actual_tcp = Eigen::Matrix4d::Identity();
+    double cycle_s = .01;
+};
+struct WristFollowOutput {
+    bool following = false, reference_reset = false;
+    std::string reason;
+    Eigen::Matrix4d tcp_reference = Eigen::Matrix4d::Identity();
+    Eigen::Matrix4d tcp_goal = Eigen::Matrix4d::Identity();
+    double actual_gap_m = 0.;
+};
+class WristFollowController {
+public:
+    WristFollowOutput Step(const WristFollowInput& input);
+    void Hold(const std::string& reason);
+    void Commit(const Eigen::Matrix4d& reference) { reference_ = reference; }
+    bool Following() const { return following_; }
+    const std::string& Reason() const { return reason_; }
+    const std::string& RequestToken() const { return token_; }
+    bool ResumeRequired() const { return ever_started_; }
+private:
+    bool following_ = false, ever_started_ = false;
+    // Experimental orientation-only deadband; raw surface observations stay intact.
+    static constexpr double kOrientationDeadbandRad = 0.08726646259971647;
+    Eigen::Matrix3d orientation_goal_ = Eigen::Matrix3d::Identity();
+    std::string target_, token_, reason_ = "waiting_for_click_and_begin";
+    Eigen::Matrix4d reference_ = Eigen::Matrix4d::Identity();
 };

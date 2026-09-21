@@ -22,7 +22,15 @@ inline const char* ModeName(ControllerMode mode) noexcept {
 struct RobotRuntimeConfig {
     ControllerMode mode = ControllerMode::kObserve;
     bool simulate = false;
+    bool wrist_no_force = false;
+    bool wrist_candidate_trial = false;
+    bool wrist_unlimited_excursion = false;
     bool redis_enabled = true;
+    std::string wrist_follow_calibration;
+    bool confirm_wrist_follow = false;
+    bool wrist_execute_requested = false;
+    std::string wrist_projection_calibration;
+    std::string wrist_global_calibration;
     std::string robot_ip = "192.168.50.254";
     int robot_port = 8080;
     std::string sensor_device = "/dev/ttyUSB0";
@@ -49,6 +57,16 @@ struct RobotRuntimeConfig {
     bool manual_terminate = false;
     bool allow_provisional_force_control = false;
     bool implicit_commissioning_profile = false;
+
+    // Wrist capture interpolation allows at most 50 ms between feedback samples.
+    // Keep headroom for transport/scheduling; ordinary ultrasound polling is unchanged.
+    int StatePollPeriodMs() const { return wrist_follow_calibration.empty() ? 40 : 10; }
+
+    Rm75RuntimeSafetyConfig EffectiveSafety() const {
+        auto result = safety;
+        if (!wrist_follow_calibration.empty()) result.max_tracking_position_error_mm = safety.wrist_max_tracking_position_error_mm;
+        return result;
+    }
 
     Rm75ControlConfig control;
     Rm75ServoPlannerConfig planner;

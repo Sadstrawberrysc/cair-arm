@@ -13,6 +13,7 @@
 
 struct RedisBridgeConfig {
     bool enabled = true;
+    bool wrist_follow = false;
     std::string host = "127.0.0.1";
     int port = 7777;
     std::string command_channel = "robot:command:channel";
@@ -66,6 +67,18 @@ struct RedisCommandDecision {
 };
 
 struct RedisSensorMessage {
+    std::string wrist_follow_state, wrist_follow_reason, wrist_target_id, wrist_request_producer;
+    std::uint64_t wrist_request_sequence = 0;
+    bool wrist_resume_required = false;
+    double wrist_actual_gap_m = 0., wrist_age_ms = 0., wrist_pose_span_ms = 0.;
+    Eigen::Vector3d wrist_surface_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d wrist_normal_base = Eigen::Vector3d::Zero();
+    Eigen::Vector3d wrist_goal_tcp = Eigen::Vector3d::Zero();
+    bool wrist_projection_enabled = false;
+    bool wrist_pose_valid = false;
+    std::uint64_t wrist_pose_sequence = 0;
+    std::int64_t wrist_pose_timestamp_ns = 0;
+    Eigen::Matrix4d wrist_camera_pose = Eigen::Matrix4d::Identity();
     std::uint64_t sequence = 0;
     std::int64_t timestamp_ns = 0;
     std::int64_t source_timestamp_unix_ns = 0;
@@ -93,6 +106,20 @@ struct RedisSensorMessage {
     std::string fault;
 };
 
+struct WristPacket {
+    bool valid = false;
+    std::string producer, target, action;
+    std::uint64_t sequence = 0;
+    std::int64_t time_ns = 0, capture_ns = 0;
+    Eigen::Vector3d point = Eigen::Vector3d::Zero(), normal = Eigen::Vector3d::Zero();
+};
+struct WristRedisSnapshot {
+    WristPacket observation, command, request;
+    bool connected = false;
+    std::uint64_t rejection_generation = 0;
+    std::string error;
+};
+
 class RedisBridge {
 public:
     explicit RedisBridge(RedisBridgeConfig config = {});
@@ -108,6 +135,16 @@ public:
     bool PublisherConnected() const { return publisher_connected_.load(); }
 
     RedisCommandSnapshot LatestCommand() const;
+    void ConfigureWristFollow(const std::string& wrist_hash);
+    WristRedisSnapshot LatestWrist() const;
+    static bool ParseWristPacket(const std::string& payload, bool observation,
+        const std::string& session, const std::string& hash, const std::string& boot,
+        std::int64_t now_ns, WristPacket& output, std::string& error);
+    // Startup-only Redis I/O. A fresh matching seed is required before hardware
+    // acquisition starts; no seed reads or JSON work in the 10 ms loop.
+    bool LoadWristProjectionSeed(const std::string& global_hash,
+                                const std::string& wrist_hash,
+                                std::string* error);
     void PublishSensor(const RedisSensorMessage& message);
     void PublishStatus(Rm75SupervisorState state,
                        const std::string& status,
@@ -147,12 +184,16 @@ private:
     };
 
     void SubscriberLoop();
+    void WristSubscriberLoop();
     void PublisherLoop();
     // publish_mutex_ must be held. Keeping the event descriptor under the
     // same lock as producer admission forms a Stop/Publish lifecycle barrier.
     void NotifyPublisherLocked();
 
     RedisBridgeConfig config_;
+    std::string wrist_identity_json_;
+    std::string wrist_runtime_session_, wrist_hash_, wrist_boot_;
+    WristRedisSnapshot latest_wrist_;
     std::atomic<bool> running_{false};
     std::atomic<bool> subscriber_connected_{false};
     std::atomic<bool> publisher_connected_{false};

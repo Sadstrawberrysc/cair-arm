@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "transform": "gemini305_color_optical_to_rm75_armtip",
+  "transform_convention": "T_A_B maps coordinates from frame B to frame A",
+  "translation_unit": "m",
+  "source": "compute_in_hand.py",
+  "computed_at": "2026-09-11",
+  "user_confirmed": true,
+  "independent_validation_recorded": false,
+  "T_armtip_camera": [
+    [0.46474155, 0.88519362, -0.0211554, -0.03755592],
+    [-0.88544054, 0.46469263, -0.00747084, -0.00180359],
+    [0.00321762, 0.02220386, 0.99974829, 0.16130131],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
