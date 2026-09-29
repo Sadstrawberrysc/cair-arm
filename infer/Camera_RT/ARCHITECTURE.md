@@ -77,7 +77,8 @@ RGB image ─→ Faster R-CNN person box ─→ crop/bbox metadata ─→ CLIFF 
 
 - 依赖或资产不完整时应在模型初始化前失败，不使用随机权重继续。
 - GPU、CUDA 或 RealSense 不可用时运行预检返回 `BLOCKED`，不得记作链路通过。
-- 无人体框、无有效深度、投影越界和设备退出清理尚未形成健壮边界，记录在 `PROGRESS.md`。
+- 无人体框、无有效深度、投影越界和设备退出清理尚未形成健壮边界，记录在本机
+  [Camera_RT 进展 notebook](../../.runme/Progress/camera-rt-progress.md)。
 - 文本路径没有时效和设备字段，只能先经 Calibration 转换并生成摘要元数据；Robot 不得直接消费。
 - 固定相机的 eye-to-hand 标定由相邻的 `infer/Calibration` 模块负责；Camera_RT 不读取外参，
   也不改变其相机坐标输出。Calibration 只有在独立验证通过后才允许离线生成 Base 坐标文件。
@@ -92,3 +93,5 @@ RGB image ─→ Faster R-CNN person box ─→ crop/bbox metadata ─→ CLIFF 
 5. 标定验收：由 `infer/Calibration` 使用独立 eye-to-hand 数据集验证残差、方向和设备身份。
 
 前三级通过不代表第四、第五级通过，也不代表机器人真机验收。
+
+启动、预检和快照操作见本机 [Camera_RT 操作 notebook](../../.runme/run/camera-rt-operations.md)。

@@ -56,9 +56,8 @@ ctest --test-dir infer/Robot/build --output-on-failure
 ## 按需查阅
 
 - 理解系统关系或接口时，查 [ARCHITECTURE.md](ARCHITECTURE.md) 及其模块文档索引。
-- 确认当前进度、配置或待办时，查 [PROGRESS.md](PROGRESS.md) 或相关子目录的进度文档。
-- 查找启动方式时，查 [README.md](README.md) 和
-  [RM75 构建与启动命令](docs/rm75_build_and_start_commands.md)。
+- 确认当前进度、配置、待办或启动方式时，查本机 `.runme/README.md` 及对应 notebook；
+  `.runme/` 不纳入 Git，缺失时以 `ARCHITECTURE.md` 和当前源码为准重新建立。
 - 处理 Robot 构建与测试时，以 [CMakeLists.txt](infer/Robot/CMakeLists.txt) 为准。
 - 处理远程相机时，查 [远程相机监控](docs/remote_camera_monitoring.md)。
 - 追溯设计原因时，查 [DECISIONS.md](DECISIONS.md)。新的跨模块、公共 API 或长期维护

@@ -28,7 +28,7 @@ robot_pid=''
 forward_stop() {
   if [[ -n "$robot_pid" ]]; then kill -INT "$robot_pid" 2>/dev/null || true; fi
 }
-trap forward_stop INT TERM
+trap forward_stop HUP INT TERM
 "$robot_binary" \
   --execute-wrist-follow --confirm-wrist-follow \
   --wrist-no-force --wrist-candidate-trial --wrist-unlimited-excursion \

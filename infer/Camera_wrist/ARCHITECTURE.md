@@ -6,6 +6,9 @@ Orbbec Gemini 305 腕部 RGB-D 采集、局部追踪与表面法向估计。
 | 入口/模块 | 用途 |
 | --- | --- |
 | [click_follow.py](click_follow.py) | 独立点击观测或 Redis 跟随，不需要全局相机/seed |
+| [launch_wrist_terminal.sh](launch_wrist_terminal.sh) | Runme/普通终端统一启动入口：按 `robot` 或 `camera` 打开独立窗口并防止重复启动 |
+| [start_camera.sh](start_camera.sh) | Runme 相机启动终端：激活 `camera` 环境、记录完整输出与退出码；不控制机器人 |
+| [start_robot_terminal.sh](start_robot_terminal.sh) | Runme 机器人独立终端：调用既有 `start_robot.sh` 并保留终端输出与退出码 |
 | [projection_preview.py](projection_preview.py) | 全局 seed 投影；加 --track 做本地追踪，不发布控制请求 |
 | [gemini_config.py](gemini_config.py) | 近距离预设、视差读回与视频流选择 |
 | [local_tracker.py](local_tracker.py) | LK 光流、局部仿射与深度平面法向 |
@@ -13,10 +16,44 @@ Orbbec Gemini 305 腕部 RGB-D 采集、局部追踪与表面法向估计。
 | [tracking_diagnostics.py](tracking_diagnostics.py) | 失效事件与图像证据 |
 
 数据流：Gemini → 相机坐标观测 → Redis → Robot 坐标转换/控制/planner；Robot 回传相机位姿和状态。
-标定采集与求解见 [hand_eye_calibration-main](../hand_eye_calibration-main/USAGE.md)。
-[腕部外参](gemini305_to_rm75_armtip.json) 定义 Camera→ArmTip 变换；标定与验收状态见 [PROGRESS.md](PROGRESS.md)。
+标定采集与求解见本机 [标定操作 notebook](../../.runme/run/calibration-operations.md)。
+[腕部外参](gemini305_to_rm75_armtip.json) 定义 Camera→ArmTip 变换；标定与验收状态见本机
+[Camera_wrist 进展 notebook](../../.runme/Progress/camera-wrist-progress.md)。环境与操作见本机
+[Camera_wrist 操作 notebook](../../.runme/run/camera-wrist-operations.md)。
 
-实现进度见 [PROGRESS.md](PROGRESS.md)，环境与操作见 [USAGE.md](USAGE.md)。
+## 模型选点入口
+
+`click_follow.py --model-id songjiatong/carotid-detect-c9gi9-8-rfdetr-medium-t1` 使用同一 Robot
+`click_follow` 协议和 LocalTracker。其选点路径为：
+
+```mermaid
+flowchart LR
+  A[Gemini 同步 RGB-D] --> B[按 d 固定一帧]
+  B --> C[ultralytics 子进程: Roboflow 检测]
+  C --> D{唯一 carotid 框中心合格?}
+  B --> E[连续 RGB-D 帧缓冲]
+  D -->|是| F[原帧初始化 LocalTracker]
+  E --> F
+  F --> G[逐帧追到当前采集帧]
+  G --> H{质量与 200 ms 时效合格?}
+  H -->|是| I[ClickSession 新目标与 Redis 观测]
+  I --> J[人工 b/r 请求 Robot 跟随]
+  D -->|否| X[拒绝选点 / 保持静止]
+  H -->|否| X
+  X -->|仅 no-redis 且已按 d| R[等待 0.75 秒并用新帧重选]
+  R --> C
+```
+
+鼠标选点仍是无 `--model-id` 时的默认模式。模型模式禁用鼠标，检测等待期间清除
+旧目标；帧缓冲最多 45 帧；超限、时间间断或跟踪失败均拒绝。追帧结束若过期，
+等待新鲜相机帧且暂不创建目标，2 秒内仍不能追上则拒绝。模型输出只是
+P0 的原图像素，三维点和外法向由既有跟踪器计算，Robot 继续拥有坐标变换与运动权限。
+`--no-redis` 可只看真实相机点位和局部跟踪，不创建 Robot 控制通道。
+首次按 `d` 后，跟踪丢失会尝试自动模型重选；`p` 停止重选。绿色显示点和
+三维文本做时间平滑，原始跟踪结果与质量门槛不变。连接 Robot 的模式
+保留人工重选和人工 `b`/`r` 请求。与 `--model-id` 同用时默认采用宽松视觉门槛；
+可追加 `--standard-vision` 恢复标准门槛。连接 Robot 时始终使用标准门槛。操作命令见
+[Carotid_begin 当前进度与启动命令](../Carotid_begin/PROGRESS.md)。
 
 ## 点击跟随全流程
 
@@ -65,7 +102,7 @@ RANSAC 局部仿射，使用仿射更新原目标像素，不以特征均值替�
 
 | 检查 | 当前门限 |
 | --- | --- |
-| 纹理区域 | 80×80 像素，完整区域必须在画面内 |
+| 纹理区域 | 最多 80×80 像素；到图像边缘时裁切，仍需至少 12 个特征 |
 | 光流一致特征 | 至少 12 个；前后向误差 ≤1 px |
 | 仿射内点比例 | ≥0.6；轴向尺度 0.9～1.1，另检查行列式 |
 | 像素 / 三维跳变 | ≤15 px/帧；≤10 mm/帧 |
@@ -73,8 +110,9 @@ RANSAC 局部仿射，使用仿射更新原目标像素，不以特征均值替�
 | 平面误差 | RMS ≤2 mm，另检查目标到平面距离与点云退化 |
 | 帧间采集时间 | 递增且间隔 ≤200 ms |
 
-640×480 图像中，目标靠近边缘约 40 像素以内，即可能无法容纳完整 ROI。
-红点仍可见也可能报 `80x80 tracking ROI outside image`；不裁剪区域继续追踪。
+P0 只需落在原图内，不要求距四边 40 px。靠边时纹理区域裁切，
+光流使用较浅金字塔并保留原有前后向、仿射和跳变门限；
+若裁切后特征、深度邻域或连续追踪不合格，仍会拒绝或 Hold。
 
 ### Robot 坐标与参考生成
 
@@ -128,6 +166,9 @@ Hold 仍可能通过当前模型关节发送保持目标，不等同于断电或
 
 当前 [start_robot.sh](start_robot.sh) 显式启用真实腕部执行、无力传感器、候选外参试验、
 取消累计位移/累计转角上限，并持续运行至中断或故障；仍需要点击后按 b/r 才请求跟随。
+Runme 操作入口把 Robot 与相机分别放入独立 Terminator 窗口，避免 VS Code Runme
+执行终端结束时带走常驻进程。Robot 捕获 INT、TERM 和 HUP，按正常控制路径请求
+StopMotion、确认静止并写入结束摘要；终端脚本转发这些停止信号。
 它不读取力传感器，不进行 tare 或力闭环；机器人标定文件仍用于 TCP 几何。
 关节、规划、通信、周期、跟踪误差与停止保护仍保留，启动脚本不会自动完成空间验证。
 
@@ -140,7 +181,8 @@ Hold 仍可能通过当前模型关节发送保持目标，不等同于断电或
   `runtime.summary.json` 记录有效配置和最终停止结果。
 - 排查时按同机单调时间关联两端日志。相机 `Robot state timeout` 可能是 Robot
   已发生 Fault 的后果，应先查 Robot 首个故障；`operator_paused` 也可能来自相机自动暂停。
-- 运行结果、问题排查、测试结论和待验收事项统一记录在 [PROGRESS.md](PROGRESS.md)。
+- 运行结果、问题排查、测试结论和待验收事项统一记录在本机
+  [Camera_wrist 进展 notebook](../../.runme/Progress/camera-wrist-progress.md)。
 
 ## Redis 接口
 
@@ -214,4 +256,5 @@ pose_time_basis=host_feedback_receive_not_controller_exposure。
 Robot 启动读取有效 seed 后固定身份；预览遇到运行会话变化退出，不自动换目标。
 
 实现入口：[click_follow.py](click_follow.py)、[wrist_projection.py](wrist_projection.py)、
-[RedisBridge](../Robot/src/redis_bridge.cpp)。操作见 [点击跟随](USAGE.md#点击跟随) / [投影预览](USAGE.md#全局投影与追踪预览)。
+[RedisBridge](../Robot/src/redis_bridge.cpp)。操作见本机
+[Camera_wrist 操作 notebook](../../.runme/run/camera-wrist-operations.md)。

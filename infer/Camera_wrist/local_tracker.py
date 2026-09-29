@@ -1,11 +1,24 @@
 """Experimental local RGB-D tracker. No robot or Redis I/O."""
+import math
 import cv2
 import numpy as np
 from wrist_projection import depth_at
 
+STANDARD = dict(depth_jump=.005, min_points=50, plane_band=.003, inlier_ratio=.7,
+                spread=.002, rms=.002, target_residual=.003, features=12,
+                fb_px=1., affine_ratio=.6, scale_low=.9, scale_high=1.1,
+                determinant_low=.81, determinant_high=1.21, affine_reproj_px=1.,
+                pixel_jump=15., position_jump=.01)
+RELAXED = dict(depth_jump=.008, min_points=35, plane_band=.004, inlier_ratio=.55,
+               spread=.0015, rms=.0035, target_residual=.0045, features=8,
+               fb_px=1.5, affine_ratio=.5, scale_low=.85, scale_high=1.15,
+               determinant_low=.72, determinant_high=1.32, affine_reproj_px=1.5,
+               pixel_jump=20., position_jump=.015)
 
-def surface(depth, pixel, k, distortion):
+
+def surface(depth, pixel, k, distortion, *, relaxed=False):
     """Metric 15 mm neighbourhood; robust plane, oriented toward camera."""
+    limits = RELAXED if relaxed else STANDARD
     z = depth_at(depth, pixel)
     ray = cv2.undistortPoints(np.asarray(pixel, np.float64).reshape(1, 1, 2), k, distortion).reshape(2)
     target = np.r_[ray, 1.] * z
@@ -17,11 +30,11 @@ def surface(depth, pixel, k, distortion):
     yy, xx = np.mgrid[y0:y1, x0:x1]
     values = depth[y0:y1, x0:x1]
     valid = np.isfinite(values) & (values > 0) & (np.abs(values-z) < .015)
-    # Discard pixels bordering invalid depth or a >5 mm discontinuity.
+    # Discard pixels bordering invalid depth or a selected depth discontinuity.
     safe = valid.astype(np.uint8)
     for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         neighbour = np.roll(values, (dy, dx), (0, 1))
-        safe &= (np.isfinite(neighbour) & (neighbour > 0) & (np.abs(values-neighbour) < .005)).astype(np.uint8)
+        safe &= (np.isfinite(neighbour) & (neighbour > 0) & (np.abs(values-neighbour) < limits["depth_jump"])).astype(np.uint8)
     safe[[0, -1], :] = 0
     safe[:, [0, -1]] = 0
     if not safe[y-y0, x-x0]:
@@ -30,8 +43,8 @@ def surface(depth, pixel, k, distortion):
     rays = cv2.undistortPoints(pixels.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
     cloud = np.column_stack((rays, np.ones(len(rays)))) * values[safe > 0, None]
     cloud = cloud[np.linalg.norm(cloud-target, axis=1) <= .015]
-    if len(cloud) < 50:
-        raise ValueError('fewer than 50 surface points')
+    if len(cloud) < limits['min_points']:
+        raise ValueError('too few surface points')
     if len(cloud) > 2000:
         cloud = cloud[np.linspace(0, len(cloud)-1, 2000).astype(int)]
     rng = np.random.default_rng(42)
@@ -42,19 +55,19 @@ def surface(depth, pixel, k, distortion):
         length = np.linalg.norm(normal)
         if length < 1e-10:
             continue
-        inliers = np.abs((cloud-a) @ (normal/length)) <= .003
+        inliers = np.abs((cloud-a) @ (normal/length)) <= limits['plane_band']
         if inliers.sum() > best.sum():
             best = inliers
-    if best.sum() < 50 or best.mean() < .7:
+    if best.sum() < limits['min_points'] or best.mean() < limits['inlier_ratio']:
         raise ValueError('surface plane lacks consensus')
     points = cloud[best]
     centre = points.mean(axis=0)
     _, singular, vh = np.linalg.svd(points-centre, full_matrices=False)
-    if singular[1] / np.sqrt(len(points)) < .002:
+    if singular[1] / np.sqrt(len(points)) < limits['spread']:
         raise ValueError('surface support nearly collinear')
     normal = vh[-1]
     rms = np.sqrt(np.mean(((points-centre) @ normal)**2))
-    if rms > .002 or abs((target-centre) @ normal) > .003:
+    if rms > limits['rms'] or abs((target-centre) @ normal) > limits['target_residual']:
         raise ValueError('surface plane/target residual too large')
     if normal @ target > 0:
         normal = -normal
@@ -64,7 +77,9 @@ def surface(depth, pixel, k, distortion):
 
 class LocalTracker:
     """Loss is latched; only explicit initialize can restore tracking."""
-    def __init__(self):
+    def __init__(self, *, relaxed=False):
+        self.limits = RELAXED if relaxed else STANDARD
+        self.relaxed = relaxed
         self.debug = {}
         self.debug_images = None
         self.lose('not initialized', force=True)
@@ -79,14 +94,18 @@ class LocalTracker:
         self.timestamp = None
 
     def _features(self, gray, pixel):
-        x, y = np.floor(pixel).astype(int)
-        if x-40 < 0 or y-40 < 0 or x+40 > gray.shape[1] or y+40 > gray.shape[0]:
-            raise ValueError('80x80 tracking ROI outside image')
+        point = np.asarray(pixel, dtype=float)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            raise ValueError('invalid tracking pixel')
+        x, y = np.floor(point).astype(int)
+        if not (0 <= x < gray.shape[1] and 0 <= y < gray.shape[0]):
+            raise ValueError('tracking pixel outside image')
         mask = np.zeros_like(gray)
-        mask[y-40:y+40, x-40:x+40] = 255
+        mask[max(0, y-40):min(gray.shape[0], y+40),
+             max(0, x-40):min(gray.shape[1], x+40)] = 255
         points = cv2.goodFeaturesToTrack(gray, 150, .01, 4, mask=mask, blockSize=5)
-        if points is None or len(points) < 12:
-            raise ValueError('fewer than 12 texture features')
+        if points is None or len(points) < self.limits['features']:
+            raise ValueError('fewer than %d texture features' % self.limits['features'])
         return points
 
     def initialize(self, image, depth, pixel, k, distortion, timestamp):
@@ -96,7 +115,7 @@ class LocalTracker:
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             features = self._features(gray, pixel)
-            point, normal, quality = surface(depth, pixel, k, distortion)
+            point, normal, quality = surface(depth, pixel, k, distortion, relaxed=self.relaxed)
             quality['feature_inliers'] = int(len(features))
             self.gray, self.features = gray, features
             self.pixel, self.position = np.asarray(pixel, float), point
@@ -126,53 +145,59 @@ class LocalTracker:
             if not 0 < timestamp-self.timestamp <= 200_000_000:
                 raise ValueError('tracking capture gap or repeated frame')
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # Coarse pyramid levels are unreliable when the ROI touches an image edge.
+            edge_distance = min(x, y, image.shape[1]-1-x, image.shape[0]-1-y)
+            pyramid_level = 1 if edge_distance < 80 else 3
+            self.debug['pyramid_level'] = pyramid_level
             self.debug['stage'] = 'forward_lk'
             nxt, status, _ = cv2.calcOpticalFlowPyrLK(self.gray, gray, self.features, None,
-                                                   winSize=(21, 21), maxLevel=3)
+                                                   winSize=(21, 21), maxLevel=pyramid_level)
             if nxt is None or status is None:
                 raise ValueError('forward optical flow failed')
             self.debug['stage'] = 'backward_lk'
             back, reverse, _ = cv2.calcOpticalFlowPyrLK(gray, self.gray, nxt, None,
-                                                     winSize=(21, 21), maxLevel=3)
+                                                     winSize=(21, 21), maxLevel=pyramid_level)
             if back is None or reverse is None:
                 raise ValueError('backward optical flow failed')
             valid = (status.ravel() > 0) & (reverse.ravel() > 0)
             fb = np.linalg.norm(back-self.features, axis=2).ravel()
             self.debug.update(forward_matches=int(status.sum()), backward_matches=int(reverse.sum()),
                               fb_median_px=float(np.median(fb[np.isfinite(fb)])) if np.isfinite(fb).any() else None)
-            valid &= fb <= 1.
+            valid &= fb <= self.limits['fb_px']
             old, new = self.features[valid].reshape(-1, 2), nxt[valid].reshape(-1, 2)
             self.debug.update(fb_matches=int(len(old)), old_points=old.tolist(), new_points=new.tolist())
             self.debug['stage'] = 'forward_backward_check'
-            if len(old) < 12:
-                raise ValueError('fewer than 12 forward-backward features')
+            if len(old) < self.limits['features']:
+                raise ValueError('fewer than %d forward-backward features' % self.limits['features'])
             self.debug['stage'] = 'affine_consensus'
             affine, mask = cv2.estimateAffine2D(old, new, method=cv2.RANSAC,
-                                                      ransacReprojThreshold=1., maxIters=1000)
+                                                      ransacReprojThreshold=self.limits['affine_reproj_px'], maxIters=1000)
             self.debug.update(affine=None if affine is None else affine.tolist(),
                               inlier_mask=None if mask is None else mask.ravel().tolist(),
                               affine_inliers=0 if mask is None else int(mask.sum()),
                               affine_inlier_ratio=0. if mask is None else float(mask.mean()))
-            if affine is None or mask is None or mask.sum() < 12 or mask.mean() < .6:
+            if (affine is None or mask is None or mask.sum() < self.limits['features']
+                    or mask.mean() < self.limits['affine_ratio']):
                 raise ValueError('local affine consensus failed')
             determinant = np.linalg.det(affine[:, :2])
             scales = np.linalg.svd(affine[:, :2], compute_uv=False)
             self.debug['affine_scales'] = scales.tolist()
             self.debug['stage'] = 'affine_scale'
-            if not .81 <= determinant <= 1.21 or scales.min() < .9 or scales.max() > 1.1:
+            if (not self.limits['determinant_low'] <= determinant <= self.limits['determinant_high']
+                    or scales.min() < self.limits['scale_low'] or scales.max() > self.limits['scale_high']):
                 raise ValueError('abnormal affine scale')
             pixel = affine @ np.r_[self.pixel, 1.]
             self.debug['stage'] = 'pixel_jump'
-            if np.linalg.norm(pixel-self.pixel) > 15:
-                raise ValueError('pixel jump exceeds 15 px/frame')
+            if np.linalg.norm(pixel-self.pixel) > self.limits['pixel_jump']:
+                raise ValueError('pixel jump exceeds %.0f px/frame' % self.limits['pixel_jump'])
             self.debug['stage'] = 'feature_replenishment'
             features = self._features(gray, pixel)
             self.debug['stage'] = 'surface_plane'
-            point, normal, quality = surface(depth, pixel, k, distortion)
+            point, normal, quality = surface(depth, pixel, k, distortion, relaxed=self.relaxed)
             self.debug['stage'] = 'position_jump'
-            if np.linalg.norm(point-self.position) > .01:
-                raise ValueError('3D jump exceeds 10 mm/frame')
-            quality.update(feature_inliers=int(mask.sum()), forward_backward_limit_px=1.)
+            if np.linalg.norm(point-self.position) > self.limits['position_jump']:
+                raise ValueError('3D jump exceeds %.0f mm/frame' % (self.limits['position_jump']*1000))
+            quality.update(feature_inliers=int(mask.sum()), forward_backward_limit_px=self.limits['fb_px'])
             self.gray, self.features, self.pixel = gray, features, pixel
             self.position, self.timestamp = point, timestamp
             self.debug['stage'] = 'accepted'
@@ -180,3 +205,35 @@ class LocalTracker:
         except (ValueError, cv2.error) as error:
             self.lose(error)
             return dict(valid=False, reason=self.reason)
+
+
+class DisplayPointSmoother:
+    """Time-aware smoothing for the no-Redis display; never alters tracking gates."""
+
+    def __init__(self, time_constant_s=.12):
+        self.time_constant_s = time_constant_s
+        self.reset()
+
+    def reset(self):
+        self.pixel = self.position = self.timestamp = self.target_id = None
+
+    def update(self, result, target_id):
+        if not result.get('valid'):
+            return None
+        pixel = np.asarray(result['pixel'], dtype=float)
+        position = np.asarray(result['point_camera_m'], dtype=float)
+        timestamp = result['capture_monotonic_ns']
+        if (pixel.shape != (2,) or position.shape != (3,) or
+                not np.isfinite(pixel).all() or not np.isfinite(position).all()):
+            raise ValueError('invalid point for display smoothing')
+        dt = (timestamp-self.timestamp)/1e9 if self.timestamp is not None else None
+        if (self.target_id != target_id or dt is None or not 0 < dt <= .2):
+            self.pixel, self.position = pixel, position
+        else:
+            alpha = 1-math.exp(-dt/self.time_constant_s)
+            if np.linalg.norm(pixel-self.pixel) > 6:
+                alpha = max(alpha, .65)
+            self.pixel = self.pixel + alpha*(pixel-self.pixel)
+            self.position = self.position + alpha*(position-self.position)
+        self.timestamp, self.target_id = timestamp, target_id
+        return self.pixel.tolist(), self.position.tolist()

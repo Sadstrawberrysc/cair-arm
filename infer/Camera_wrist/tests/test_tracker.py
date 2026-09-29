@@ -4,7 +4,7 @@ import unittest
 import cv2
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from local_tracker import LocalTracker, surface
+from local_tracker import DisplayPointSmoother, LocalTracker, surface
 
 class TrackerTests(unittest.TestCase):
     def setUp(self):
@@ -14,6 +14,37 @@ class TrackerTests(unittest.TestCase):
         gray=cv2.GaussianBlur(rng.integers(0,256,(240,320),dtype=np.uint8),(3,3),0)
         self.image=cv2.cvtColor(gray,cv2.COLOR_GRAY2BGR)
         self.depth=np.full((240,320),.2)
+
+    def test_display_smoother_reduces_jitter_and_resets_on_new_target(self):
+        rng = np.random.default_rng(9)
+        smoother = DisplayPointSmoother()
+        raw_x, smooth_x = [], []
+        for index in range(30):
+            x = 160 + rng.normal(0, 1.5)
+            result = dict(valid=True, pixel=[x, 120.],
+                          point_camera_m=[x/4000., 0., .2],
+                          capture_monotonic_ns=1_000_000_000+index*33_000_000)
+            pixel, point = smoother.update(result, 'target-a')
+            raw_x.append(x)
+            smooth_x.append(pixel[0])
+            self.assertAlmostEqual(point[0], pixel[0]/4000.)
+        self.assertLess(np.std(smooth_x[10:]), np.std(raw_x[10:])*.8)
+        step = dict(valid=True, pixel=[175., 120.],
+                    point_camera_m=[175/4000., 0., .2],
+                    capture_monotonic_ns=1_000_000_000+30*33_000_000)
+        self.assertGreater(smoother.update(step, 'target-a')[0][0], 169.)
+        self.assertEqual(smoother.update(step, 'target-b')[0], [175., 120.])
+
+    def test_display_smoother_does_not_hold_stale_point(self):
+        smoother = DisplayPointSmoother()
+        initial = dict(valid=True, pixel=[100., 100.],
+                       point_camera_m=[0., 0., .2], capture_monotonic_ns=1)
+        self.assertIsNotNone(smoother.update(initial, 'target-a'))
+        self.assertIsNone(smoother.update(dict(valid=False), 'target-a'))
+        later = dict(valid=True, pixel=[110., 100.],
+                     point_camera_m=[.005, 0., .2],
+                     capture_monotonic_ns=300_000_001)
+        self.assertEqual(smoother.update(later, 'target-a')[0], [110., 100.])
 
     def test_plane_normal_and_metric_depth(self):
         point,normal,q=surface(self.depth,[160,120],self.k,self.d)
@@ -29,6 +60,15 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(result['valid'],result)
         np.testing.assert_allclose(result['pixel'],[158,119],atol=.3)
 
+    def test_edge_pixel_uses_clipped_texture_roi(self):
+        tracker=LocalTracker()
+        result=tracker.initialize(self.image,self.depth,[20,120],self.k,self.d,1)
+        self.assertTrue(result['valid'],result)
+        moved=cv2.warpAffine(self.image,np.array([[1.,0,2],[0,1.,1]]),(320,240))
+        result=tracker.update(moved,self.depth,self.k,self.d,33_000_001)
+        self.assertTrue(result['valid'],result)
+        np.testing.assert_allclose(result['pixel'],[22,121],atol=.4)
+
     def test_depth_failure_latches_until_explicit_reinitialization(self):
         tracker=LocalTracker()
         tracker.initialize(self.image,self.depth,[160,120],self.k,self.d,1)
@@ -41,6 +81,20 @@ class TrackerTests(unittest.TestCase):
         self.assertFalse(tracker.initialize(np.zeros_like(self.image),self.depth,[160,120],self.k,self.d,1)['valid'])
         tracker.initialize(self.image,self.depth,[160,120],self.k,self.d,1)
         self.assertFalse(tracker.update(self.image,self.depth,self.k,self.d,1)['valid'])
+
+    def test_relaxed_depth_step_keeps_invalid_depth_rejected(self):
+        depth = self.depth.copy()
+        depth[120, 161] = .206
+        standard = LocalTracker().initialize(self.image, depth, [160, 120],
+                                             self.k, self.d, 1)
+        relaxed = LocalTracker(relaxed=True).initialize(self.image, depth, [160, 120],
+                                                        self.k, self.d, 1)
+        self.assertFalse(standard['valid'])
+        self.assertTrue(relaxed['valid'], relaxed)
+        depth[120, 160] = 0
+        invalid = LocalTracker(relaxed=True).initialize(self.image, depth, [160, 120],
+                                                        self.k, self.d, 1)
+        self.assertFalse(invalid['valid'])
 
     def test_depth_edge_rejected(self):
         self.depth[:,160:]=.25

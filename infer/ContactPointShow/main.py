@@ -2,6 +2,7 @@ import redis
 import json
 import threading
 import time
+from pathlib import Path
 import numpy as np
 import pyvista as pv
 
@@ -10,7 +11,7 @@ REDIS_HOST = 'localhost'
 REDIS_PORT = 7777
 REDIS_CHANNEL = 'sensor_data'
 
-STL_FILE_PATH = "./model/Lprobe-show.STL" 
+STL_FILE_PATH = Path(__file__).resolve().parents[1] / "Robot/model/Lprobe-IFS.STL"
 SCALING_FACTOR = 100
 
 class ContactSensingApp:

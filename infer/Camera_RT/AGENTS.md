@@ -31,7 +31,8 @@ RealSense RGB-D
 - `tools/`：预检、摘要清单和纯离线路径格式测试。
 - `lib/`：旧 YOLOv3 实现，不属于当前入口活动链路。
 
-详细边界见 `ARCHITECTURE.md`，当前状态见 `PROGRESS.md`，长期决定见
+详细边界见 `ARCHITECTURE.md`，当前状态与操作见本机
+`../../.runme/Progress/camera-rt-progress.md` 和 `../../.runme/run/camera-rt-operations.md`，长期决定见
 `DECISIONS.md`。
 
 ## 运行命令

@@ -537,6 +537,7 @@ int main(int argc, char** argv) {
     const Rm75RuntimeSafetyConfig& effective_safety = options.EffectiveSafety();
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
+    std::signal(SIGHUP, HandleSignal);
     const bool provisional_execute =
         options.mode == ControllerMode::kExecute
         && options.allow_provisional_force_control;
@@ -2041,7 +2042,7 @@ int main(int argc, char** argv) {
             if (g_stop_requested.load()) {
                 fatal_fault = true;
                 fatal_fault_code = "operator_stop_requested";
-                control_output.fault = "SIGINT/SIGTERM requested StopMotion";
+                control_output.fault = "Stop signal requested StopMotion";
             }
             servo_status = command.ServoStatus();
             if (!fatal_fault
