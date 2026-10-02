@@ -60,6 +60,38 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(result['valid'],result)
         np.testing.assert_allclose(result['pixel'],[158,119],atol=.3)
 
+    def test_detection_correction_is_capped_at_two_pixels(self):
+        tracker = LocalTracker()
+        self.assertTrue(tracker.initialize(self.image, self.depth, [155, 117],
+                                           self.k, self.d, 1)['valid'])
+        corrected, reason = tracker.correct_from_detection(
+            [165, 117], self.depth, self.k, self.d, 1)
+        self.assertIsNone(reason)
+        self.assertTrue(corrected['valid'])
+        np.testing.assert_allclose(corrected['pixel'], [157, 117], atol=1e-6)
+        self.assertAlmostEqual(corrected['point_camera_m'][0],
+                               (157-160)*.2/400, places=6)
+
+    def test_rejected_detection_correction_keeps_optical_flow_state(self):
+        tracker = LocalTracker()
+        self.assertTrue(tracker.initialize(self.image, self.depth, [155, 117],
+                                           self.k, self.d, 1)['valid'])
+        original_pixel = tracker.pixel.copy()
+        original_position = tracker.position.copy()
+        bad_depth = self.depth.copy()
+        bad_depth[117, 155] = 0
+        corrected, reason = tracker.correct_from_detection(
+            [157, 117], bad_depth, self.k, self.d, 1)
+        self.assertIsNone(corrected)
+        self.assertIn('depth', reason)
+        self.assertTrue(tracker.active)
+        np.testing.assert_array_equal(tracker.pixel, original_pixel)
+        np.testing.assert_array_equal(tracker.position, original_position)
+        corrected, reason = tracker.correct_from_detection(
+            [157, 117], self.depth, self.k, self.d, 2)
+        self.assertIsNone(corrected)
+        self.assertIn('current frame', reason)
+
     def test_edge_pixel_uses_clipped_texture_roi(self):
         tracker=LocalTracker()
         result=tracker.initialize(self.image,self.depth,[20,120],self.k,self.d,1)

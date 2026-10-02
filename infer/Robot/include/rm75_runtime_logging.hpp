@@ -209,6 +209,9 @@ struct RuntimeSummaryData {
     bool force_sensor_enabled = true;
     bool wrist_candidate_trial = false;
     bool wrist_unlimited_excursion = false;
+    bool wrist_unlimited_translation = false;
+    bool wrist_unlimited_position_tracking_error = false;
+    double joint_speed_cap_deg_s = 0.0;
     bool fatal_fault = false;
     std::string completion_reason;
     std::string fault_code;

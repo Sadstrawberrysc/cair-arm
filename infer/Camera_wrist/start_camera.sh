@@ -43,12 +43,13 @@ if pgrep -af '^(/[^ ]*/)?python(3)?( -u)? infer/Camera_wrist/click_follow\.py( |
 fi
 
 printf 'Camera_wrist 启动于 %s\n终端日志：%s\n' "$(date --iso-8601=seconds)" "$terminal_log"
-python -u infer/Camera_wrist/click_follow.py
+model_id=${CAROTID_MODEL_ID:-songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1}
+python -u infer/Camera_wrist/click_follow.py --model-id "$model_id" --model-class carotid
 camera_status=$?
 if (( camera_status == 7 )); then
   echo '首次启动未取得完整 RGB-D；关闭旧 SDK 会话后只重新初始化一次相机。'
   sleep 1
-  python -u infer/Camera_wrist/click_follow.py
+  python -u infer/Camera_wrist/click_follow.py --model-id "$model_id" --model-class carotid
   camera_status=$?
 fi
 exit "$camera_status"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real hardware wrist experiment. Operator selects the point and presses b/r.
+# No-contact wrist trial. Operator selects the point and presses b/r.
 set -euo pipefail
 if (( $# != 0 )); then
   echo 'Usage: bash infer/Camera_wrist/start_robot.sh (no arguments)' >&2
@@ -14,8 +14,8 @@ if [[ ! -x "$robot_binary" ]]; then
 fi
 mkdir -p -- "$wrist_dir/log"
 run_dir=$(mktemp -d "$wrist_dir/log/wrist_continuous_XXXXXXXX")
-echo "Real wrist execution: no force sensor, candidate extrinsic, no total excursion limits."
-echo "Continuous until Ctrl+C or fault; click and b/r still required. Logs: $run_dir"
+echo "Wrist trial: no force sensor, candidate extrinsic; TCP displacement, total orientation, and TCP position tracking error limits disabled."
+echo "Continuous until Ctrl+C or fault; Hold pauses motion; model selection and b/r still required. Logs: $run_dir"
 # Export after normal exit or a controller fault, preserving its exit status.
 export_simple_log() {
   if [[ -f "$run_dir/runtime.csv" ]]; then
@@ -32,6 +32,7 @@ trap forward_stop HUP INT TERM
 "$robot_binary" \
   --execute-wrist-follow --confirm-wrist-follow \
   --wrist-no-force --wrist-candidate-trial --wrist-unlimited-excursion \
+  --wrist-unlimited-position-tracking-error \
   --calibration "$project_dir/infer/Robot/build/rm75_force_calibration.json" \
   --probe-model "$project_dir/infer/Robot/model/Lprobe-IFS.STL" \
   --wrist-follow "$wrist_dir/gemini305_to_rm75_armtip.json" \

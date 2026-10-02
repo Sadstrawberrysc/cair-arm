@@ -96,15 +96,31 @@ int main() {
     config.safety.maximum_orientation_excursion_deg=5; config.safety.maximum_no_contact_approach_distance_m=.006;
     ok &= Check(!ValidateRobotRuntimeConfig(config,&error), "candidate cannot enlarge distance envelope");
     config.safety.maximum_no_contact_approach_distance_m=.005;
+    config.wrist_unlimited_translation=true;
+    ok &= Check(ValidateRobotRuntimeConfig(config,&error), "candidate accepts explicit translation override");
+    ok &= Check(!config.wrist_unlimited_excursion && config.safety.maximum_orientation_excursion_deg==5,
+                "translation override retains angular envelope");
+    config.wrist_candidate_trial=false;
+    ok &= Check(!ValidateRobotRuntimeConfig(config,&error), "translation override forbidden outside candidate trial");
+    config.wrist_candidate_trial=true; config.wrist_unlimited_translation=false;
     config.wrist_unlimited_excursion=true;
     ok &= Check(ValidateRobotRuntimeConfig(config,&error), "explicit candidate can disable total excursion gates");
     config.wrist_candidate_trial=false;
     ok &= Check(!ValidateRobotRuntimeConfig(config,&error), "excursion override forbidden in ordinary wrist mode");
+    config.wrist_unlimited_excursion=false; config.wrist_candidate_trial=true;
+    config.wrist_unlimited_position_tracking_error=true;
+    ok &= Check(ValidateRobotRuntimeConfig(config,&error), "candidate accepts explicit TCP position tracking error override");
+    config.wrist_candidate_trial=false;
+    ok &= Check(!ValidateRobotRuntimeConfig(config,&error), "TCP position tracking error override forbidden outside candidate trial");
     RobotRuntimeConfig polling;
     ok &= Check(polling.StatePollPeriodMs()==40, "ordinary robot polling remains 40 ms");
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==25.0, "ordinary tracking error remains 25 mm");
+    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==0.0,
+                "ordinary planner keeps its existing joint speed envelope");
     polling.wrist_follow_calibration="wrist.json";
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==50.0, "wrist tracking error uses 50 mm");
+    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==2.0,
+                "wrist follow caps each planned joint at 2 deg/s");
     ok &= Check(polling.StatePollPeriodMs()==10, "wrist polling uses requested 10 ms period");
     return ok ? 0 : 1;
 }

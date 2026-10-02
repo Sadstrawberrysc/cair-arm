@@ -45,7 +45,7 @@ Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日�
 
 ## 详细架构文档
 
-- [无标记初始扫描点定位 Carotid_begin](infer/Carotid_begin/ARCHITECTURE.md)：Roboflow 模型实时腕部 RGB-D 检测与本地画框；启动命令见 [当前进度](infer/Carotid_begin/PROGRESS.md)。
+- [无标记初始扫描点定位 Carotid_begin](infer/Carotid_begin/ARCHITECTURE.md)：Roboflow 模型实时腕部 RGB-D 检测与本地画框；本机 [最简启动](.runme/run/carotid-begin-operations.md)与[进展记录](.runme/Progress/carotid-begin-progress.md)。
 
 - [Robot](infer/Robot/ARCHITECTURE.md)、[超声推理](intergrate_infer/ARCHITECTURE.md)、
   [全局相机](infer/Camera_RT/ARCHITECTURE.md)、[传感器监视](infer/SensorMonitor/ARCHITECTURE.md)

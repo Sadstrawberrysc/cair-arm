@@ -321,6 +321,7 @@ struct Rm75ServoPlannerConfig {
     // 速度比例乘周期不得超过最小下发间隔。
     double minimum_dispatch_gap_ms = 10.0; // 相邻 ServoJ 下发的最小时间间隔
     double joint_speed_scale = 1.0; // 官方最大关节速度比例
+    double max_joint_speed_deg_s = 0.0; // 0 表示不额外限制每关节速度
     double max_joint_accel_deg_s2 = 90.0; // 相邻周期关节速度变化上限
     bool allow_near_singularity = false; // true 仅用于诊断，生产入口保持 false
 };

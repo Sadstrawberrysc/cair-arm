@@ -5,6 +5,7 @@ publishes a Robot command or relaxes the wrist tracker quality gates.
 """
 from collections import deque
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -149,3 +150,77 @@ def observation_is_fresh(result, now_ns):
         return False
     capture = result.get('capture_monotonic_ns')
     return isinstance(capture, int) and 0 <= now_ns - capture <= 200_000_000
+
+
+class DetectionCenterFusion:
+    """Align an asynchronous detection with optical flow from the same source frame."""
+
+    def __init__(self, *, max_age_ns=500_000_000):
+        self.max_age_ns = max_age_ns
+        self.history = deque(maxlen=60)
+        self.target_id = None
+
+    def reset(self):
+        self.history.clear()
+        self.target_id = None
+
+    def remember(self, result, target_id):
+        if not target_id or not result.get('valid'):
+            return
+        if target_id != self.target_id:
+            self.reset()
+            self.target_id = target_id
+        stamp = result['capture_monotonic_ns']
+        point = tuple(result['pixel'])
+        if self.history and self.history[-1][0] == stamp:
+            self.history[-1] = (stamp, point)
+        elif not self.history or stamp > self.history[-1][0]:
+            self.history.append((stamp, point))
+
+    def aligned_center(self, response, target_id, current_result, now_ns):
+        if not target_id or target_id != self.target_id or not current_result.get('valid'):
+            return None, 'no active target for fusion'
+        if not isinstance(response, dict) or response.get('valid') is not True:
+            return None, 'detection is not a unique valid target'
+        stamp = response.get('capture_monotonic_ns')
+        if not isinstance(stamp, int) or not 0 <= now_ns-stamp <= self.max_age_ns:
+            return None, 'detection is stale or from the future'
+        current_stamp = current_result.get('capture_monotonic_ns')
+        if not isinstance(current_stamp, int) or current_stamp < stamp:
+            return None, 'tracking result precedes detection'
+        prediction = response.get('prediction')
+        if not isinstance(prediction, dict):
+            return None, 'detection has no selected center'
+        try:
+            center = tuple(float(value) for value in prediction['scan_start'])
+        except (KeyError, TypeError, ValueError):
+            return None, 'invalid detection center'
+        if len(center) != 2 or not all(math.isfinite(value) for value in center):
+            return None, 'invalid detection center'
+        source = next((point for time_ns, point in reversed(self.history)
+                       if time_ns == stamp), None)
+        if source is None:
+            return None, 'matching tracked source frame unavailable'
+        current = current_result.get('pixel')
+        if (not isinstance(current, (list, tuple)) or len(current) != 2 or
+                not all(isinstance(value, (int, float)) and math.isfinite(value)
+                        for value in current)):
+            return None, 'invalid current tracking point'
+        return [current[0]+center[0]-source[0], current[1]+center[1]-source[1]], None
+
+
+def fuse_model_observation(tracker, fusion, response, source_timestamp, frame,
+                           current_result, target_id, k, distortion, now_ns):
+    """Return (observation, applied, reason, confirmed) for one model preview."""
+    if response.get('capture_monotonic_ns') != source_timestamp:
+        return current_result, False, 'model response frame identity mismatch', False
+    aligned, reason = fusion.aligned_center(response, target_id, current_result, now_ns)
+    if aligned is None:
+        return current_result, False, reason, False
+    if not observation_is_fresh(current_result, now_ns):
+        return current_result, False, 'current tracking observation is stale', False
+    corrected, reason = tracker.correct_from_detection(
+        aligned, frame[1], k, distortion, frame[2])
+    if corrected is not None:
+        return corrected, True, None, True
+    return current_result, False, reason, reason == 'already aligned'

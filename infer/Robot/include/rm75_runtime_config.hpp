@@ -25,6 +25,8 @@ struct RobotRuntimeConfig {
     bool wrist_no_force = false;
     bool wrist_candidate_trial = false;
     bool wrist_unlimited_excursion = false;
+    bool wrist_unlimited_translation = false;
+    bool wrist_unlimited_position_tracking_error = false;
     bool redis_enabled = true;
     std::string wrist_follow_calibration;
     bool confirm_wrist_follow = false;
@@ -65,6 +67,12 @@ struct RobotRuntimeConfig {
     Rm75RuntimeSafetyConfig EffectiveSafety() const {
         auto result = safety;
         if (!wrist_follow_calibration.empty()) result.max_tracking_position_error_mm = safety.wrist_max_tracking_position_error_mm;
+        return result;
+    }
+
+    Rm75ServoPlannerConfig EffectivePlanner() const {
+        auto result = planner;
+        if (!wrist_follow_calibration.empty()) result.max_joint_speed_deg_s = 2.0;
         return result;
     }
 

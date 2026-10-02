@@ -1073,6 +1073,8 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
         || !std::isfinite(config_.joint_speed_scale)
         || config_.joint_speed_scale <= 0.0
         || config_.joint_speed_scale > 1.0
+        || !std::isfinite(config_.max_joint_speed_deg_s)
+        || config_.max_joint_speed_deg_s < 0.0
         || config_.joint_speed_scale * config_.period_ms
                > config_.minimum_dispatch_gap_ms + 1e-12
         || !std::isfinite(config_.max_joint_accel_deg_s2)
@@ -1122,9 +1124,14 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
     }
 
     const double period_s = config_.period_ms / 1000.0;
-    const Eigen::Matrix<double, 7, 1> maximum_step =
+    Eigen::Matrix<double, 7, 1> maximum_step =
         config_.joint_speed_scale
         * kJointMaximumSpeedDegS * period_s * kDegToRad;
+    if (config_.max_joint_speed_deg_s > 0.0) {
+        maximum_step = maximum_step.cwiseMin(
+            Eigen::Matrix<double, 7, 1>::Constant(
+                config_.max_joint_speed_deg_s * period_s * kDegToRad));
+    }
     if ((previous_joint_delta.cwiseAbs().array()
          > maximum_step.array() + 1e-12).any()) {
         result.error = Rm75PlanError::kPreviousStepOutOfBounds;
@@ -1279,12 +1286,12 @@ WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
     out.actual_gap_m = (in.actual_tcp.topRightCorner<3,1>() - in.surface_base).dot(n);
     Eigen::Vector3d delta = out.tcp_goal.topRightCorner<3,1>() - reference_.topRightCorner<3,1>();
     const double distance = delta.norm();
-    if (distance > .005*in.cycle_s) delta *= .005*in.cycle_s/distance;
+    if (distance > .002*in.cycle_s) delta *= .002*in.cycle_s/distance;
     out.tcp_reference = reference_;
     out.tcp_reference.topRightCorner<3,1>() += delta;
     Eigen::Quaterniond current(reference_.topLeftCorner<3,3>()), desired(rotation);
     const double angle = current.angularDistance(desired);
-    const double fraction = angle < 1e-12 ? 1. : std::min(1., (5.*M_PI/180.)*in.cycle_s/angle);
+    const double fraction = angle < 1e-12 ? 1. : std::min(1., (2.*M_PI/180.)*in.cycle_s/angle);
     out.tcp_reference.topLeftCorner<3,3>() = current.slerp(fraction, desired).normalized().toRotationMatrix();
     out.following = true; return out;
 }

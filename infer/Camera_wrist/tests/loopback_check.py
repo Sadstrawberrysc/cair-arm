@@ -2,7 +2,7 @@
 """Hardware-free Redis/Robot integration check. Requires built main_rm75, numpy, redis-py.
 Starts only its own loopback Redis and explicit --simulate Robot; never uses port 7777.
 """
-import argparse,csv,json,socket,subprocess,tempfile,time
+import argparse,csv,json,socket,subprocess,sys,tempfile,time
 from pathlib import Path
 import numpy as np
 import redis
@@ -11,6 +11,9 @@ parser.add_argument("--no-force",action="store_true")
 parser.add_argument("--continuous",action="store_true")
 parser.add_argument("--candidate-trial",action="store_true")
 parser.add_argument("--unlimited-excursion",action="store_true")
+parser.add_argument("--unlimited-translation",action="store_true")
+parser.add_argument("--unlimited-position-tracking-error",action="store_true")
+parser.add_argument("--auto-recovery",action="store_true")
 args=parser.parse_args()
 ROOT=Path(__file__).resolve().parents[3]
 with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -29,6 +32,8 @@ try:
  if args.no_force:command.append("--wrist-no-force")
  if args.candidate_trial:command.append("--wrist-candidate-trial")
  if args.unlimited_excursion:command.append("--wrist-unlimited-excursion")
+ if args.unlimited_translation:command.append("--wrist-unlimited-translation")
+ if args.unlimited_position_tracking_error:command.append("--wrist-unlimited-position-tracking-error")
  robot=subprocess.Popen(command,stdout=robot_log,stderr=subprocess.STDOUT)
  state=None; deadline=time.monotonic()+5
  while time.monotonic()<deadline:
@@ -43,7 +48,7 @@ try:
  mount=np.array(force['sensor_to_tool']['rotation_row_major']).reshape(3,3)
  tool_rotation=base_arm[:3,:3]@mount
  tcp=base_arm[:3,3]+base_arm[:3,:3]@mount@np.array(force['probe_tcp_sensor_m'])
- normal=-tool_rotation[:,2];skin=tcp+np.array([.008 if args.unlimited_excursion else .001,0,0])-.05*normal
+ normal=-tool_rotation[:,2];skin=tcp+np.array([.008 if (args.unlimited_excursion or args.unlimited_translation) else .001,0,0])-.05*normal
  seq=0;events=[];capture=0;history=[state];capture_state=state
  def envelope(target):
   global seq
@@ -92,6 +97,8 @@ try:
  pump(.3,'two')
  assert state['follow_state']=='hold','heartbeat resumed after command timeout'
  pump(.3,'three','resume')
+ if args.unlimited_excursion or args.unlimited_translation:
+  pump(4.,'three')  # Allow the wrist reference to cross the former 5 mm gate.
  assert state['follow_state']=='following','explicit resume after timeout failed'
  pump(.3,'three',observations=False)
  assert state['follow_state']=='hold','observation timeout did not Hold'
@@ -117,25 +124,82 @@ try:
  assert state['follow_state']=='following','reconnect explicit resume failed'
  cmd('pause','seven');pump(.2,'seven')
  assert state['follow_state']=='hold','pause not held'
+ if args.auto_recovery:
+  sys.path.insert(0,str(ROOT/'infer/Camera_wrist'))
+  from click_follow import ClickSession, ModelRecovery
+  camera=ClickSession(state['calibration_sha256']);camera.accept_state(state,time.monotonic_ns())
+  camera.select(); recovery=ModelRecovery(); auto_resumes=[]
+  def camera_pump(seconds,valid=True):
+   global state
+   until=time.monotonic()+seconds
+   while time.monotonic()<until:
+    assert robot.poll() is None, 'simulated Robot exited during recovery test'
+    for _ in range(100):
+     message=sub.get_message(timeout=0)
+     if message is None:break
+     if message['type']=='message':
+      state=json.loads(message['data']);history.append(state);history[:]=history[-100:]
+      camera.accept_state(state,time.monotonic_ns())
+    recovery.check_state(camera,time.monotonic_ns())
+    eligible=[item for item in history if item['timestamp_monotonic_ns']<=time.monotonic_ns()-40_000_000]
+    source=eligible[-1] if eligible else history[0]
+    bc=np.array(source['T_base_camera'])
+    result=dict(valid=valid,capture_monotonic_ns=source['timestamp_monotonic_ns'],
+      point_camera_m=(bc[:3,:3].T@(skin-bc[:3,3])).tolist(),
+      normal_out_camera=(bc[:3,:3].T@normal).tolist(),
+      quality=dict(surface_points=100,feature_inliers=20,plane_rms_m=.001,plane_inlier_ratio=.95))
+    if camera.target:
+     packet=camera.envelope();packet.update(result)
+     r.publish('robot:wrist:observation:v1',json.dumps(packet))
+    if not valid and camera.following:
+     r.publish('robot:wrist:command:v1',json.dumps(recovery.pause_for_loss(camera)))
+    resumed=recovery.resume(camera,result,time.monotonic_ns())
+    if resumed:
+     auto_resumes.append(resumed['target_id'])
+     r.publish('robot:wrist:command:v1',json.dumps(resumed))
+    if camera.following or recovery.waiting:
+     heartbeat=camera.envelope();heartbeat.update(action='heartbeat',target_id=camera.target or recovery.old_target)
+     r.publish('robot:wrist:command:v1',json.dumps(heartbeat))
+    time.sleep(.035)
+  camera_pump(.1)
+  request=camera.request('resume',True);recovery.arm(camera)
+  r.publish('robot:wrist:command:v1',json.dumps(request));camera_pump(.3)
+  assert camera.following and state['follow_state']=='following', 'manual start not accepted'
+  for _ in range(2):
+   old=camera.target;camera_pump(.2,valid=False)
+   assert state['follow_state']=='hold' and recovery.ready(camera,time.monotonic_ns()), ('visual pause not acknowledged',state)
+   camera.select();assert camera.target!=old
+   camera_pump(.35)
+   assert camera.following and state['follow_state']=='following', ('automatic resume failed',state)
+  recovery.cancel()
+  r.publish('robot:wrist:command:v1',json.dumps(camera.request('pause',False)))
+  camera_pump(.25)
+  assert state['follow_state']=='hold' and not camera.following and len(auto_resumes)==2
+  print(json.dumps({'auto_recovery_cycles':len(auto_resumes),'manual_pause_kept':True}))
  robot.send_signal(2);robot.wait(timeout=5)
  rows=list(csv.DictReader((folder/'runtime.csv.wrist.csv').open()))
  assert rows and any(row['valid']=='1' for row in rows)
  assert any(row['planner_attempted']=='1' and row['planner_valid']=='1' for row in rows), 'planner never accepted a target'
  summary=json.loads((folder/'runtime.summary.json').read_text())
+ main_rows=list(csv.DictReader((folder/'runtime.csv').open()))
+ joints=np.array([[float(row['j%d_rad' % joint]) for joint in range(1,8)] for row in main_rows])
+ max_joint_step_deg=float(np.rad2deg(np.abs(np.diff(joints,axis=0)).max()))
+ assert max_joint_step_deg<=.020001, ('joint command step exceeds 2 deg/s at 10 ms',max_joint_step_deg)
  assert summary['simulated'] and summary['mode']=='dry_run'
  assert summary['servo']['sent_sequence']==0
- if args.unlimited_excursion:
-  physical=list(csv.DictReader((folder/'runtime.csv').open()))
-  xyz=np.array([[float(row[k]) for k in ('actual_x_m','actual_y_m','actual_z_m')] for row in physical])
+ if args.unlimited_excursion or args.unlimited_translation:
+  xyz=np.array([[float(row[k]) for k in ('actual_x_m','actual_y_m','actual_z_m')] for row in main_rows])
   excursion=float(np.linalg.norm(xyz-xyz[0],axis=1).max())
   assert excursion>.005, ('override never exercised beyond 5mm',excursion)
- assert summary['control']['wrist_total_excursion_limits_enabled'] == (not args.unlimited_excursion)
+ assert summary['control']['wrist_translation_limit_enabled'] == (not (args.unlimited_excursion or args.unlimited_translation))
+ assert summary['control']['wrist_orientation_limit_enabled'] == (not args.unlimited_excursion)
+ assert summary['control']['wrist_position_tracking_error_limit_enabled'] == (not args.unlimited_position_tracking_error)
+ assert summary['control']['joint_speed_cap_deg_s'] == 2.0
  assert summary['control']['wrist_candidate_trial'] == args.candidate_trial
  assert summary['control']['force_sensor_enabled'] == (not args.no_force)
  if args.no_force:
-  main_rows=list(csv.DictReader((folder/'runtime.csv').open()))
   assert all(row['wrench_valid']=='0' for row in main_rows), 'fabricated valid wrench'
- print(json.dumps({'directory':str(folder),'rows':len(rows),'events':list(dict.fromkeys(events)),'result':summary['result'],'fault':summary['fault_code'],'servo_sent':summary['servo']['sent_sequence']},indent=2))
+ print(json.dumps({'directory':str(folder),'rows':len(rows),'events':list(dict.fromkeys(events)),'result':summary['result'],'fault':summary['fault_code'],'servo_sent':summary['servo']['sent_sequence'],'max_joint_step_deg':max_joint_step_deg},indent=2))
 finally:
  if robot and robot.poll() is None:robot.terminate();robot.wait(timeout=5)
  server.terminate();server.wait(timeout=5)

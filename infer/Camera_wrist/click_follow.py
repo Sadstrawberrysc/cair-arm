@@ -9,8 +9,10 @@ import uuid
 import cv2
 import numpy as np
 from gemini_config import WIDTH, HEIGHT, configure_close_range, stream_profiles
-from local_tracker import DisplayPointSmoother, LocalTracker
-from model_selection import DEFAULT_DETECTOR_PYTHON, ModelSelector, replay_selection, observation_is_fresh
+from local_tracker import LocalTracker
+from model_selection import (DEFAULT_DETECTOR_PYTHON, DetectionCenterFusion,
+                             ModelSelector, fuse_model_observation, replay_selection,
+                             observation_is_fresh)
 from projection_preview import CaptureClock, aligned_rgbd, color_bgr
 from tracking_diagnostics import TrackingDiagnostics
 from wrist_projection import boot_id, calibration, FRAME
@@ -108,9 +110,141 @@ class ClickSession:
         return packet
 
 
-def use_relaxed_vision(model_id, no_redis, standard_vision=False):
-    """Use relaxed visual gates only for model inspection without Robot I/O."""
-    return bool(model_id and no_redis and not standard_vision)
+class ModelStart:
+    """One b press authorizes one fresh model selection and acknowledged start."""
+    def __init__(self):
+        self.cancel()
+
+    def cancel(self):
+        self.runtime = ''
+        self.old_target = ''
+
+    def queue(self, session, now):
+        state = session.state or {}
+        if session.following:
+            raise ValueError('already following; pause before selecting another target')
+        if (not session.runtime or not 0 <= now-state.get('timestamp_monotonic_ns', 0) <= 200_000_000
+                or state.get('follow_state') != 'hold'
+                or str(state.get('control_state', '')).lower() == 'fault'):
+            raise ValueError('wait for a fresh Robot Hold before starting')
+        self.runtime = session.runtime
+        self.old_target = session.target
+
+    def poll(self, session, result, now, *, selecting):
+        if not self.runtime:
+            return None
+        state = session.state or {}
+        if (session.runtime != self.runtime or session.following
+                or not 0 <= now-state.get('timestamp_monotonic_ns', 0) <= 200_000_000
+                or state.get('follow_state') != 'hold'
+                or str(state.get('control_state', '')).lower() == 'fault'):
+            self.cancel()
+            return None
+        if selecting:
+            return None
+        if (not session.target or session.target == self.old_target
+                or not observation_is_fresh(result, now)):
+            self.cancel()
+            return None
+        # Observation is published by the caller before polling. Wait until Robot
+        # echoes its target identity, so begin/resume cannot race the observation.
+        if state.get('target_id') != session.target:
+            return None
+        packet = session.request('resume' if session.started else 'begin', True)
+        self.cancel()
+        return packet
+
+
+class ModelRecovery:
+    """Keep operator follow intent across visual loss, with an acknowledged pause."""
+    VISUAL_HOLDS = {'operator_pause', 'operator_paused', 'invalid wrist observation',
+                    'wrist_pose_time_unmatched', 'wrist_observation_missing_stale_or_mismatched'}
+
+    def __init__(self):
+        self.cancel()
+
+    def cancel(self):
+        self.enabled = self.waiting = False
+        self.runtime = self.old_target = ''
+        self.pause_sequence = self.pause_state_sequence = 0
+
+    def arm(self, session):
+        self.cancel()
+        self.enabled = True
+        self.runtime = session.runtime
+
+    def accept_state(self, session, state, now):
+        """Turn an owned Robot timing Hold into the acknowledged recovery path."""
+        was_following = session.following
+        old_target = session.target
+        previous_sequence = session.last_state_sequence
+        previous_runtime = session.runtime
+        changed = session.accept_state(state, now)
+        pause = None
+        if (self.enabled and not self.waiting and was_following and old_target
+                and session.runtime == previous_runtime == self.runtime
+                and session.state is state and state['sequence'] > previous_sequence
+                and state.get('follow_state') == 'hold'
+                and state.get('follow_reason') == 'wrist_pose_time_unmatched'
+                and str(state.get('control_state', '')).lower() != 'fault'
+                and state.get('target_id') == old_target
+                and state.get('request_producer_id') == session.producer
+                and state.get('request_sequence', 0) >= session.last_request_sequence):
+            # accept_state clears the held target; carry its identity on our pause
+            # so recovery still requires a different, acknowledged new target.
+            pause = self.pause_for_loss(session, target_id=old_target)
+        self.check_state(session, now)
+        return changed, pause
+
+    def pause_for_loss(self, session, *, target_id=None):
+        packet = session.request('pause', False)
+        if target_id is not None:
+            packet['target_id'] = target_id
+        self.waiting = self.enabled
+        self.pause_sequence = packet['sequence']
+        self.pause_state_sequence = session.last_state_sequence
+        self.old_target = packet['target_id']
+        return packet
+
+    def check_state(self, session, now):
+        if not self.enabled:
+            return
+        state = session.state
+        if (session.runtime != self.runtime or not state
+                or not 0 <= now-state['timestamp_monotonic_ns'] <= 200_000_000
+                or str(state.get('control_state', '')).lower() == 'fault'):
+            self.cancel()
+            return
+        if self.waiting:
+            if state['sequence'] <= self.pause_state_sequence:
+                return
+            if (state.get('follow_state') == 'hold'
+                    and state.get('follow_reason') not in self.VISUAL_HOLDS):
+                self.cancel()
+            elif (state.get('request_sequence', 0) >= self.pause_sequence
+                  and state.get('request_producer_id') != session.producer):
+                self.cancel()
+        elif not session.following:
+            self.cancel()
+
+    def ready(self, session, now):
+        self.check_state(session, now)
+        state = session.state or {}
+        return (self.enabled and self.waiting
+                and state.get('follow_state') == 'hold'
+                and state.get('request_producer_id') == session.producer
+                and state.get('request_sequence') == self.pause_sequence
+                and state.get('follow_reason') in self.VISUAL_HOLDS)
+
+    def resume(self, session, result, now):
+        if (not self.ready(session, now) or not session.target
+                or session.target == self.old_target
+                or session.state.get('target_id') != session.target
+                or not observation_is_fresh(result, now)):
+            return None
+        packet = session.request('resume', True)
+        self.waiting = False
+        return packet
 
 
 def draw_detection_boxes(image, response, now_ns, *, max_age_ns=500_000_000):
@@ -141,27 +275,28 @@ def draw_detection_boxes(image, response, now_ns, *, max_age_ns=500_000_000):
     return True
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--serial', default='CV2L360000HZ')
     parser.add_argument('--calibration', type=Path, default=Path(__file__).with_name('gemini305_to_rm75_armtip.json'))
-    parser.add_argument('--no-redis', action='store_true', help='independent click/normal test; cannot request Robot motion')
     parser.add_argument('--redis-port', type=int, default=7777)
     parser.add_argument('--model-id', help='Enable model P0 selection with d; disables mouse selection')
     parser.add_argument('--detector-python', type=Path, default=DEFAULT_DETECTOR_PYTHON)
     parser.add_argument('--model-class', default='carotid')
-    parser.add_argument('--model-confidence', type=float, help='Default 0.25 for no-Redis model inspection, otherwise 0.5')
-    parser.add_argument('--standard-vision', action='store_true',
-                        help='Use the original stricter visual thresholds in no-Redis model inspection')
+    parser.add_argument('--model-confidence', type=float, default=.4, help='Model selection confidence (default: 0.4)')
     parser.add_argument('--log', type=Path, default=Path(__file__).resolve().parent / 'log' / ('wrist_click_%d.jsonl' % time.time_ns()))
-    args = parser.parse_args()
-    relaxed_vision = use_relaxed_vision(args.model_id, args.no_redis, args.standard_vision)
-    model_confidence = (args.model_confidence if args.model_confidence is not None
-                        else (.25 if relaxed_vision else .5))
+    args = parser.parse_args(argv)
+    model_confidence = args.model_confidence
     if not 0 <= model_confidence <= 1:
         parser.error('--model-confidence must be in [0, 1]')
     if args.model_id and not args.detector_python.is_file():
         parser.error('detector Python environment not found')
+    return args
+
+
+def main():
+    args = parse_args()
+    model_confidence = args.model_confidence
     _, digest = calibration(args.calibration, 'T_armtip_camera', 'gemini305_color_optical_to_rm75_armtip')
     import pyorbbecsdk as ob
     sdk_log = Path(__file__).resolve().parent / 'log' / 'sdk'
@@ -186,19 +321,17 @@ def main():
     d = np.array([dist.k1, dist.k2, dist.p1, dist.p2, dist.k3, dist.k4, dist.k5, dist.k6])
     if dist.model == ob.OBCameraDistortionModel.NONE: d[:] = 0
     align = ob.AlignFilter(align_to_stream=ob.OBStreamType.COLOR_STREAM)
-    tracker, session, clock = LocalTracker(relaxed=relaxed_vision), ClickSession(digest), CaptureClock()
-    smoother = DisplayPointSmoother()
+    tracker, session, clock = LocalTracker(), ClickSession(digest), CaptureClock()
     selector = ModelSelector(args.detector_python, args.model_id, args.model_class,
                              model_confidence, 0,
                              inference_confidence=.4) if args.model_id else None
-    client = subscriber = None
-    if not args.no_redis:
-        import redis
-        client = redis.Redis(host='127.0.0.1', port=args.redis_port, socket_timeout=.05, socket_connect_timeout=.1)
-        subscriber = client.pubsub(ignore_subscribe_messages=True)
-        subscriber.subscribe(STATE)
+    fusion = DetectionCenterFusion() if selector is not None else None
+    import redis
+    client = redis.Redis(host='127.0.0.1', port=args.redis_port, socket_timeout=.05, socket_connect_timeout=.1)
+    subscriber = client.pubsub(ignore_subscribe_messages=True)
+    subscriber.subscribe(STATE)
     clicked = []
-    window = 'Wrist click follow' + (' [relaxed vision]' if relaxed_vision else '')
+    window = 'Wrist click follow'
     cv2.namedWindow(window)
     cv2.setMouseCallback(window, lambda event, x, y, flags, param:
                         clicked.append((x, y)) if not selector and event == cv2.EVENT_LBUTTONDOWN else None)
@@ -210,9 +343,11 @@ def main():
     latest_detection = None
     selection_requested = False
     selection_pending = False
-    auto_recovery_enabled = False
+    recovery = ModelRecovery()
+    model_start = ModelStart()
     next_recovery_at = 0.
     last_preview_request = 0.
+    last_model_confirmed_ns = None
     last_state_error = ""
     last_published_capture = {}
     with args.log.open('x') as log:
@@ -225,6 +360,8 @@ def main():
                 except Exception as error:
                     session.following = False
                     tracker.lose('Redis publication failed')
+                    recovery.cancel()
+                    model_start.cancel()
                     record(dict(type='redis_error', reason=str(error)))
         def publish_observation(result):
             if not session.runtime or not session.target:
@@ -244,7 +381,7 @@ def main():
         record(dict(type='configuration', mode='click_follow', serial=args.serial, calibration_sha256=digest,
                     intrinsic=k.tolist(), distortion=d.tolist(), sdk=str(ob.__version__), independent_validation=False,
                     selection='model' if selector else 'click', model_id=args.model_id,
-                    vision_profile='relaxed' if relaxed_vision else 'standard',
+                    vision_profile='standard',
                     model_confidence=model_confidence))
         try:
             pipeline.start(config); started = True; pipeline.enable_frame_sync()
@@ -259,11 +396,19 @@ def main():
                             if msg is None: break
                             if msg['type'] != 'message': continue
                             previous_runtime = session.runtime
-                            changed = session.accept_state(json.loads(msg['data']), time.monotonic_ns())
+                            changed, recovery_pause = recovery.accept_state(
+                                session, json.loads(msg['data']), time.monotonic_ns())
                             last_state_error = ""
                             if session.runtime != previous_runtime:
                                 record(dict(type='robot_state_connected', runtime_session_id=session.runtime,
                                             sequence=session.last_state_sequence))
+                            if recovery_pause is not None:
+                                publish(COMMAND, recovery_pause)
+                                selection_requested = selection_pending = model_catching_up = False
+                                next_recovery_at = time.monotonic()+.75
+                                record(dict(type='model_recovery_wait',
+                                            reason='wrist_pose_time_unmatched', source='robot'))
+                                user_notice = 'Robot timing Hold; waiting for pause acknowledgement and new model center'
                             if changed:
                                 tracker.lose('Robot held/restarted: '+str(session.state.get('follow_reason') or 'session changed')+'; select again', force=True)
                     except Exception as error:
@@ -271,18 +416,19 @@ def main():
                             tracker.lose('Robot state rejected/disconnected')
                             session.following = False
                             session.target = ''
+                        recovery.cancel()
+                        model_start.cancel()
                         last_state_error = str(error)
                         record(dict(type='state_rejected', reason=last_state_error))
                 if session.following and (session.state is None or time.monotonic_ns()-session.state['timestamp_monotonic_ns'] > 200_000_000):
                     tracker.lose('Robot state timeout'); session.following = False; session.target = ''
+                recovery.check_state(session, time.monotonic_ns())
                 color, depth, missing = aligned_rgbd(pipeline.wait_for_frames(100), align)
                 frame = None
                 result = dict(valid=False, reason=missing or tracker.reason)
                 image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
                 if missing:
-                    # Brief frame loss can be bridged by the next optical-flow update.
-                    if not (args.no_redis and tracker.active):
-                        tracker.lose(missing)
+                    tracker.lose(missing)
                     startup_limit = 10 if not first_complete else 5
                     if time.monotonic()-last_complete > startup_limit:
                         message = 'no complete RGB-D for %d seconds: %s' % (startup_limit, missing)
@@ -309,12 +455,13 @@ def main():
                                 record(dict(type='model_selection_rejected', reason=result['reason']))
                             elif observation_is_fresh(result, time.monotonic_ns()):
                                 session.select()
+                                last_model_confirmed_ns = time.monotonic_ns()
                                 model_catching_up = False
                                 record(dict(type='model_selection', target_id=session.target,
                                             current_capture_monotonic_ns=result['capture_monotonic_ns'],
                                             catchup=True))
-                                user_notice = ('model P0 tracking' if args.no_redis else
-                                               'model P0 selected; press b or r to follow')
+                                user_notice = ('model P0 selected; waiting for Robot confirmation' if model_start.runtime
+                                                           else 'model P0 selected; press b or r to follow')
                         if selector is not None:
                             selector.add_frame(frame)
                             completed = selector.poll()
@@ -341,11 +488,12 @@ def main():
                                                     replay_frames=len(intervening)))
                                         if observation_is_fresh(result, time.monotonic_ns()):
                                             session.select()
+                                            last_model_confirmed_ns = time.monotonic_ns()
                                             record(dict(type='model_selection', target_id=session.target,
                                                         current_capture_monotonic_ns=result['capture_monotonic_ns'],
                                                         catchup=False))
-                                            user_notice = ('model P0 tracking' if args.no_redis else
-                                                           'model P0 selected; press b or r to follow')
+                                            user_notice = ('model P0 selected; waiting for Robot confirmation' if model_start.runtime
+                                                           else 'model P0 selected; press b or r to follow')
                                         else:
                                             model_catching_up = True
                                             model_catchup_started = time.monotonic_ns()
@@ -356,7 +504,7 @@ def main():
                                         result = dict(valid=False, reason=str(error))
                                         user_notice = str(error)
                                         record(dict(type='model_selection_rejected', reason=str(error)))
-                                        if args.no_redis and auto_recovery_enabled:
+                                        if recovery.waiting:
                                             next_recovery_at = time.monotonic()+.75
                                 else:
                                     if response is not None:
@@ -368,7 +516,19 @@ def main():
                                                     valid=response.get('valid', False)))
                                     if error:
                                         user_notice = 'model preview: ' + error
-                            recovery_due = (args.no_redis and auto_recovery_enabled
+                                    if (fusion is not None and tracker.active and session.target
+                                            and response is not None and result.get('valid')):
+                                        result, applied, reason, confirmed = fuse_model_observation(
+                                            tracker, fusion, response, initial[2], frame, result,
+                                            session.target, k, d, time.monotonic_ns())
+                                        if confirmed:
+                                            last_model_confirmed_ns = time.monotonic_ns()
+                                        record(dict(type='model_fusion', applied=applied,
+                                                    reason=reason, source_capture_monotonic_ns=initial[2],
+                                                    current_capture_monotonic_ns=timestamp,
+                                                    pixel=result.get('pixel')))
+                            recovery_due = (recovery.ready(session, time.monotonic_ns())
+                                            and not session.following
                                             and not tracker.active and not model_catching_up
                                             and time.monotonic() >= next_recovery_at)
                             if (selection_requested or recovery_due) and not selector.pending:
@@ -390,7 +550,7 @@ def main():
                                     next_recovery_at = time.monotonic()+.75
                                     user_notice = str(error)
                                     record(dict(type='model_selection_rejected', reason=str(error)))
-                            elif (args.no_redis and not selector.pending and not selection_pending
+                            elif (not selector.pending and not selection_pending
                                   and time.monotonic()-last_preview_request >= .1):
                                 try:
                                     selector.request(frame, dict(capture_monotonic_ns=frame[2]),
@@ -398,27 +558,54 @@ def main():
                                     last_preview_request = time.monotonic()
                                 except ValueError as error:
                                     user_notice = 'model preview: ' + str(error)
+                        if (fusion is not None and tracker.active
+                                and session.target and last_model_confirmed_ns is not None
+                                and time.monotonic_ns()-last_model_confirmed_ns > 1_000_000_000):
+                            tracker.lose('model confirmation missing for 1 second', force=True)
+                            result = dict(valid=False, reason=tracker.reason)
                         if time.monotonic_ns()-timestamp > 200_000_000:
                             result = dict(valid=False, reason='tracking computation exceeded observation age')
                     except ValueError as error:
                         tracker.lose(error); result = dict(valid=False, reason=str(error))
+                if fusion is not None:
+                    if not tracker.active or not session.target:
+                        fusion.reset()
+                    elif result.get('valid') and observation_is_fresh(result, time.monotonic_ns()):
+                        fusion.remember(result, session.target)
                 diagnostics.emit(result, tracker)
                 publish_observation(result)
                 if not result.get('valid') and session.following:
-                    publish(COMMAND, session.request('pause', False))
-                if session.following and time.monotonic()-last_heartbeat >= .1:
+                    packet = (recovery.pause_for_loss(session) if recovery.enabled
+                              else session.request('pause', False))
+                    publish(COMMAND, packet)
+                    tracker.lose(result.get('reason', 'visual tracking lost'), force=True)
+                    next_recovery_at = time.monotonic()+.75
+                    if recovery.waiting:
+                        record(dict(type='model_recovery_wait', reason=result.get('reason')))
+                        user_notice = 'visual target lost; waiting for Robot Hold and new model center'
+                start_packet = model_start.poll(
+                    session, result, time.monotonic_ns(),
+                    selecting=selection_requested or selection_pending or model_catching_up)
+                if start_packet is not None:
+                    recovery.arm(session)
+                    publish(COMMAND, start_packet)
+                    record(dict(type='model_start', action=start_packet['action'], target_id=session.target))
+                    user_notice = 'model target confirmed; follow requested'
+                resume_packet = recovery.resume(session, result, time.monotonic_ns())
+                if resume_packet is not None:
+                    publish(COMMAND, resume_packet)
+                    record(dict(type='model_auto_resume', target_id=session.target))
+                    user_notice = 'new model center acquired; automatic resume requested'
+                if (session.following or recovery.waiting) and time.monotonic()-last_heartbeat >= .1:
                     heartbeat = session.envelope(); heartbeat['action'] = 'heartbeat'
+                    heartbeat['target_id'] = session.target or recovery.old_target
                     publish(COMMAND, heartbeat); last_heartbeat = time.monotonic()
-                if args.no_redis and not tracker.active:
-                    smoother.reset()
-                smoothed = smoother.update(result, session.target) if args.no_redis else None
-                if selector is not None and args.no_redis:
+                if selector is not None:
                     shown = draw_detection_boxes(image, latest_detection, time.monotonic_ns())
                     status = 'boxes: %d' % len(latest_detection.get('detections', [])) if shown else 'boxes: waiting'
                     cv2.putText(image, status, (10, 175), 0, .45, (0, 165, 255), 1)
                 if result.get('valid'):
-                    display_pixel, display_position = (smoothed if smoothed is not None else
-                                                       (result['pixel'], result['point_camera_m']))
+                    display_pixel, display_position = result['pixel'], result['point_camera_m']
                     cv2.circle(image, tuple(np.floor(display_pixel).astype(int)), 6, (0,255,0), 2)
                     cv2.putText(image, 'p(m): '+str(np.round(display_position,3)), (10,75), 0,.5,(0,255,255),1)
                     cv2.putText(image, 'n: '+str(np.round(result['normal_out_camera'],3)), (10,100),0,.5,(0,255,255),1)
@@ -435,20 +622,35 @@ def main():
                 cv2.putText(image, 'Robot: '+robot_text[:70], (10,25),0,.45,(0,255,255),1)
                 cv2.putText(image, result.get('reason','')[:80],(10,50),0,.45,(0,0,255),1)
                 cv2.putText(image, user_notice[:85],(10,150),0,.45,(0,165,255),1)
-                instructions = ('d: model select | b: begin | p: pause | r: resume | q: exit'
+                instructions = ('b: select + follow | d: select only | p: pause | r: resume | q: exit'
                                 if selector else 'click: select | b: begin | p: pause | r: resume | q: exit')
                 cv2.putText(image,instructions,(10,465),0,.45,(255,255,255),1)
                 cv2.imshow(window,image)
                 key = cv2.waitKey(1)&255
+                if key == ord('b') and selector is not None:
+                    try:
+                        if (model_start.runtime or selection_requested or selection_pending
+                                or model_catching_up):
+                            raise ValueError('model selection/start already running')
+                        model_start.queue(session, time.monotonic_ns())
+                        recovery.cancel()
+                        tracker.lose('model start selecting a fresh target', force=True)
+                        session.target = ''
+                        selection_requested = True
+                        user_notice = 'selecting model target; follow will start after Robot confirmation'
+                    except ValueError as error:
+                        user_notice = str(error)
+                    # Model b is handled asynchronously; never start on the old point.
+                    key = -1
                 if key == ord('d') and selector is not None:
+                    model_start.cancel()
                     if session.following:
                         user_notice = 'pause before selecting another target'
                     elif selection_requested or selection_pending:
                         user_notice = 'model selection already running'
                     else:
+                        recovery.cancel()
                         selection_requested = True
-                        if args.no_redis:
-                            auto_recovery_enabled = True
                         user_notice = 'model selection queued for next fresh frame'
                 if clicked:
                     pixel = clicked[-1]; clicked.clear()
@@ -465,19 +667,22 @@ def main():
                         record(dict(type='selection_rejected',reason=str(error)))
                 if key in (ord('b'),ord('r'),ord('p'),ord('q')):
                     action = {ord('b'):'begin',ord('r'):'resume',ord('p'):'pause',ord('q'):'end'}[key]
+                    model_start.cancel()
                     try:
-                        if args.no_redis and action in ('begin','resume'): raise ValueError('no-redis is observation only')
                         # Publish initialized observation before begin; never command first.
                         if result.get('valid') and observation_is_fresh(result, time.monotonic_ns()):
                             publish_observation(result)
-                        packet=session.request(action,observation_is_fresh(result, time.monotonic_ns()));publish(COMMAND,packet)
+                        packet=session.request(action,observation_is_fresh(result, time.monotonic_ns()))
+                        if selector is not None and action in ('begin', 'resume'):
+                            recovery.arm(session)
+                        publish(COMMAND,packet)
                         user_notice = ''
                         if action in ('pause','end'):
-                            auto_recovery_enabled = False
+                            recovery.cancel()
                             selection_requested = False
                             selection_pending = False
                             model_catching_up = False
-                            smoother.reset()
+                            if fusion is not None: fusion.reset()
                             tracker.lose('operator paused; select again',force=True);session.target=''
                     except ValueError as error:
                         user_notice = str(error)

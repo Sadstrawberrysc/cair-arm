@@ -433,7 +433,13 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
         {"outstanding", data.servo_outstanding}};
     summary["control"]["force_sensor_enabled"] = data.force_sensor_enabled;
     summary["control"]["wrist_candidate_trial"] = data.wrist_candidate_trial;
-    summary["control"]["wrist_total_excursion_limits_enabled"] = !data.wrist_unlimited_excursion;
+    const bool translation_limit = !(data.wrist_unlimited_excursion || data.wrist_unlimited_translation);
+    summary["control"]["wrist_total_excursion_limits_enabled"] = translation_limit;
+    summary["control"]["wrist_translation_limit_enabled"] = translation_limit;
+    summary["control"]["wrist_orientation_limit_enabled"] = !data.wrist_unlimited_excursion;
+    summary["control"]["wrist_position_tracking_error_limit_enabled"] =
+        !data.wrist_unlimited_position_tracking_error;
+    summary["control"]["joint_speed_cap_deg_s"] = data.joint_speed_cap_deg_s;
     return summary;
 }
 

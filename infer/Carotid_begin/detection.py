@@ -3,7 +3,7 @@ import math
 
 
 def scan_start_from_boxes(response, width, height, *, class_name=None,
-                          min_confidence=0.5, margin=0):
+                          min_confidence=0.4, margin=0):
     """Return the center pixel of one unambiguous detection.
 
     Roboflow detection coordinates are expected as pixel center x/y and box
@@ -67,11 +67,27 @@ def response_to_boxes(response):
         if len(response) != 1:
             raise ValueError("expected one image response")
         response = response[0]
+    if not hasattr(response, 'image') or not hasattr(response, 'predictions'):
+        raise ValueError('invalid native detection response')
     image = response.image
+    try:
+        return _native_boxes(response, image)
+    except (AttributeError, TypeError, OverflowError) as error:
+        raise ValueError('invalid native detection fields') from error
+
+
+def _native_boxes(response, image):
     raw = {"image": {"width": int(image.width), "height": int(image.height)},
            "predictions": [
                {"x": item.x, "y": item.y, "width": item.width,
                 "height": item.height, "confidence": item.confidence,
                 "class": item.class_name}
                for item in response.predictions]}
+    for item in raw['predictions']:
+        for key in ('x', 'y', 'width', 'height', 'confidence'):
+            item[key] = float(item[key])
+            if not math.isfinite(item[key]):
+                raise ValueError('non-finite detection')
+        if not isinstance(item['class'], str):
+            raise ValueError('invalid detection class')
     return raw

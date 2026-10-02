@@ -50,8 +50,16 @@ RobotRuntimeConfig MakeImplicitRm75ProductionConfig(
 
 bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
                                 std::string* error) {
+    if (config.wrist_unlimited_translation && !config.wrist_candidate_trial) {
+        SetError(error, "wrist-unlimited-translation requires explicit wrist-candidate-trial");
+        return false;
+    }
     if (config.wrist_unlimited_excursion && !config.wrist_candidate_trial) {
         SetError(error, "wrist-unlimited-excursion requires explicit wrist-candidate-trial");
+        return false;
+    }
+    if (config.wrist_unlimited_position_tracking_error && !config.wrist_candidate_trial) {
+        SetError(error, "wrist-unlimited-position-tracking-error requires explicit wrist-candidate-trial");
         return false;
     }
     if (config.wrist_candidate_trial && (!config.wrist_no_force
@@ -164,6 +172,8 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
     if (planner.period_ms <= 0 || planner.minimum_dispatch_gap_ms <= 0.0
         || planner.joint_speed_scale <= 0.0
         || planner.joint_speed_scale > 1.0
+        || !std::isfinite(planner.max_joint_speed_deg_s)
+        || planner.max_joint_speed_deg_s < 0.0
         || planner.max_joint_accel_deg_s2 < 0.0) {
         SetError(error, "invalid planner configuration");
         return false;

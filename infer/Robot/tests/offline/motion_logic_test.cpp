@@ -60,6 +60,30 @@ int main() {
                     && plan.error == Rm75PlanError::kPreviousStepOutOfBounds,
                 "planner rejects previous step outside speed envelope");
 
+    Rm75ServoPlannerConfig wrist_speed_config = planner_config;
+    wrist_speed_config.max_joint_speed_deg_s = 2.0;
+    wrist_speed_config.max_joint_accel_deg_s2 = 0.0;
+    Rm75ServoPlanner wrist_speed_planner(wrist_speed_config);
+    Eigen::Matrix<double, 7, 1> moved_joints = joints;
+    moved_joints[0] += 10.0 * M_PI / 180.0;
+    const auto moved_pose = wrist_speed_planner.PoseFromJoints(moved_joints);
+    const auto wrist_speed_plan = wrist_speed_planner.Plan(joints, pose, moved_pose);
+    const double joint_step_limit_rad = M_PI / 180.0 * 0.02;
+    ok &= Check(wrist_speed_plan.valid
+                    && wrist_speed_plan.joint_delta.cwiseAbs().maxCoeff()
+                           <= joint_step_limit_rad + 1e-12,
+                "wrist planner caps every 10 ms joint step at 2 deg/s");
+    ok &= Check(wrist_speed_plan.valid
+                    && wrist_speed_plan.joint_delta.cwiseAbs().maxCoeff()
+                           >= joint_step_limit_rad * 0.99,
+                "joint speed cap is exercised by a large target change");
+    Eigen::Matrix<double, 7, 1> previous_too_fast =
+        Eigen::Matrix<double, 7, 1>::Zero();
+    previous_too_fast[0] = joint_step_limit_rad * 1.1;
+    plan = wrist_speed_planner.Plan(joints, pose, moved_pose, previous_too_fast);
+    ok &= Check(!plan.valid && plan.error == Rm75PlanError::kPreviousStepOutOfBounds,
+                "wrist planner rejects a previous joint step above 2 deg/s");
+
     Eigen::Matrix<double, 7, 1> outside_limits = joints;
     outside_limits[0] = 10.0;
     const Eigen::Matrix<double, 6, 1> outside_pose =
@@ -131,9 +155,10 @@ int main() {
         auto large=filtered.Step(input);
         ok &= Check((large.tcp_goal.topLeftCorner<3,3>().col(2)+input.normal_base).norm()<1e-12,
                     "real tilt beyond deadband updates orientation goal");
-        ok &= Check(Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
-                    Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()))<=5.*M_PI/180.*input.cycle_s+1e-12,
-                    "filtered orientation retains angular speed bound");
+        const double angle_step = Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
+            Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()));
+        ok &= Check(angle_step > 0.0 && angle_step <= 2.*M_PI/180.*input.cycle_s+1e-12,
+                    "filtered orientation advances within 2 deg/s bound");
     }
 
     WristFollowController wrist;
@@ -145,8 +170,9 @@ int main() {
     ok &= Check(wo.following && wo.reference_reset, "wrist explicit begin resets measured reference");
     ok &= Check((wo.tcp_goal.topRightCorner<3,1>()-Eigen::Vector3d(.01,0,.05)).norm()<1e-12,
                 "wrist adds exactly 50 mm outward");
-    ok &= Check(wo.tcp_reference.topRightCorner<3,1>().norm()<=.000050001,
-                "wrist speed at most 5 mm/s");
+    ok &= Check(wo.tcp_reference.topRightCorner<3,1>().norm()>0.0
+                    && wo.tcp_reference.topRightCorner<3,1>().norm()<=.000020001,
+                "wrist TCP reference speed at most 2 mm/s");
     ok &= Check((wo.tcp_goal.topLeftCorner<3,3>().col(2)-Eigen::Vector3d(0,0,1)).norm()<1e-12,
                 "wrist Tool Z points inward");
     wrist.Commit(wo.tcp_reference);
@@ -166,7 +192,7 @@ int main() {
     wi.normal_base=Eigen::Vector3d(.1,0,-1).normalized();
     wo=wrist.Step(wi);
     ok &= Check(wo.following && Eigen::AngleAxisd(wo.tcp_reference.topLeftCorner<3,3>()).angle()
-                <=5*M_PI/180.*.01+1e-9, "angular reference limited to 5 deg/s");
+                <=2.*M_PI/180.*.01+1e-9, "angular reference limited to 2 deg/s");
     wrist.Hold("planner_rejected");
     ok &= Check(!wrist.Step(wi).following, "planner rejection is latched");
     wi.normal_base=Eigen::Vector3d(1,0,0); wi.target_id="degenerate";

@@ -123,7 +123,9 @@ void Usage(const char* program) {
         << "    envelope applies only before contact, not to the Tool-X scan.\n\n"
         << "Safe modes (default is observe):\n"
         << "  --observe             acquire/publish only; never plan or send motion\n"
+        << "  --wrist-unlimited-translation  candidate trial only: disable TCP displacement gate\n"
         << "  --wrist-unlimited-excursion  candidate trial only: disable total displacement/rotation gates\n"
+        << "  --wrist-unlimited-position-tracking-error  candidate trial only: disable actual TCP position tracking error gate\n"
         << "  --wrist-candidate-trial  unverified-extrinsic wrist experiment (0=continuous or 1..30 s)\n"
         << "  --wrist-no-force      explicit wrist-only mode without force acquisition/protection\n"
         << "  --wrist-follow FILE   click target mode, no global seed\n"
@@ -197,8 +199,12 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
             std::exit(0);
         } else if (argument == "--observe") {
             options.mode = ControllerMode::kObserve;
+        } else if (argument == "--wrist-unlimited-translation") {
+            options.wrist_unlimited_translation=true;
         } else if (argument == "--wrist-unlimited-excursion") {
             options.wrist_unlimited_excursion=true;
+        } else if (argument == "--wrist-unlimited-position-tracking-error") {
+            options.wrist_unlimited_position_tracking_error=true;
         } else if (argument == "--wrist-candidate-trial") {
             options.wrist_candidate_trial=true;
         } else if (argument == "--wrist-no-force") {
@@ -533,7 +539,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     const Rm75ControlConfig& effective_control = options.control;
-    const Rm75ServoPlannerConfig& effective_planner = options.planner;
+    const Rm75ServoPlannerConfig effective_planner = options.EffectivePlanner();
     const Rm75RuntimeSafetyConfig& effective_safety = options.EffectiveSafety();
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
@@ -774,7 +780,7 @@ int main(int argc, char** argv) {
 
     // 规划器把每周期的 6D 笛卡尔目标转换为七关节 ServoJ 目标，并统一执行
     // 关节限位、速度/加速度约束及奇异性检查。
-    Rm75ServoPlannerConfig planner_config = options.planner;
+    Rm75ServoPlannerConfig planner_config = effective_planner;
     planner_config.period_ms = options.period_ms;
     planner_config.minimum_dispatch_gap_ms = options.period_ms;
     Rm75ServoPlanner planner(planner_config);
@@ -1015,6 +1021,7 @@ int main(int argc, char** argv) {
                       : "explicit_cli")
               << '\n'
               << "period_ms: " << options.period_ms << '\n'
+              << "joint_speed_cap_deg_s: " << planner_config.max_joint_speed_deg_s << '\n'
               << "sensor_protocol: "
               << ForceSensorProtocolName(sensor_config.protocol) << '\n'
               << "sensor_stale_ms: " << options.sensor_stale_ms << '\n'
@@ -1082,7 +1089,10 @@ int main(int argc, char** argv) {
               << (control_config.legacy_contact_roll_enabled
                       ? "enabled" : "disabled")
               << '\n'
-              << "wrist_total_excursion_limits: " << (options.wrist_unlimited_excursion ? "disabled" : "enabled") << '\n'
+              << "wrist_translation_limit: " << ((options.wrist_unlimited_excursion || options.wrist_unlimited_translation) ? "disabled" : "enabled")
+              << "\nwrist_orientation_limit: " << (options.wrist_unlimited_excursion ? "disabled" : "enabled") << '\n'
+              << "wrist_position_tracking_error_limit: "
+              << (options.wrist_unlimited_position_tracking_error ? "disabled" : "enabled") << '\n'
               << "configured_maximum_no_contact_approach_distance_mm: "
               << safety_config.maximum_no_contact_approach_distance_m * 1000.0
               << '\n'
@@ -1432,7 +1442,8 @@ int main(int argc, char** argv) {
                     < planner.Config().joint_limit_stop_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "actual_joint_limit_margin_exceeded";
-            } else if (!options.wrist_unlimited_excursion && !contact_established
+            } else if (!options.wrist_unlimited_excursion && !options.wrist_unlimited_translation
+                       && !contact_established
                        && actual_approach_distance_mm
                        > safety_config.maximum_no_contact_approach_distance_m
                              * 1000.0) {
@@ -1447,7 +1458,7 @@ int main(int argc, char** argv) {
                        > safety_config.max_tracking_joint_error_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "robot_joint_tracking_error_exceeded";
-            } else if (position_error_mm
+            } else if (!options.wrist_unlimited_position_tracking_error && position_error_mm
                        > safety_config.max_tracking_position_error_mm) {
                 fatal_fault = true;
                 fatal_fault_code = "robot_position_tracking_error_exceeded";
@@ -2074,7 +2085,8 @@ int main(int argc, char** argv) {
                        > safety_config.maximum_orientation_excursion_deg) {
                 fatal_fault = true;
                 fatal_fault_code = "maximum_orientation_excursion_exceeded";
-            } else if (!options.wrist_unlimited_excursion && !contact_established
+            } else if (!options.wrist_unlimited_excursion && !options.wrist_unlimited_translation
+                       && !contact_established
                        && (frame_chain.ProbeTcpBase(servo_plan.model_pose)
                  - approach_origin_probe_tcp).norm()
                 > safety_config.maximum_no_contact_approach_distance_m) {
@@ -2506,6 +2518,9 @@ int main(int argc, char** argv) {
     summary_data.force_sensor_enabled = !options.wrist_no_force;
     summary_data.wrist_candidate_trial = options.wrist_candidate_trial;
     summary_data.wrist_unlimited_excursion = options.wrist_unlimited_excursion;
+    summary_data.wrist_unlimited_translation = options.wrist_unlimited_translation;
+    summary_data.wrist_unlimited_position_tracking_error = options.wrist_unlimited_position_tracking_error;
+    summary_data.joint_speed_cap_deg_s = planner_config.max_joint_speed_deg_s;
     summary_data.fatal_fault = fatal_fault;
     summary_data.completion_reason = completion_reason;
     summary_data.fault_code = fatal_fault_code;

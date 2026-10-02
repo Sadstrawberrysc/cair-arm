@@ -207,6 +207,37 @@ class LocalTracker:
             return dict(valid=False, reason=self.reason)
 
 
+    def correct_from_detection(self, center_current, depth, k, distortion, timestamp,
+                               *, gain=.25, max_step_px=2.):
+        """Gently anchor a tracked point to a time-aligned model center.
+
+        A rejected correction leaves the optical-flow state untouched. The caller
+        must associate the model result with its exact source frame first.
+        """
+        if not self.active or timestamp != self.timestamp:
+            return None, 'tracker is inactive or not on the current frame'
+        center = np.asarray(center_current, dtype=float)
+        if center.shape != (2,) or not np.isfinite(center).all():
+            return None, 'invalid time-aligned detection center'
+        delta = center-self.pixel
+        distance = float(np.linalg.norm(delta))
+        if distance < 1e-6:
+            return None, 'already aligned'
+        step = delta * min(gain, max_step_px/distance)
+        candidate = self.pixel+step
+        try:
+            point, normal, quality = surface(depth, candidate, k, distortion,
+                                             relaxed=self.relaxed)
+            if np.linalg.norm(point-self.position) > self.limits['position_jump']:
+                raise ValueError('fused point exceeds 3D jump limit')
+            features = self._features(self.gray, candidate)
+        except (ValueError, cv2.error) as error:
+            return None, str(error)
+        self.pixel, self.position, self.features = candidate, point, features
+        quality['feature_inliers'] = int(len(features))
+        return self.result(point, normal, quality), None
+
+
 class DisplayPointSmoother:
     """Time-aware smoothing for the no-Redis display; never alters tracking gates."""
 

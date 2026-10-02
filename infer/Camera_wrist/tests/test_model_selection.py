@@ -8,9 +8,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_tracker import LocalTracker
-from click_follow import ClickSession, draw_detection_boxes, use_relaxed_vision
+from click_follow import ClickSession, draw_detection_boxes
 from wrist_projection import boot_id, FRAME
-from model_selection import replay_selection, observation_is_fresh
+from model_selection import (DetectionCenterFusion, fuse_model_observation,
+                             replay_selection, observation_is_fresh)
 
 
 class ModelSelectionTests(unittest.TestCase):
@@ -39,12 +40,6 @@ class ModelSelectionTests(unittest.TestCase):
         stale = np.zeros_like(recent)
         self.assertFalse(draw_detection_boxes(stale, response, 1_600_000_000))
         self.assertFalse(stale.any())
-
-    def test_visual_defaults_keep_robot_path_standard(self):
-        self.assertTrue(use_relaxed_vision('model/id', True))
-        self.assertFalse(use_relaxed_vision('model/id', False))
-        self.assertFalse(use_relaxed_vision('model/id', True, standard_vision=True))
-        self.assertFalse(use_relaxed_vision(None, True))
 
     def test_replay_tracks_model_point_to_fresh_frame(self):
         tracker = LocalTracker()
@@ -77,6 +72,98 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertGreaterEqual(packet['quality']['feature_inliers'], 12)
         self.assertFalse(session.following)
         self.assertEqual(session.request('begin', True)['action'], 'begin')
+
+    def test_detection_center_fusion_aligns_source_frame_before_correcting(self):
+        tracker = LocalTracker()
+        source = self.frame(0, 0, 1_000_000_000)
+        current = self.frame(3, 2, 1_033_000_000)
+        source_result = tracker.initialize(*source[:2], [155, 117], self.k,
+                                           self.distortion, source[2])
+        self.assertTrue(source_result['valid'])
+        fusion = DetectionCenterFusion()
+        fusion.remember(source_result, 'target-a')
+        current_result = tracker.update(*current[:2], self.k, self.distortion, current[2])
+        self.assertTrue(current_result['valid'])
+        response = dict(valid=True, capture_monotonic_ns=source[2],
+                        prediction={'scan_start': [157, 116]})
+        aligned, reason = fusion.aligned_center(response, 'target-a', current_result,
+                                                current[2]+80_000_000)
+        self.assertIsNone(reason)
+        np.testing.assert_allclose(aligned,
+                                   np.asarray(current_result['pixel'])+[2, -1], atol=.001)
+        corrected, reason = tracker.correct_from_detection(
+            aligned, current[1], self.k, self.distortion, current[2])
+        self.assertIsNone(reason)
+        self.assertTrue(corrected['valid'])
+        np.testing.assert_allclose(corrected['pixel'],
+                                   np.asarray(current_result['pixel'])+[.5, -.25], atol=.001)
+        self.assertEqual(corrected['capture_monotonic_ns'], current[2])
+        fusion.remember(corrected, 'target-a')
+        self.assertEqual(fusion.history[-1][1], tuple(corrected['pixel']))
+        next_result = tracker.update(self.frame(4, 2, 1_066_000_000)[0],
+                                     self.depth, self.k, self.distortion, 1_066_000_000)
+        self.assertTrue(next_result['valid'], next_result)
+
+    def test_fusion_aligns_large_offset_but_rejects_stale_and_previous_target(self):
+        fusion = DetectionCenterFusion()
+        current = dict(valid=True, capture_monotonic_ns=1_033_000_000,
+                       pixel=[158, 119])
+        fusion.remember(dict(valid=True, capture_monotonic_ns=1_000_000_000,
+                             pixel=[155, 117]), 'target-a')
+        jump = dict(valid=True, capture_monotonic_ns=1_000_000_000,
+                    prediction={'scan_start': [180, 117]})
+        aligned, reason = fusion.aligned_center(jump, 'target-a', current,
+                                                1_100_000_000)
+        self.assertIsNone(reason)
+        np.testing.assert_allclose(aligned, [183, 119])
+        normal = dict(jump, prediction={'scan_start': [157, 116]})
+        self.assertIn('stale', fusion.aligned_center(normal, 'target-a', current,
+                                                     1_600_000_000)[1])
+        self.assertIn('active target', fusion.aligned_center(normal, 'target-b', current,
+                                                             1_100_000_000)[1])
+        fusion.remember(dict(valid=True, capture_monotonic_ns=1_100_000_000,
+                             pixel=[160, 120]), 'target-b')
+        self.assertIn('unavailable', fusion.aligned_center(normal, 'target-b', current,
+                                                            1_100_000_000)[1])
+
+    def test_large_model_offset_keeps_track_and_limits_correction(self):
+        stamp = 1_000_000_000
+        source = self.frame(0, 0, stamp)
+        response = dict(valid=True, capture_monotonic_ns=stamp,
+                        prediction={'scan_start': [190, 117]})
+        tracker = LocalTracker()
+        current = tracker.initialize(source[0], source[1], [155, 117],
+                                     self.k, self.distortion, stamp)
+        self.assertTrue(current['valid'])
+        fusion = DetectionCenterFusion()
+        fusion.remember(current, 'target-a')
+        output, applied, reason, confirmed = fuse_model_observation(
+            tracker, fusion, response, stamp, source, current,
+            'target-a', self.k, self.distortion, stamp+50_000_000)
+        self.assertTrue(output['valid'])
+        self.assertTrue(tracker.active)
+        self.assertTrue(applied)
+        self.assertTrue(confirmed)
+        self.assertIsNone(reason)
+        np.testing.assert_allclose(output['pixel'], [157, 117], atol=.001)
+
+    def test_fusion_rejects_response_from_different_capture(self):
+        stamp = 1_000_000_000
+        frame = self.frame(0, 0, stamp)
+        tracker = LocalTracker()
+        current = tracker.initialize(frame[0], frame[1], [155, 117],
+                                     self.k, self.distortion, stamp)
+        fusion = DetectionCenterFusion()
+        fusion.remember(current, 'target-a')
+        response = dict(valid=True, capture_monotonic_ns=stamp+1,
+                        prediction={'scan_start': [155, 117]})
+        output, applied, reason, confirmed = fuse_model_observation(
+            tracker, fusion, response, stamp, frame, current, 'target-a',
+            self.k, self.distortion, stamp+50_000_000)
+        self.assertIs(output, current)
+        self.assertFalse(applied or confirmed)
+        self.assertIn('identity mismatch', reason)
+        self.assertTrue(tracker.active)
 
     def test_gap_and_stale_result_fail_closed(self):
         tracker = LocalTracker()
