@@ -25,7 +25,7 @@
 已不在 `click_follow.py` 的 CLI 中。原独立预览的 `camera_stream.py`、`live_preview.py`、
 `live_window.py` 等文件已移除，不能作为当前启动入口。最简启动命令见本机
 [启动 notebook](../../.runme/run/carotid-begin-operations.md)，历史证据见
-[进展 notebook](../../.runme/Progress/carotid-begin-progress.md)。`.runme/` 不纳入 Git；
+[进展 notebook](../../.runme/Progress/carotid-begin-progress.md)。`.runme/` 中的 Markdown notebooks 纳入 Git；
 跨模块变更原因见 [DECISIONS.md](../../DECISIONS.md)。
 
 ## 2. 系统架构与职责

@@ -31,7 +31,7 @@ Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日�
 
 ## Runme 操作与进展
 
-本机启动操作、当前进展、实验记录和待办保存在 Git 忽略的 `.runme/`：
+本机启动操作、当前进展、实验记录和待办保存在随仓库维护的 `.runme/`：
 
 - [Runme 索引](.runme/README.md)、[全系统入口](.runme/run/system-operations.md)
 - [Robot 操作](.runme/run/robot-operations.md)、[项目进展](.runme/Progress/project-progress.md)
@@ -39,7 +39,7 @@ Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日�
 - [Camera_wrist 操作](.runme/run/camera-wrist-operations.md)、[Camera_wrist 进展](.runme/Progress/camera-wrist-progress.md)
 - [标定与单点定位](.runme/run/calibration-operations.md)
 
-这些 notebook 是本机运行知识，不进入 Git；架构和公共接口仍以本文件及模块级
+这些 notebook 记录本机运行知识并纳入 Git；架构和公共接口仍以本文件及模块级
 `ARCHITECTURE.md` 为权威来源。含设备、常驻进程或机器人运动的单元必须逐个执行，
 禁止使用 `runme run --all`。
 
