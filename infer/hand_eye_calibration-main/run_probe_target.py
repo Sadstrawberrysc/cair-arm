@@ -49,7 +49,7 @@ def first_point(path, previous):
 
 
 def short_axis_rotation(inward, tangent):
-    """Tool-YZ cuts across the projected vessel tangent; -X follows it."""
+    """Tool-YZ cuts across the projected vessel tangent; +X follows it."""
     if not np.isfinite(inward).all() or not np.isfinite(tangent).all():
         raise ValueError("法向或切向无效")
     nz, nt = np.linalg.norm(inward), np.linalg.norm(tangent)
@@ -57,7 +57,9 @@ def short_axis_rotation(inward, tangent):
         raise ValueError("法向或切向为零或无效")
     z = inward / nz
     t = tangent / nt
-    x = -(t - np.dot(t, z) * z)
+    # Flip the former -X convention by 180 degrees about local Tool-Z.
+    # Both X/Y reverse; inward Z and the TCP standoff stay unchanged.
+    x = t - np.dot(t, z) * z
     if np.linalg.norm(x) < 1e-3:
         raise ValueError("血管切向近似平行于表面法向，无法确定短轴姿态")
     x /= np.linalg.norm(x)
@@ -134,7 +136,7 @@ def run(args, root=ROOT, runner=subprocess.run):
     print("target_inward_normal_base:", normal, flush=True)
     print("target_tool_y_base:", rotation[:, 1].tolist(), flush=True)
     print("target_imaging_view: short_axis", flush=True)
-    print("Tool-YZ 为短轴成像平面；-X 沿血管投影切向，Tool +Z 朝内；目标 Tool -Z 后退50 mm；位置转换使用所选相机外参。", flush=True)
+    print("Tool-YZ 为短轴成像平面；+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转180°），Tool +Z 朝内；目标 Tool -Z 后退50 mm；位置转换使用所选相机外参。", flush=True)
     pose = ",".join("{:.9f}".format(v) for v in
                     np.concatenate((base_point, controller_euler(rotation))))
     print("target_probe_tcp_m_rad:", pose, flush=True)

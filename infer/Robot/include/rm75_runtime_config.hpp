@@ -72,7 +72,7 @@ struct RobotRuntimeConfig {
 
     Rm75ServoPlannerConfig EffectivePlanner() const {
         auto result = planner;
-        if (!wrist_follow_calibration.empty()) result.max_joint_speed_deg_s = 2.0;
+        if (!wrist_follow_calibration.empty()) result.max_joint_speed_deg_s = 4.0;
         return result;
     }
 

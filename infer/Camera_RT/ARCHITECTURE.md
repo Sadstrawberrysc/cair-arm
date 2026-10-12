@@ -1,6 +1,6 @@
 # Camera_RT 人体 / 解剖相机架构
 
-本文依据 **2026-10-02 当前工作区源码**。本模块从 RealSense RGB-D 估计人体姿态与体型，
+本文依据 **2026-10-12 当前工作区源码**。本模块从 RealSense RGB-D 估计人体姿态与体型，
 将骨骼 / 血管模型投影到彩色图，并将选定左颈动脉模型顶点的像素反投影为相机坐标路径。
 入口 [cliff_demo.py](cliff_demo.py) 只采集、推理、显示和保存快照，不连接 Redis 或 RM75。
 
@@ -37,7 +37,7 @@ flowchart TD
         ANATOMY --> RENDER["PyTorch3D render_mesh"]
         FULL --> RENDER
         RENDER --> VIEW["OpenCV result / color stream"]
-        RENDER --> PIXELS["六个血管顶点像素<br/>bottom_first_pixels 排序"]
+        RENDER --> PIXELS["六个血管顶点像素<br/>top_first_pixels 排序"]
         PIXELS --> GEOM["kpt_2d_to_3d + 首点邻域 SVD"]
         DEPTH --> GEOM
         GEOM --> SAVE["按 s / Esc 覆盖 artery_path.txt"]
@@ -80,7 +80,7 @@ sequenceDiagram
         D-->>C: 彩色与对齐深度
         C->>M: 选框、crop、CLIFF、蒙皮与渲染
         M-->>C: 叠加图及六个血管像素
-        C->>C: 底部优先排序、深度反投影、首点附近 SVD 法向
+        C->>C: 顶部优先排序、深度反投影、首点附近 SVD 法向
         C->>V: 显示两窗口并 waitKey
         alt 按 s 或 Esc
             U->>C: 保存当前结果
@@ -105,15 +105,22 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 | 第一行 | 三个法向分量，保留 3 位小数 | 无量纲方向，转换到 Base 时只乘旋转；舍入后不保证精确单位长度 |
 | 后续行 | 每行三个相机坐标，保留 6 位小数，单位 m | RealSense 光学系：X 向右、Y 向下、Z 向前 |
 | 当前采样点 | 左颈动脉模型顶点 `[43976,43975,15973,43908,43907,5163]` | 固定模型索引，不是从图像或超声直接分割血管 |
-| 点顺序 | 图像 Y 从大到小稳定排序 | 第二行是画面最下面采样点；等 Y 保留原顺序，不按三维 Y 排序 |
+| 点顺序 | 图像 Y 从小到大稳定排序 | 第二行是画面最上面采样点；等 Y 保留原顺序，不按三维 Y 排序 |
 | 三维位置 | `z=depth×depth_scale`；`x=(u-ppx)/fx×z`、`y=(v-ppy)/fy×z` | 使用彩色流实际内参和对齐深度 |
 | 法向 | 首点像素附近 4×4 邻域反投影，SVD 最小方向；若 Z>0 则翻转 | 仅保证该符号约定；没有平面 RMS、内点比例或非共线门限 |
 | 元数据 | 无时间戳、序号、设备身份、单位 / frame 字段或标定摘要 | 文件本身不提供时效及空间验收证据 |
 
-`kpt_2d_to_3d` 将取深度用的像素整数索引限制在图像上界，未完整检查下界；
+`kpt_2d_to_3d` 将取深度用的像素整数索引限制在图像上下界；
 深度为零时搜索**全图最近非零深度像素**，随后仍用原始投影像素的射线计算三维坐标。
+补点使用 NumPy `argwhere` 的行列坐标，不依赖 OpenCV 4/5 `findNonZero` 返回数组的维度。
 该补点没有距离上限、局部表面一致性或置信度检查，不能称为同点有效深度测量。
-全图无非零深度、无检测框或缺少完整帧时尚无统一拒绝 / 恢复状态机，可能异常退出。
+全图无非零深度时明确报错并终止，不生成新快照；无检测框或缺少完整帧时尚无统一
+拒绝 / 恢复状态机，可能异常退出。
+
+渲染使用 PyTorch3D 自动分桶尺寸，并以单个网格的全部面数设置 `max_faces_per_bin`，
+避免稠密解剖网格超出默认分桶容量而丢面。OpenCV 使用普通窗口，关闭输入法和 XCB GL
+插件，避免加载 Conda 的另一套 Qt；自动设置的字体目录不存在时改用可用的系统字体目录。
+`s` / `q` / Esc 仍由 `waitKey` 处理。
 
 输出窗口为 `result`（骨骼 / 血管叠加）和 `color stream`（采样像素辅助画面），均缩放到
 800×600。文件内坐标来自缩放前的原图；画面里的标记不能据此认作 P0 真值。
@@ -126,7 +133,7 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 | 采集快照 | `run_probe_target` 记录旧文件签名，运行相机，成功退出后要求新快照且读取期间未变 | [run_probe_target.py](../hand_eye_calibration-main/run_probe_target.py)；签名含 device / inode / size / mtime / ctime，mtime 不是曝光时间 |
 | 提取首点 / 方向 | 一行非零法向 + 至少两点；取首点与第一个间距 >1 μm 的后续点，单位化法向与切向 | 同上；所有行必须三列有限值；单位切向在切平面的投影范数 <0.001 时拒绝短轴姿态 |
 | 相机 → Base | `p_base=R×p_camera+t`；方向只乘 R | [transform_point.py](../hand_eye_calibration-main/transform_point.py) |
-| 构造短轴姿态 | Tool +Z 朝内，-X 沿血管投影切向；沿 Tool -Z 后退 50 mm | `run_probe_target`；50 mm 是计算偏置，不是实际净空 |
+| 构造短轴姿态 | Tool +Z 朝内，+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转 180°）；沿 Tool -Z 后退 50 mm | `run_probe_target`；50 mm 是计算偏置，不是实际净空 |
 | 单点调用 | 传 `--target-pose-m-rad --controller-movej-p` 给 `arm_probe_pose` | [Robot 维护工具](../Robot/tests/tools/arm_probe_pose.cpp)；默认编排可执行运动，非只读相机功能 |
 | 可选投影 seed | `--wrist-handoff` 起始先删除旧 seed；非 dry-run、定位子进程成功退出且两份外参摘要未变才写入 TTL 60 秒 seed | `scope=projection_preview_only`；不授权腕部自动运动；dry-run 也会删除旧 seed，但不发布新 seed |
 
@@ -194,7 +201,7 @@ Faster R-CNN 权重另由 Torch 缓存提供。入口不会自动运行预检或
 | `tools/preflight.py --static` | 已实现：解释器、包、源码语法、七个本机资产 | 无实时推理、设备流或空间精度验收 |
 | `tools/preflight.py --runtime` | 已实现：含 static，再枚举 GPU / CUDA、RealSense 与权重缓存；不打开流或下载权重 | 硬件枚举不等于采集与显示成功；缓存缺失可报告 WARN |
 | [test_path_format.py](tools/test_path_format.py) | 已实现：旧夹具三列有限值 / 结构 characterization | 不认可旧数据空间坐标或真实路径质量 |
-| [test_sample_order.py](tools/test_sample_order.py) | 已实现：生产排序函数的底部优先、稳定顺序和非法输入 | 不验证检测、深度、血管对应或法向 |
+| [test_sample_order.py](tools/test_sample_order.py) | 已实现：顶部优先、稳定顺序、非法输入及快照首点下游读取 | 不验证检测、现场深度精度、血管对应或法向 |
 | 检测类别 / 无框、像素与深度、局部平面质量、采集元数据 | 规划补齐 | 当前不能宣称存在这些完整拒绝门 |
 | 真实采集、人体叠加、独立空间 / 外参 / 动态时序验收 | 待验收 | 不能以预检或格式测试代替 |
 

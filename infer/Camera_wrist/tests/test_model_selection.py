@@ -8,7 +8,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_tracker import LocalTracker
-from click_follow import ClickSession, draw_detection_boxes
+from follow_session import ClickSession
+from click_follow import draw_detection_boxes
 from wrist_projection import boot_id, FRAME
 from model_selection import (DetectionCenterFusion, fuse_model_observation,
                              replay_selection, observation_is_fresh)

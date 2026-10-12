@@ -3,12 +3,30 @@
 > 本文件是纳入 Git 的 Runme notebook。项目当前架构以根级和模块级
 > `ARCHITECTURE.md` 为准；本文件保存进展、验证证据、待办和历史运行结论。
 
-更新日期：2026-09-23
+更新日期：2026-10-02
 
 本文记录当前工作树中 RM75 视觉力控闭环的实际实现、有效配置、已知分叉和待验收项。
 架构边界见 [ARCHITECTURE.md](../../ARCHITECTURE.md)，启动顺序见
 [RM75 启动与运行](../run/robot-operations.md)，源码阅读路径见
-[RM75 学习路径](../../docs/rm75_learning_path.md)。
+[RM75 学习路径](../rm75_learning_path.md)。
+
+## 2026-10-02 腕部模型模块合并
+
+原 `Carotid_begin` 模型服务并入 `Camera_wrist/detector/`，相机默认无需参数进入模型模式，
+`--manual` 保留手动选点跟踪。采集和模型继续在两个环境/进程中运行，Robot 公共协议和控制
+沿用现状；启动不自动请求运动。源码与入口见 [腕部架构](../../infer/Camera_wrist/ARCHITECTURE.md)
+及 [detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)，本次检查和运行边界见
+[腕部进展](camera-wrist-progress.md#当前入口与验证2026-10-02)；
+[模型进展](carotid-begin-progress.md)和[早期方案历史](yolo-roboflow-visual-servo-plan.md)保留模型与试验沿革。
+
+模型默认 ID、类别/阈值入口见 `detector/config.py` 和相机 CLI，worker 包名为
+`infer.Camera_wrist.detector.worker`，缓存位于 `Camera_wrist/data/model_cache/`。
+相机始终连接 Redis，不再支持 `--no-redis`；收到 Robot 状态不自动发起运动。
+离线验证统一到 `infer/Camera_wrist/tests/`：`camera` / `carotid` 各 79 项、
+`ultralytics` 模型相关 14 项通过，使用假模型和离线输入；本次未运行真实 GPU、相机、
+Redis 回环或机械臂运动。真实目标选点/恢复、独立定位真值、外参、时序和悬停净空仍待验收。
+日常入口见 [腕部操作](../run/camera-wrist-operations.md)与[模型最简启动](../run/carotid-begin-operations.md)。
+下方 09 月条目保留当时实现与验证，腕部当前入口以本节和腕部进展为准。
 
 ## 2026-09-23 Runme 启动入口核查
 

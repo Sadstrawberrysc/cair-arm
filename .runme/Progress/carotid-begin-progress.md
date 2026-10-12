@@ -1,13 +1,45 @@
-# Carotid_begin 项目进展（Runme notebook）
+# 腕部 detector 模型进展及 Carotid_begin 历史（Runme notebook）
 
-> 本文件记录 Carotid_begin 的项目进展、验证证据与运行边界，纳入 Git。
-> 当前架构见 [ARCHITECTURE.md](../../infer/Carotid_begin/ARCHITECTURE.md)，
+> 本文件记录腕部 detector 模型服务及原 Carotid_begin 的进展、验证证据与运行边界，纳入 Git。
+> 当前架构见 [detector/ARCHITECTURE.md](../../infer/Camera_wrist/detector/ARCHITECTURE.md)，
 > 最简启动命令见 [启动 notebook](../run/carotid-begin-operations.md)。
 >
-> 迁移日期：2026-10-02。下方验证结果保留原记录的日期与执行范围，迁移未新增实测。
+> Notebook 整理及模块合并日期：2026-10-02。下方历史验证结果保留原记录的日期与执行范围，迁移未新增实测。
 > 历史验证命令标记为 `ignore=true`，仅供查阅；日常启动在 run notebook 中逐个执行。
 
-## 当前状态（2026-10-02）
+## 当前组织与入口（2026-10-02）
+
+`infer/Carotid_begin/` 的模型代码已并入 `infer/Camera_wrist/detector/`，相机和模型仍为
+独立进程，分别使用 `camera` 与 `ultralytics` 环境，经私有 socketpair 交换 RGB-D 和结果。
+常驻服务入口改为 `python -m infer.Camera_wrist.detector.worker`，由相机自动启动。
+会话、单键开始和恢复状态机提取到 `Camera_wrist/follow_session.py`。
+
+`click_follow.py` 与 `start_camera.sh` 无参数均默认模型模式，模型 ID 在
+[detector/config.py](../../infer/Camera_wrist/detector/config.py) 的 `DEFAULT_MODEL_ID` 定义；
+显式 `--model-id` 优先于环境变量 `CAROTID_MODEL_ID`。手动选点保留，使用
+`bash infer/Camera_wrist/start_camera.sh --manual`；左键选点后沿用光流、深度和 Robot 请求链。
+启动或模型加载不自动发送跟随开始请求，Robot 公共协议和控制未因本次合并改变。
+
+默认缓存迁到 `Camera_wrist/data/model_cache/`，`MODEL_CACHE_DIR` 仍可覆盖；
+凭据继续读 `~/.config/carotid_begin/roboflow_api_key`，无需重录。测试统一到
+`Camera_wrist/tests/`；默认选点/推理阈值均为 0.4，旧记录的 0.5 是当时配置。
+当前 `camera` 环境离线入口为
+`/home/cair-jacen/anaconda3/envs/camera/bin/python -m unittest discover -s infer/Camera_wrist/tests -v`。
+本次 `camera` / `carotid` 各 79 项、`ultralytics` 模型相关 14 项离线测试通过，包含
+真实 socketpair 与假模型 worker；未运行真实 GPU 推理、相机、Redis 回环或机械臂运动。
+详细范围见
+[腕部进展](camera-wrist-progress.md#2026-10-02carotid_begin-合并到腕部模块)。
+其他索引见 [项目进展](project-progress.md)和[早期方案历史](yolo-roboflow-visual-servo-plan.md)。
+下方旧目录、入口、无 Redis 分支及通过数是历史记录，不作为迁移后的当前能力或启动命令。
+
+## 当前待验收事项
+
+- 第 9 版模型的真实 RGB-D 选点与连续融合、模型丢失后的恢复，以及手动模式的现场跟踪。
+- 模型框中心与实际扫描点的独立真值、多对象/会话定位误差和错选率。
+- 腕部外参、TCP 几何、采集/反馈时序和悬停净空；源码迁移与离线通过不补足这些证据。
+- 接触人体及超声力控交接仍未在当前链路实现，属于后续扩展。
+
+## 合并前证据汇总（2026-10-02）
 
 - 模型：`songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1`，类别 `carotid`。
    本机 `ultralytics` 环境的 ONNX Runtime 已启用 CUDA provider；API Key
@@ -17,8 +49,8 @@
    1 个有效 `carotid` 框。尚未验证实时相机画面、连续跟踪或真机运动。
    以下历史模型检测数值均来自第 8 版
    `songjiatong/carotid-detect-c9gi9-8-rfdetr-medium-t1`，不能作为第 9 版结果。
-- 检测框中心选点、光流逐帧跟踪、源帧对齐后的模型校正、无 Redis 模式自动
-   恢复，以及 Redis 模式视觉丢失后的自动重选/恢复已实现。腕部相机 47 项、模型模块
+- 当时实现了检测框中心选点、光流逐帧跟踪、源帧对齐后的模型校正、无 Redis 模式自动
+   恢复，以及 Redis 模式视觉丢失后的自动重选/恢复。无 Redis 分支后来已移除；当时腕部相机 47 项、模型模块
    5 项离线测试通过；Robot 6 项 CTest 通过。
 - 临时端口 Redis + 模拟 Robot 的无力候选试验通过：状态、观测、开始、
    暂停、恢复和超时 Hold 均有记录；新增连续两次视觉丢失后自动恢复及人工
@@ -62,7 +94,7 @@
 离线测试通过；隔离 Redis 模拟链路完成两次自动恢复，摘要显示三项检查关闭、
 ServoJ 发送数为 0。新配置尚未进行真机验收。
 
-## 本次模块化验证（2026-09-30）
+## 2026-09-30 模块化验证（历史）
 
 模型服务已拆成配置（`config.py`）、单帧业务（`pipeline.py`）、协议
 （`live_protocol.py`）和启动/常驻循环（`model_worker.py`）。原入口、CLI 默认值、
@@ -78,7 +110,7 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 
 本次未运行 GPU 推理、真实相机、Redis 或 Robot。调用方
 `Camera_wrist/tests/test_model_selection.py` 的重构前基线为 9 项中 6 项通过、
-3 项错误：测试仍要求 `robot_mode` 参数和融合层的跳框拒绝，但当前工作区
+3 项错误：测试仍要求 `robot_mode` 参数和融合层的跳框拒绝，但当时工作区
 `model_selection.py` 未提供对应接口/行为。这些既有不一致未纳入本次修改，
 不能将上文历史通过记录视为当前工作区的完整回归结果。
 
@@ -86,7 +118,7 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 
 相机每次启动都连接 Redis 并订阅 Robot 状态，已取消 `--no-redis` 和仅用于
 独立视觉的 `--standard-vision` 参数。统一使用标准跟踪门槛，默认选点置信度
-为 0.5；启动顺序见 [最简启动 notebook](../run/carotid-begin-operations.md)：Redis → 相机 → Robot。模型模式首次按 `b` 自动选点并请求跟随。
+当时为 0.5（当前为 0.4）；启动顺序见 [最简启动 notebook](../run/carotid-begin-operations.md)：Redis → 相机 → Robot。模型模式首次按 `b` 自动选点并请求跟随。
 已运行的旧相机进程需按 `q` 退出后重新启动，修改才会生效。
 
 本次相机离线测试 48 项全部通过，Python 编译及差异检查通过；未重启现场
@@ -200,9 +232,10 @@ Robot 使用 `--wrist-no-force --wrist-candidate-trial --wrist-unlimited-excursi
 
 ## 更换模型
 
-以后拿到新 Roboflow Model ID，可通过 `CAROTID_MODEL_ID` 覆盖相机启动脚本默认值；
-类别改变时同步修改 `start_camera.sh` 中的 `--model-class`。如使用终端启动脚本，可先导出
+以后拿到新 Roboflow Model ID，可通过 `CAROTID_MODEL_ID` 覆盖
+[detector/config.py](../../infer/Camera_wrist/detector/config.py) 的默认值，或在相机入口显式传入
+`--model-id`；类别改变时传入 `--model-class`。如使用终端启动脚本，可先导出
 `CAROTID_MODEL_ID='新的完整 Model ID'`，再运行
 `bash infer/Camera_wrist/launch_wrist_terminal.sh camera`。
 不要把 API Key 写入命令；本机凭据检查命令为
-`/home/cair-jacen/anaconda3/envs/ultralytics/bin/python -m infer.Carotid_begin.credentials check`。
+`/home/cair-jacen/anaconda3/envs/ultralytics/bin/python -m infer.Camera_wrist.detector.credentials check`。

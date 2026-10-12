@@ -81,7 +81,7 @@ python infer/hand_eye_calibration-main/run_probe_target.py
 ```
 
 先打开数字人窗口；按 `s` 保存，按 `q` 退出后，入口检查本次文件已更新，读取第一行法向量，
-读取第一个采样点，即画面最下面的红点（像素 y 最大；由相机保存前排序）。用新外参计算 `p_base = R_base_camera @ p_camera + t_base_camera`，
+读取第一个采样点，即画面最上面的红点（像素 y 最小；由相机保存前排序）。用新外参计算 `p_base = R_base_camera @ p_camera + t_base_camera`，
 然后调用 `arm_probe_pose --target-pose-m-rad ... --controller-movej-p`，自动传入速度3和双执行参数，
 通过控制器 `movej_p` 执行单次初始位姿移动。此流程仅负责到达扫描初始位姿，不是生产扫描控制。
 相机保存的是 Z≤0 的朝相机外法向，入口取反后只用外参旋转：
@@ -90,8 +90,8 @@ python infer/hand_eye_calibration-main/run_probe_target.py
 `Z = normalize(n_inward_base)`，`t_surface = normalize(t - dot(t,Z)*Z)`，
 `X = -t_surface`，`Y = Z × X`，得到右手旋转矩阵 `[X,Y,Z]`。
 因此 Tool-YZ 成像平面垂直于血管投影切向，+Z 朝内，-X 沿采样方向。
-不再生成长轴姿态或叠加固定 -90° 旋转；轴符号保留原最终朝向以避免额外翻转。
-切向取第一点指向后续首个非重复点（距离大于1微米）的方向，按当前保存顺序由画面底部向后续点。
+不再生成长轴姿态或叠加固定 -90° 旋转；轴方向随当前采样切向确定。
+切向取第一点指向后续首个非重复点（距离大于1微米）的方向，按当前保存顺序由画面顶部向后续点。
 方向只用外参旋转，不加平移；完整姿态不再依赖当前探头姿态。程序将旋转矩阵转换为 ZYX
 欧拉角，通过完整六维探头位姿参数交给 Robot，后者仍负责 TCP 到 ArmTip 换算。
 至少需要两个不同采样点；点不足、全部重复或归一化切向投影长度小于0.001 时拒绝运动。

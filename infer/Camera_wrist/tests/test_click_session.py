@@ -1,7 +1,7 @@
 import sys,time,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from click_follow import ClickSession, ModelRecovery
+from follow_session import ClickSession, ModelRecovery
 from wrist_projection import boot_id,FRAME
 
 class ClickSessionTests(unittest.TestCase):

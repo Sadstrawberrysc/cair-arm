@@ -1,6 +1,20 @@
 import atexit
+import os
+from pathlib import Path
 
 import cv2
+
+# The OpenCV wheel ships its own Qt. Conda's input-method and GL plugins load
+# another Qt; these 2D camera windows only need ASCII hotkeys and no OpenGL.
+os.environ["QT_IM_MODULE"] = "none"
+os.environ["QT_XCB_GL_INTEGRATION"] = "none"
+if not Path(os.environ.get("QT_QPA_FONTDIR", "/usr/share/fonts")).is_dir():
+    os.environ.pop("QT_QPA_FONTDIR", None)
+    for font_dir in ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts"):
+        if Path(font_dir).is_dir():
+            os.environ["QT_QPA_FONTDIR"] = font_dir
+            break
+
 import pyrealsense2 as rs
 import torch
 import torchvision
@@ -24,14 +38,14 @@ from common.utils import estimate_focal_length
 from common.imutils import process_image
 
 
-def bottom_first_pixels(pixels):
-    """Order samples by image row, bottom first (not by camera-space Y)."""
+def top_first_pixels(pixels):
+    """Order samples by image row, top first (not by camera-space Y)."""
     pixels = np.asarray(pixels)
     if pixels.ndim != 2 or pixels.shape[1] != 2 or len(pixels) == 0:
         raise ValueError("sample pixels must be a nonempty Nx2 array")
     if not np.isfinite(pixels).all():
         raise ValueError("sample pixels must be finite")
-    return pixels[np.argsort(-pixels[:, 1], kind="stable")]
+    return pixels[np.argsort(pixels[:, 1], kind="stable")]
 
 
 def render_mesh(vertices, faces, translation, focal_length, height, width, device=None, red=True):
@@ -82,7 +96,10 @@ def render_mesh(vertices, faces, translation, focal_length, height, width, devic
         # image_size=height,   # (H, W)
         blur_radius=0.0,
         faces_per_pixel=1,
-        bin_size=92
+        bin_size=None,
+        # A dense anatomy mesh can put more than the default F/5 faces in one
+        # bin. Reserve enough for the entire mesh so faces are not dropped.
+        max_faces_per_bin=faces.shape[1]
     )
 
     # Define the material
@@ -136,18 +153,28 @@ def render_mesh(vertices, faces, translation, focal_length, height, width, devic
 
 
 def kpt_2d_to_3d(kpt_2d, depth_mat, depth_intrin, depth_scale):
+    kpt_2d = np.asarray(kpt_2d)
+    if kpt_2d.ndim != 2 or kpt_2d.shape[1] != 2 or not np.isfinite(kpt_2d).all():
+        raise ValueError("sample pixels must be a finite Nx2 array")
+    if depth_mat.ndim != 2 or not depth_mat.size:
+        raise ValueError("depth image must be a nonempty 2D array")
     kpt_3d = np.zeros([kpt_2d.shape[0], 3])
+    nonzero_yx = None
     for i in range(kpt_2d.shape[0]):
-        x = min(int(kpt_2d[i, 0]), depth_mat.shape[1]-1)
-        y = min(int(kpt_2d[i, 1]), depth_mat.shape[0]-1)
+        x = int(np.clip(int(kpt_2d[i, 0]), 0, depth_mat.shape[1]-1))
+        y = int(np.clip(int(kpt_2d[i, 1]), 0, depth_mat.shape[0]-1))
         dis = depth_mat[y, x] * depth_scale
         if not dis:  # 如果深度值为0，寻找最近的不为0的深度值
-            nonzero = cv2.findNonZero(depth_mat)
-            distances = np.sqrt((nonzero[:, :, 0] - x) ** 2 + (nonzero[:, :, 1] - y) ** 2)
+            # np.argwhere always returns Nx2 (row, column), independent of the
+            # OpenCV 4/5 findNonZero return layout and supports Z16 depth.
+            if nonzero_yx is None:
+                nonzero_yx = np.argwhere(depth_mat > 0)
+            if not len(nonzero_yx):
+                raise ValueError("深度图中没有有效深度，无法生成相机采样点")
+            distances = ((nonzero_yx[:, 1] - x) ** 2
+                         + (nonzero_yx[:, 0] - y) ** 2)
             nearest_index = np.argmin(distances)
-            nearest_pixel = nonzero[nearest_index]
-            x = int(nearest_pixel[0][0])
-            y = int(nearest_pixel[0][1])
+            y, x = nonzero_yx[nearest_index]
             dis = depth_mat[y, x] * depth_scale
 
         kpt_3d[i, 0] = (kpt_2d[i, 0] - depth_intrin.ppx) / depth_intrin.fx * dis
@@ -249,6 +276,11 @@ if __name__ == '__main__':
     artery_shapedir_file = 'data/artery_shapedir.npy'
     skel_model = AnatomyModel(skel_file, skel_shapedir_file)
     artery_model = AnatomyModel(artery_file, artery_shapedir_file)
+
+    # The expanded Qt toolbar loads Conda image plugins linked to another Qt.
+    # Use plain windows; s/q/Esc are still handled by waitKey below.
+    cv2.namedWindow("result", cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    cv2.namedWindow("color stream", cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
 
     while True:
 
@@ -354,7 +386,7 @@ if __name__ == '__main__':
         image_vis = image_vis.astype(np.uint8)
         image_vis = cv2.cvtColor(image_vis, cv2.COLOR_RGB2BGR)
 
-        artery_pixel_coords = bottom_first_pixels(artery_pixel_coords.cpu().numpy())
+        artery_pixel_coords = top_first_pixels(artery_pixel_coords.cpu().numpy())
 
         # 像素坐标转换为相机坐标
         artery_camera_coords = kpt_2d_to_3d(artery_pixel_coords, np_depth, intr, depth_scale)

@@ -1,15 +1,39 @@
 # YOLO + Roboflow 自动目标检测到腕部视觉伺服实施计划
 
+> 本文件保留 2026-09 起的实施计划和验证历史，不作为当前源码或启动入口。
+> 2026-10-02 原 `infer/Carotid_begin/` 模型服务并入 `infer/Camera_wrist/detector/`；
+> 当前能力见 [腕部架构](../../infer/Camera_wrist/ARCHITECTURE.md)与
+> [模型服务架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)，
+> 日常启动见 [最简启动 notebook](../run/carotid-begin-operations.md)。
+> 下方旧目录、已移除工具/文档和模型数值保留为历史；本地数据或报告不随 Git 分发。
+
+## 当前进展与剩余验收（2026-10-02）
+
+当前使用 Roboflow Object Detection 唯一合格框中心选点，模型服务已归入
+`Camera_wrist/detector/`，worker 为 `infer.Camera_wrist.detector.worker`，
+与相机通过私有 socketpair 通信。无参数默认模型模式，`--manual` 显式保留手动跟踪；
+相机始终连接 Redis，启动不自动发起运动。默认模型、类别与阈值见
+[模型配置](../../infer/Camera_wrist/detector/config.py)及相机 CLI；缓存为 `Camera_wrist/data/model_cache/`。
+
+模型选点、光流/深度、同源帧融合和暂停确认后的恢复已有实现；`camera` / `carotid`
+各 79 项、`ultralytics` 模型相关 14 项离线测试通过。本次未运行真实 GPU 推理、相机、
+Redis 回环或机械臂运动，剩余是独立扫描点真值、真实目标连续跟踪/恢复、外参/时序和悬停净空验收。
+接触与超声力控交接仍为后续扩展。
+
+当前验证入口与证据见 [腕部进展](camera-wrist-progress.md#当前入口与验证2026-10-02)、
+[模型进展](carotid-begin-progress.md)和[项目进展](project-progress.md)。下方 YOLO-Pose、
+旧模型适配目录与 P0–P4 工作包是早期方案，未完成项是否继续采用需以当前需求和源码为准。
+
 制定日期：2026-09-24；无标记单点输出修订：2026-09-25。状态（2026-09-28）：本机 P0 已采集首批 RGB-D；用户另行采集约 50 张并在 Roboflow 开始训练。用户现指定以检测框中心生成 scan_start；v4 私有模型已在本机完成一张图片推理，旧框底点规则被边界拒绝；中心规则已用真实模型重跑并输出 `(490,404)`，通过像素边距门；真实 P0 仍待核对。用户已确认本图中心与 P0 重合，但本地缺少真值证据和多图误差评估；模型驱动的实机闭环未完成。
 
 ## 工作目录与当前落地状态（2026-09-25）
 
-工作目录：`infer/Carotid_begin/`。
+当时工作目录：`infer/Carotid_begin/`。
 
-- [算法架构与流程图](../../infer/Carotid_begin/ARCHITECTURE.md)
-- [P0 操作命令](../../infer/Carotid_begin/README.md)
-- [单点标注规范](../../infer/Carotid_begin/ANNOTATION.md)
-- [Roboflow v4 部署步骤](../../infer/Carotid_begin/DEPLOYMENT.md)
+- 当前 [模型服务架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)和[腕部流程](../../infer/Camera_wrist/ARCHITECTURE.md)
+- 当时 P0 操作命令：`infer/Carotid_begin/README.md`（旧文档已移除）
+- 当时单点标注规范：`infer/Carotid_begin/ANNOTATION.md`（旧文档已移除）
+- 当时 Roboflow v4 部署步骤：`infer/Carotid_begin/DEPLOYMENT.md`（旧文档已移除）
 
 已实现 P0 工具入口：`collect` 保存真实同步 RGB-D，`annotate` 记录单点/证据及
 复核修订，`check` 检查几何与纹理条件，`report` 生成 RGB-D 可视化复核页，
@@ -29,9 +53,8 @@ Close Range Default、视差 256，RGB/深度均 640×480 @30 FPS；按约 2 秒
 - 30 组完整 RGB-D，全部通过文件、尺寸、单位和时间检查，覆盖约 59.03 秒。
 - 实际保存间隔 2.035～2.036 秒；采集年龄 34.30～37.06 ms；彩深差最大 0.169 ms。
 - 全图有效深度比例 60.81%～85.75%；全图包含远背景，该比例不代表目标点深度有效。
-- [JSON 检查](../../infer/Carotid_begin/reports/p0_P001_left_20260925_01.json)、
-  [RGB-D 可视化报告](../../infer/Carotid_begin/reports/p0_P001_left_20260925_01.html)、
-  [统计摘要](../../infer/Carotid_begin/reports/p0_P001_left_20260925_01_summary.json)。
+- 当时报告位于 `infer/Carotid_begin/reports/`：JSON 检查 `p0_P001_left_20260925_01.json`、
+  RGB-D 可视化 `p0_P001_left_20260925_01.html`、统计 `p0_P001_left_20260925_01_summary.json`。
 - 首图中颈部占据大部分画面，侧边界可见，下颌轮廓线索有限；需要试标验证该视野
   的可重复定位能力。这批短序列不构成独立受试者的训练/验证/测试集。
 
@@ -44,8 +67,8 @@ Close Range Default、视差 256，RGB/深度均 640×480 @30 FPS；按约 2 秒
 不能容纳现有 80×80 跟踪 ROI，故 `tracking_initialization_possible=false`、check 返回 3。
 这是边界条件失败，不代表纹理数量为零；工具在 ROI 越界时未进行特征提取。
 
-- [首点几何报告](../../infer/Carotid_begin/reports/p0_P001_left_first_point_01.json)
-- [包含首点的 RGB-D 复核页](../../infer/Carotid_begin/reports/p0_P001_left_20260925_02_annotated.html)
+- 当时首点几何报告：`infer/Carotid_begin/reports/p0_P001_left_first_point_01.json`
+- 当时 RGB-D 复核页：`infer/Carotid_begin/reports/p0_P001_left_20260925_02_annotated.html`
 
 用户随后明确：真实初始扫描点位于当前视野下边界之外，故 (392,468) 仅是误选的试标草稿，不能作为 scan_start 真值。已为该样本追加 out_of_view 修订（草稿），导出时明确拒绝此状态；其余 29 张仍未标注。
 要以本方案进行直接单点定位和深度反投影，采集时必须让真实目标进入腕部相机视野，且满足现有 80×80 跟踪 ROI 的至少 40 px 边距。若观察位姿无法同时满足可见上下文、目标可见和深度质量，需先解决相机取景/观察位姿及标注真值获取方法；不能用画面内替代点代替真实起点。下一轮实采需先确定取景方案；不自动移动机械臂。试标窗口新增 40 px 边界和选点后即时几何/纹理
@@ -74,7 +97,7 @@ Close Range Default、视差 256，RGB/深度均 640×480 @30 FPS；按约 2 秒
 新增 `replay_session.py`，在 `ultralytics` 环境对已存 RGB-D 会话加载模型一次，
 逐帧输出框中心候选、几何/纹理检查与离线模型推理耗时；合成回归通过。
 本机进程无 Roboflow API Key，尚未对这 10 张运行真实模型。下一步命令已写入
-[DEPLOYMENT.md](../../infer/Carotid_begin/DEPLOYMENT.md)，由用户在本地输入 Key 执行。
+旧 `infer/Carotid_begin/DEPLOYMENT.md`（已移除），由用户在本地输入 Key 执行。
 报告不替代独立 P0 真值误差和实时/Robot 时效验证。
 用户已运行 v1：10 帧有 6 帧候选，6 帧几何与纹理通过；4 帧因各有 2 个有效框被拒绝。
 6 个被接受框下边均为图像边缘 `y=480`，需核对标注与真实 P0。离线推理耗时
@@ -104,7 +127,7 @@ Roboflow API Key 已可从本机私密凭据文件读取，不在仓库内保存
 新增窗口 s 键原始 RGB-D 难例采集、按受试者暂存 Roboflow RGB 并留出测试
 受试者的工具；模型诊断与人工真值分开。离线回放新增独立复核 P0 的像素
 误差统计；只有 measured_reference/expert_ultrasound 计入定位精度。采集、
-标注、重训和留出集比较流程见 [RETRAINING.md](../../infer/Carotid_begin/RETRAINING.md)。
+当时标注、重训和留出集比较流程见旧 `infer/Carotid_begin/RETRAINING.md`（已移除）。
 
 ## 2026-09-28：用户自采 50 张与 Roboflow 训练（待核实）
 
@@ -178,11 +201,11 @@ URL 中 openModelEval=true 只是打开评估页的参数，不能据此推断�
 加载私有模型、单图推理；框下边中点为该节记录时的旧规则，当前已改为框中心。
 默认缓存到被 Git 忽略的 `infer/Carotid_begin/data/model_cache/`；
 需要 API Key 和首次联网下载，尚未实测真实模型或 GPU。部署命令见
-[DEPLOYMENT.md](../../infer/Carotid_begin/DEPLOYMENT.md)。
+旧 `infer/Carotid_begin/DEPLOYMENT.md`（已移除）。
 离线回归现为 20 项通过，入口 `--help` 在 Python 3.10 下通过。
 目前只完成单图入口，实时相机进程和 Robot 尚未接入。
 
-## 1. 目标与现有接点
+## 1. 早期目标与接点（历史方案）
 
 用户已完成机械臂到达初始位置，并验证了给定单点的视觉伺服效果。当前复用
 `infer/Camera_wrist/click_follow.py` 的 Gemini 305 RGB-D → Redis → RM75 腕部
@@ -284,7 +307,7 @@ YOLO 候选点直接接入腕部 `ClickSession`，绑定当前图像采集时间
    初始扫描点的一致性。不能把每帧变化的检测框中心当成同一个皮肤点直接驱动。
    重新检测与已跟踪点不一致时记录偏差并进入重新确认流程。
 
-## 2. 当前接口与姿态语义
+## 2. 早期接口与姿态语义（历史方案）
 
 | 项 | 现状 / 接入约束 |
 | --- | --- |
@@ -299,7 +322,7 @@ Ultralytics 的 `pose` 指的是图像关键点任务，通常输出二维像素
 本任务只训练一个二维关键点。三维位置由同步且对齐的深度/内参求出，表面法向
 由局部三维点拟合；Robot 沿用现有姿态连续性规则生成朝向。
 
-## 3. 工作包与交付门
+## 3. 早期工作包与交付门（历史方案）
 
 ### P0 — 目标与测量协议（开始数据采集前）
 
@@ -404,7 +427,7 @@ P95 ≤8 px、错选可执行目标 ≤0.5%、无目标场景误触发 ≤0.5%�
 超时后继续运动或未确认恢复，均判失败。若要探头接触/超声成像，另设力控和
 成像质量验收；当前无力腕部模式只对应非接触悬停。
 
-## 4. 建议的实施顺序与决策点
+## 4. 早期实施顺序与决策点（历史方案）
 
 | 顺序 | 预计投入* | 完成判据 / 依赖 |
 | --- | --- | --- |

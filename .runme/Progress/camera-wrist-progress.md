@@ -1,11 +1,47 @@
 # Camera_wrist 项目进展（Runme notebook）
 
 > 本文件是纳入 Git 的 Runme notebook；当前架构见
-> `infer/Camera_wrist/ARCHITECTURE.md`。
+> [Camera_wrist/ARCHITECTURE.md](../../infer/Camera_wrist/ARCHITECTURE.md)。
 
-整理日期：2026-09-17。以下为已有实现和历史验证汇总，本次文档重写未新增实测。
+更新日期：2026-10-02。09-17 起的记录保留当时日期、配置和验证范围；当前入口以本节为准。
 
-## 当前状态
+## 当前入口与验证（2026-10-02）
+
+`bash infer/Camera_wrist/start_camera.sh` 无参数默认模型模式；显式 `--manual` 使用左键
+选点跟踪，不加载模型。两种模式都连接 Redis 并订阅 Robot 状态，`--no-redis` 已移除。
+模型模式 `b` 新帧选点后请求开始、`d` 只选点；手动模式左键选点后按 `b/r` 请求跟随。
+启动、模型加载和收到 Robot 状态本身不自动开始运动。
+
+模型服务在 `detector/`，由相机启动 `infer.Camera_wrist.detector.worker`；
+`follow_session.py` 管理会话、单键开始和暂停回执后的自动恢复。
+配置见 [detector/config.py](../../infer/Camera_wrist/detector/config.py)：显式 `--model-id`
+优先于 `CAROTID_MODEL_ID`，再取 `DEFAULT_MODEL_ID`；默认选点阈值 0.4。
+缓存位于 `Camera_wrist/data/model_cache/`，可由 `MODEL_CACHE_DIR` 覆盖；相机 `camera`
+环境与模型 `ultralytics` 环境、私有 socketpair 保留。
+
+本次迁移 `camera` / `carotid` 环境各 79 项离线测试、`ultralytics` 模型相关 14 项通过，
+含真实 socketpair 和假模型 worker；未运行真实 GPU 推理、相机、Redis 回环或机械臂运动。
+当前离线入口是在仓库根目录运行
+`/home/cair-jacen/anaconda3/envs/camera/bin/python -m unittest discover -s infer/Camera_wrist/tests -v`；
+具体覆盖见 [迁移验证记录](#2026-10-02carotid_begin-合并到腕部模块)。
+
+日常操作见 [腕部操作 notebook](../run/camera-wrist-operations.md)与
+[模型最简启动](../run/carotid-begin-operations.md)；其他进展见
+[模型进展](carotid-begin-progress.md)、[项目进展](project-progress.md)和
+[早期方案历史](yolo-roboflow-visual-servo-plan.md)。
+
+## 2026-10-12：腕部相机未枚举与启动诊断
+
+10:49、10:51 的相机终端均在选择 `CV2L360000HZ` 时退出，尚未启动视频流。
+宿主只读 Orbbec SDK 枚举为 0 台，sysfs 可见 D455 与普通 UVC 摄像头，未见 Gemini 305。
+当前证据只确定腕部相机未被识别，不能区分线缆、供电、接口或相机本体原因。
+
+`click_follow.py` 启动时先检查枚举结果：0 台设备明确提示连接检查，序列号不匹配则列出
+实际设备名及序列号，保持按指定序列号选择设备。13 项 CLI/设备选择离线测试通过；
+宿主只读调用新选择逻辑也返回明确的 0 台设备提示。未打开视频流、加载模型或执行运动，
+连接恢复与完整 RGB-D 启动仍待现场验证。
+
+## 2026-09-17 状态汇总（历史）
 
 - 点击入口已接通 RGB-D → 局部追踪/法向 → Redis → Robot 坐标转换、跟随控制和 planner。
 - 支持独立相机、observe、dry-run-control、显式执行及腕部无力模式。
@@ -13,7 +49,7 @@
 - 失效进入 Hold；重新选点并确认恢复。追踪丢失记录事件、匹配统计及局部图片。
 - Gemini 数字人叠加实验已按用户反馈回退。
 
-## 已有证据
+## 2026-09-17 已有证据汇总（历史）
 
 | 日期 | 结果 |
 | --- | --- |
@@ -25,15 +61,17 @@
 历史文件核查见下方；测试日志：/tmp/wrist_loopback_otnd84zy（754 周期）、
 /tmp/wrist_loopback_n5ichamd（757 周期），均无故障、ServoJ 发送数 0，后者验证 planner 接受过目标。
 
-## 待办
+## 当前待验收事项
 
+- 在真实目标上复核检测框中心与实际扫描点的对应关系，建立独立真值与定位误差记录。
+- 验证模型选点、同源帧融合与遮挡后的暂停确认、自动重选/恢复，保留两端日志及图像证据。
 - 复测静止、缓慢移动、遮挡、弱纹理、深度失效及重选恢复，分析追踪丢失图像。
 - 独立核验腕部外参、同一标记多姿态 Base 位置、曝光与机器人反馈时间对应。
 - 对照实测 Probe TCP 间距，核查约 24 mm 深度差及根目录记录的约 11.7 mm 间距差，分别记录来源。
 - 完成悬停间距和低速真实联动验证；带力模式另需完成力残差验收。
 
-当前实现与离线测试不能替代空间、时序或真实运动验证。启动见
-[点击跟随与投影预览](../run/camera-wrist-operations.md)。
+当前实现与离线测试不能替代空间、时序或真实运动验证。以下日期条目为实现与试验历史，
+旧独立视觉模式、限速、累计运动门和启动命令不能替代上方当前入口与模块架构。
 
 ## 2026-09-16 标定文件核查
 
@@ -266,3 +304,84 @@ Orbbec 官方推荐 USB 3.0，故该链路是间歇性零帧的可能因素，�
 共同调用 `launch_wrist_terminal.sh robot|camera`；独立 Terminator、日志和防重逻辑
 移入脚本。防重匹配同时覆盖相机实际使用的 `python -u` 启动形式。
 已通过 Bash 语法检查及两个 Runme 单元的 dry-run；本次未重新启动实体设备。
+
+## 2026-10-02：Carotid_begin 合并到腕部模块
+
+模型服务归入 `Camera_wrist/detector/`，采用 config、credentials、gpu_model、detection、
+pipeline、protocol、worker 的职责拆分；模型入口改为
+`python -m infer.Camera_wrist.detector.worker`。相机与模型仍使用各自 Conda 环境和私有
+socketpair，不改变 Robot Redis 公共协议与控制。ClickSession、ModelStart 和 ModelRecovery
+统一放在 `follow_session.py`，相机入口保留采集、窗口、跟踪融合和 Redis I/O。
+
+无参数默认模型模式；默认 ID 由 `detector/config.py` 定义，`CAROTID_MODEL_ID` 可覆盖，
+显式 `--model-id` 优先。`--manual` 保留手动点击、光流和深度跟踪，且不启动模型进程。
+模型加载不自动开始运动，仍由人工 `b/r` 启用跟随意图。
+
+默认缓存迁到 `Camera_wrist/data/model_cache/`，原私有凭据路径继续兼容；原独立模型日志
+归档到 `Camera_wrist/log/carotid_begin/`。模型测试合并到 `Camera_wrist/tests/`；
+架构与操作入口同步更新。模型历史证据保留在
+[模型进展 notebook](carotid-begin-progress.md)，当前服务边界见
+[detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
+
+本次 `camera`（Python 3.8）与 `carotid` 环境各运行 79 项离线测试全部通过，
+包含本机真实 socketpair 和假模型 worker 子进程；`ultralytics`（Python 3.11）环境的
+模型相关 14 项全部通过。Python 源码语法、Bash 语法、相机和新 worker 的 `--help`
+检查通过，提取的三个会话类与迁移前 AST 一致。
+这些验证使用假模型及离线输入，未运行真实 GPU 推理、相机、Redis 回环或机械臂运动；
+真实目标连续跟踪、恢复和定位精度仍待验收。
+
+## 2026-10-09：恢复原 RT 内核默认启动项
+
+17:46 相机模型 worker 启动失败时，当前内核为 `6.8.0-45-generic`，该内核没有
+NVIDIA 驱动模块，`/dev/nvidia*` 不存在，`nvidia-smi` 无法连接驱动。已核对旧驱动
+`535.129.03` 的模块仅安装在 `6.2.1-rt3`，与本机 NVIDIA 用户态库版本一致；
+原 RT 内核的 vmlinuz、initrd 和 GRUB 菜单均存在，默认模型权重缓存也存在。
+
+原 `GRUB_DEFAULT="1>4"` 的数字索引因新增内核而指向 generic 内核。按用户选择，
+已将 `/etc/default/grub` 的默认项改为原 RT 内核的固定菜单 ID，并执行 `update-grub`；
+生成菜单包含正确默认项，`grub-script-check` 通过。原配置和菜单备份保存在
+`/var/backups/uspilot-grub-20261009_175038/`。
+
+本次未安装或升级驱动、未修改模型代码、未重启电脑。重启后需先确认 `uname -r`
+为 `6.2.1-rt3` 且 `nvidia-smi` 正常，再复测模型加载和相机；GPU 推理与真机运行尚未验证。
+
+## 2026-10-09：改用指定 generic 内核并恢复 NVIDIA 驱动
+
+用户随后明确要求使用 `6.8.0-45-generic`，该要求替代上一条记录中的 RT 默认启动选择。
+本次核对 `/etc/default/grub` 和 `/boot/grub/grub.cfg` 均已固定为该内核的菜单 ID：
+`gnulinux-advanced-4dd208b4-ab9b-42ca-9eae-bafb8df79db7>gnulinux-6.8.0-45-generic-advanced-4dd208b4-ab9b-42ca-9eae-bafb8df79db7`。
+当前运行内核也是 `6.8.0-45-generic`，GRUB 语法检查通过。
+
+使用原 `nvidia-uninstall` 清理手动安装的 `535.129.03`，随后安装 Ubuntu 官方仓库中
+`ubuntu-drivers devices` 推荐的 `nvidia-driver-595`（`595.99.02`）及 DKMS。
+安装新增 19 个包，未升级现有包、未删除其他内核；DKMS 为当前 `6.8.0-45-generic`
+和已安装的 `6.8.0-138-generic` 构建并安装模块。另已更新指定内核的 initramfs。
+旧 535 驱动已卸载，旧 RT 内核不再作为本次 GPU 验证目标。
+卸载日志为 `/var/log/uspilot-nvidia-uninstall-20261009.log`；
+卸载器提示无法删除非空的 `vdpau` 目录，退出码为 0，新驱动安装与验证成功。
+
+无需重启即成功加载 `nvidia`、`nvidia_uvm`：`nvidia-smi` 显示驱动 `595.99.02`，
+GPU 为 RTX 4080 Laptop；`dkms status` 确认当前内核模块已安装，`dpkg --audit` 无输出。
+通过项目原有 `camera` 环境 → `ModelSelector` → `ultralytics` 环境 worker 通道，
+对本地保存的 `infer/Camera_wrist/data/pictures/1.png` 连续运行 3 次真实模型推理：
+ONNX 会话启用 `CUDAExecutionProvider`，worker 正常就绪，源时间戳一致，均返回有效选点。
+检测到一个 `carotid` 框，置信度约 `0.7974`；首次推理约 `260 ms`，随后约 `10.4/10.7 ms`。
+这些耗时仅代表该保存图片的模型推理，不代表真实相机全链路延迟或定位精度。
+
+本次未修改模型源码、未升级 Python 推理包、未重启电脑；尚未复测真实相机、深度拟合、
+追踪或机械臂。SAM/SAM3/YoloWorld 等可选依赖及版本提示仍存在，但不阻碍当前模型推理。
+
+## 2026-10-12：速度翻倍与自动初始开始
+
+按用户要求，腕部 TCP 参考速度由 2 mm/s 改为 4 mm/s，姿态参考和每关节 ServoJ
+命令上限由 2°/s 改为 4°/s。`main_rm75` 已重新编译，常用启动入口直接使用新二进制。
+默认模型相机新增 `ModelStartup`，取得新鲜 Robot Hold 和完整 RGB-D 后自动从新帧
+选取初始目标，不需要按 `b`；继续经过追踪/深度/表面拟合及新目标回传确认后请求跟随。
+无唯一合格目标或追踪无效时每隔至少 0.1 秒重试，未确认目标时不发开始请求。
+人工 `p` 取消自动开始和恢复；之后可用 `b` 重选并跟随。手动模式保持原操作。
+
+新增初始启动离线用例覆盖等待 Robot、选点与目标回传顺序、无效选点重试、人工取消、
+故障/重启取消及状态/忙碌门；速度测试确认远目标每周期以新限速推进。
+`camera` 环境 90 项腕部离线测试通过（私有 socketpair 需在允许本机 socket 的执行环境运行）；
+CMake 配置、`main_rm75` 和 `robot_offline_tests` 构建成功，CTest 6/6 通过。
+启动 notebook、架构和终端提示已同步；未启动真实相机或机械臂，实机速度和自动开始待验收。

@@ -15,6 +15,20 @@ git -C /home/cair-jacen/uspilot_ctrl-main status --short
 redis-cli -h 127.0.0.1 -p 7777 ping
 ```
 
+## 腕部模型 / 手动选点跟随
+
+统一操作入口为 [camera-wrist-operations.md](camera-wrist-operations.md)。
+依次执行 `start-redis-7777`、`start-wrist-camera`、`start-wrist-robot`，
+默认相机自动加载模型，Robot 就绪后自动选取初始目标，通过观测和回传确认后请求跟随。
+手动选点用 `start-wrist-camera-manual` 替代相机单元；模型配置和离线验证也在该 notebook 中。
+原 [carotid-begin 最简启动](carotid-begin-operations.md) 保留为同一链路的最简入口。
+
+下面单元只列出腕部 notebook 的命令，不执行启动或运动：
+
+```bash {"name":"list-wrist-operations","excludeFromRunAll":"true"}
+runme list --filename /home/cair-jacen/uspilot_ctrl-main/.runme/run/camera-wrist-operations.md --chdir /home/cair-jacen/uspilot_ctrl-main
+```
+
 ## 超声在线推理
 
 ```bash {"name":"start-ultrasound-inference","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}

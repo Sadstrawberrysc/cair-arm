@@ -1,7 +1,0 @@
-data/
-exports/
-reports/
-runs/
-log/
-__pycache__/
-*.pyc

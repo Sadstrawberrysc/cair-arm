@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from infer.Carotid_begin.credentials import get_api_key, save_api_key
+from infer.Camera_wrist.detector.credentials import get_api_key, save_api_key
 
 
 class CredentialsTests(unittest.TestCase):

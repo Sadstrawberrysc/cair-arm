@@ -5,8 +5,8 @@ import unittest
 
 import numpy as np
 
-from infer.Carotid_begin.detection import response_to_boxes, scan_start_from_boxes
-from infer.Carotid_begin.live_protocol import pack_frame, unpack_frame
+from infer.Camera_wrist.detector.detection import response_to_boxes, scan_start_from_boxes
+from infer.Camera_wrist.detector.protocol import pack_frame, unpack_frame
 
 
 class DetectionProtocolTests(unittest.TestCase):

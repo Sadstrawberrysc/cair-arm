@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Click-to-track commissioning UI. Robot motion requires an explicit Robot mode."""
+"""Wrist tracking UI: model selection by default, mouse selection with --manual."""
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import time
-import uuid
 import cv2
 import numpy as np
 from gemini_config import WIDTH, HEIGHT, configure_close_range, stream_profiles
@@ -13,9 +13,11 @@ from local_tracker import LocalTracker
 from model_selection import (DEFAULT_DETECTOR_PYTHON, DetectionCenterFusion,
                              ModelSelector, fuse_model_observation, replay_selection,
                              observation_is_fresh)
+from infer.Camera_wrist.detector.config import DEFAULT_MODEL_ID
+from follow_session import ClickSession, ModelRecovery, ModelStart, ModelStartup
 from projection_preview import CaptureClock, aligned_rgbd, color_bgr
 from tracking_diagnostics import TrackingDiagnostics
-from wrist_projection import boot_id, calibration, FRAME
+from wrist_projection import calibration
 
 STATE = 'robot:wrist:state:v1'
 OBSERVATION = 'robot:wrist:observation:v1'
@@ -24,227 +26,6 @@ COMMAND = 'robot:wrist:command:v1'
 
 class StartupFramesUnavailable(RuntimeError):
     """The first synchronized RGB-D frame never arrived after stream start."""
-
-
-class ClickSession:
-    """UI ownership gate, independent of SDK and Redis for offline tests."""
-    def __init__(self, digest):
-        self.digest = digest
-        self.producer = uuid.uuid4().hex
-        self.runtime = ''
-        self.target = ''
-        self.sequence = 0
-        self.following = False
-        self.started = False
-        self.last_request_sequence = 0
-        self.last_state_sequence = 0
-        self.state = None
-
-    def accept_state(self, state, now):
-        expected = (('version', 1), ('scope', 'click_follow'),
-                    ('boot_id', boot_id()), ('calibration_sha256', self.digest),
-                    ('frame', FRAME), ('length_unit', 'm'))
-        for field, value in expected:
-            if state.get(field) != value:
-                raise ValueError('Robot state %s mismatch' % field)
-        if state.get('valid') is not True:
-            raise ValueError('Robot state invalid')
-        stamp = state.get('timestamp_monotonic_ns')
-        if not isinstance(stamp, int):
-            raise ValueError('Robot state timestamp missing/invalid')
-        age_ns = now - stamp
-        if not 0 <= age_ns <= 200_000_000:
-            raise ValueError('Robot state age %.1f ms outside 0..200 ms' % (age_ns / 1e6))
-        runtime = state['runtime_session_id']
-        if not isinstance(runtime, str) or not runtime:
-            raise ValueError('missing Robot session')
-        changed = bool(self.runtime and self.runtime != runtime)
-        if changed:
-            self.following = False
-            self.started = False
-            self.target = ''
-            self.last_request_sequence = 0
-            self.last_state_sequence = 0
-        if state['sequence'] <= self.last_state_sequence:
-            return changed
-        self.runtime = runtime
-        self.last_state_sequence = state['sequence']
-        self.state = state
-        self.started = self.started or state.get("resume_required", False)
-        if (self.following and state.get('request_producer_id') == self.producer
-                and state.get('request_sequence', 0) >= self.last_request_sequence
-                and state.get('follow_state') != 'following'):
-            self.following = False
-            self.target = ''
-            changed = True
-        return changed
-
-    def select(self):
-        if self.following:
-            raise ValueError('pause before selecting another target')
-        self.target = uuid.uuid4().hex
-
-    def envelope(self):
-        self.sequence += 1
-        return dict(version=1, runtime_session_id=self.runtime, producer_id=self.producer,
-                    target_id=self.target, sequence=self.sequence, timestamp_monotonic_ns=time.monotonic_ns(),
-                    boot_id=boot_id(), calibration_sha256=self.digest, frame=FRAME, length_unit='m')
-
-    def request(self, action, valid):
-        if action in ('begin', 'resume'):
-            if not self.runtime or not self.state or not self.target or not valid:
-                raise ValueError('select a valid target and wait for Robot before starting')
-            if time.monotonic_ns()-self.state['timestamp_monotonic_ns'] > 200_000_000:
-                raise ValueError('Robot state stale')
-            if self.started and action != 'resume':
-                raise ValueError('use r after pause/loss and selecting a new target')
-            if not self.started and action != 'begin':
-                raise ValueError('use b for the first start')
-            self.following = True
-            self.started = True
-        elif action in ('pause', 'end'):
-            self.following = False
-        packet = self.envelope()
-        packet['action'] = action
-        self.last_request_sequence = packet['sequence']
-        return packet
-
-
-class ModelStart:
-    """One b press authorizes one fresh model selection and acknowledged start."""
-    def __init__(self):
-        self.cancel()
-
-    def cancel(self):
-        self.runtime = ''
-        self.old_target = ''
-
-    def queue(self, session, now):
-        state = session.state or {}
-        if session.following:
-            raise ValueError('already following; pause before selecting another target')
-        if (not session.runtime or not 0 <= now-state.get('timestamp_monotonic_ns', 0) <= 200_000_000
-                or state.get('follow_state') != 'hold'
-                or str(state.get('control_state', '')).lower() == 'fault'):
-            raise ValueError('wait for a fresh Robot Hold before starting')
-        self.runtime = session.runtime
-        self.old_target = session.target
-
-    def poll(self, session, result, now, *, selecting):
-        if not self.runtime:
-            return None
-        state = session.state or {}
-        if (session.runtime != self.runtime or session.following
-                or not 0 <= now-state.get('timestamp_monotonic_ns', 0) <= 200_000_000
-                or state.get('follow_state') != 'hold'
-                or str(state.get('control_state', '')).lower() == 'fault'):
-            self.cancel()
-            return None
-        if selecting:
-            return None
-        if (not session.target or session.target == self.old_target
-                or not observation_is_fresh(result, now)):
-            self.cancel()
-            return None
-        # Observation is published by the caller before polling. Wait until Robot
-        # echoes its target identity, so begin/resume cannot race the observation.
-        if state.get('target_id') != session.target:
-            return None
-        packet = session.request('resume' if session.started else 'begin', True)
-        self.cancel()
-        return packet
-
-
-class ModelRecovery:
-    """Keep operator follow intent across visual loss, with an acknowledged pause."""
-    VISUAL_HOLDS = {'operator_pause', 'operator_paused', 'invalid wrist observation',
-                    'wrist_pose_time_unmatched', 'wrist_observation_missing_stale_or_mismatched'}
-
-    def __init__(self):
-        self.cancel()
-
-    def cancel(self):
-        self.enabled = self.waiting = False
-        self.runtime = self.old_target = ''
-        self.pause_sequence = self.pause_state_sequence = 0
-
-    def arm(self, session):
-        self.cancel()
-        self.enabled = True
-        self.runtime = session.runtime
-
-    def accept_state(self, session, state, now):
-        """Turn an owned Robot timing Hold into the acknowledged recovery path."""
-        was_following = session.following
-        old_target = session.target
-        previous_sequence = session.last_state_sequence
-        previous_runtime = session.runtime
-        changed = session.accept_state(state, now)
-        pause = None
-        if (self.enabled and not self.waiting and was_following and old_target
-                and session.runtime == previous_runtime == self.runtime
-                and session.state is state and state['sequence'] > previous_sequence
-                and state.get('follow_state') == 'hold'
-                and state.get('follow_reason') == 'wrist_pose_time_unmatched'
-                and str(state.get('control_state', '')).lower() != 'fault'
-                and state.get('target_id') == old_target
-                and state.get('request_producer_id') == session.producer
-                and state.get('request_sequence', 0) >= session.last_request_sequence):
-            # accept_state clears the held target; carry its identity on our pause
-            # so recovery still requires a different, acknowledged new target.
-            pause = self.pause_for_loss(session, target_id=old_target)
-        self.check_state(session, now)
-        return changed, pause
-
-    def pause_for_loss(self, session, *, target_id=None):
-        packet = session.request('pause', False)
-        if target_id is not None:
-            packet['target_id'] = target_id
-        self.waiting = self.enabled
-        self.pause_sequence = packet['sequence']
-        self.pause_state_sequence = session.last_state_sequence
-        self.old_target = packet['target_id']
-        return packet
-
-    def check_state(self, session, now):
-        if not self.enabled:
-            return
-        state = session.state
-        if (session.runtime != self.runtime or not state
-                or not 0 <= now-state['timestamp_monotonic_ns'] <= 200_000_000
-                or str(state.get('control_state', '')).lower() == 'fault'):
-            self.cancel()
-            return
-        if self.waiting:
-            if state['sequence'] <= self.pause_state_sequence:
-                return
-            if (state.get('follow_state') == 'hold'
-                    and state.get('follow_reason') not in self.VISUAL_HOLDS):
-                self.cancel()
-            elif (state.get('request_sequence', 0) >= self.pause_sequence
-                  and state.get('request_producer_id') != session.producer):
-                self.cancel()
-        elif not session.following:
-            self.cancel()
-
-    def ready(self, session, now):
-        self.check_state(session, now)
-        state = session.state or {}
-        return (self.enabled and self.waiting
-                and state.get('follow_state') == 'hold'
-                and state.get('request_producer_id') == session.producer
-                and state.get('request_sequence') == self.pause_sequence
-                and state.get('follow_reason') in self.VISUAL_HOLDS)
-
-    def resume(self, session, result, now):
-        if (not self.ready(session, now) or not session.target
-                or session.target == self.old_target
-                or session.state.get('target_id') != session.target
-                or not observation_is_fresh(result, now)):
-            return None
-        packet = session.request('resume', True)
-        self.waiting = False
-        return packet
 
 
 def draw_detection_boxes(image, response, now_ns, *, max_age_ns=500_000_000):
@@ -280,18 +61,47 @@ def parse_args(argv=None):
     parser.add_argument('--serial', default='CV2L360000HZ')
     parser.add_argument('--calibration', type=Path, default=Path(__file__).with_name('gemini305_to_rm75_armtip.json'))
     parser.add_argument('--redis-port', type=int, default=7777)
-    parser.add_argument('--model-id', help='Enable model P0 selection with d; disables mouse selection')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--model-id',
+                           default=os.environ.get('CAROTID_MODEL_ID', '').strip() or DEFAULT_MODEL_ID,
+                           help='Override the default model; initial selection and follow start automatically')
+    selection.add_argument('--manual', action='store_true',
+                           help='Use mouse selection instead of loading the detector')
     parser.add_argument('--detector-python', type=Path, default=DEFAULT_DETECTOR_PYTHON)
     parser.add_argument('--model-class', default='carotid')
     parser.add_argument('--model-confidence', type=float, default=.4, help='Model selection confidence (default: 0.4)')
     parser.add_argument('--log', type=Path, default=Path(__file__).resolve().parent / 'log' / ('wrist_click_%d.jsonl' % time.time_ns()))
     args = parser.parse_args(argv)
+    if args.manual:
+        args.model_id = None
+    else:
+        args.model_id = args.model_id.strip()
+        if not args.model_id:
+            parser.error('--model-id must be nonempty')
     model_confidence = args.model_confidence
     if not 0 <= model_confidence <= 1:
         parser.error('--model-confidence must be in [0, 1]')
     if args.model_id and not args.detector_python.is_file():
         parser.error('detector Python environment not found')
     return args
+
+
+def select_wrist_device(context, serial):
+    """Report enumeration failures before opening the configured camera."""
+    devices = context.query_devices()
+    count = devices.get_count()
+    if count == 0:
+        raise ValueError(
+            'Orbbec SDK 枚举到 0 台设备，未识别腕部相机（目标序列号：%s）；'
+            '请检查相机端供电与数据线，并重新插拔或直连电脑 USB 口。' % serial)
+    available = [(devices.get_device_name_by_index(i),
+                  devices.get_device_serial_number_by_index(i))
+                 for i in range(count)]
+    if serial not in [item[1] for item in available]:
+        raise ValueError(
+            '未找到腕部相机序列号 %s；已枚举设备：%s。'
+            '请核对设备身份及对应标定。' % (serial, json.dumps(available, ensure_ascii=False)))
+    return devices.get_device_by_serial_number(serial)
 
 
 def main():
@@ -304,7 +114,7 @@ def main():
     args.log.parent.mkdir(parents=True, exist_ok=True)
     ob.Context.set_logger_to_file(ob.OBLogLevel.ERROR, str(sdk_log))
     context = ob.Context()
-    device = context.query_devices().get_device_by_serial_number(args.serial)
+    device = select_wrist_device(context, args.serial)
     if not device.is_global_timestamp_supported():
         raise ValueError('SDK capture clock unsupported')
     camera_settings = configure_close_range(device, ob)
@@ -345,6 +155,7 @@ def main():
     selection_pending = False
     recovery = ModelRecovery()
     model_start = ModelStart()
+    startup = ModelStartup(selector is not None)
     next_recovery_at = 0.
     last_preview_request = 0.
     last_model_confirmed_ns = None
@@ -362,6 +173,7 @@ def main():
                     tracker.lose('Redis publication failed')
                     recovery.cancel()
                     model_start.cancel()
+                    startup.cancel()
                     record(dict(type='redis_error', reason=str(error)))
         def publish_observation(result):
             if not session.runtime or not session.target:
@@ -381,6 +193,7 @@ def main():
         record(dict(type='configuration', mode='click_follow', serial=args.serial, calibration_sha256=digest,
                     intrinsic=k.tolist(), distortion=d.tolist(), sdk=str(ob.__version__), independent_validation=False,
                     selection='model' if selector else 'click', model_id=args.model_id,
+                    automatic_initial_start=startup.pending,
                     vision_profile='standard',
                     model_confidence=model_confidence))
         try:
@@ -418,6 +231,8 @@ def main():
                             session.target = ''
                         recovery.cancel()
                         model_start.cancel()
+                        if startup.runtime:
+                            startup.cancel()
                         last_state_error = str(error)
                         record(dict(type='state_rejected', reason=last_state_error))
                 if session.following and (session.state is None or time.monotonic_ns()-session.state['timestamp_monotonic_ns'] > 200_000_000):
@@ -527,6 +342,15 @@ def main():
                                                     reason=reason, source_capture_monotonic_ns=initial[2],
                                                     current_capture_monotonic_ns=timestamp,
                                                     pixel=result.get('pixel')))
+                            if (0 <= time.monotonic_ns()-timestamp <= 200_000_000
+                                    and startup.queue(
+                                        session, model_start, time.monotonic_ns(),
+                                        selecting=selection_requested or selection_pending or model_catching_up)):
+                                recovery.cancel()
+                                tracker.lose('automatic initial model selection', force=True)
+                                session.target = ''
+                                selection_requested = True
+                                user_notice = 'selecting initial target; follow will start after Robot confirmation'
                             recovery_due = (recovery.ready(session, time.monotonic_ns())
                                             and not session.following
                                             and not tracker.active and not model_catching_up
@@ -534,7 +358,7 @@ def main():
                             if (selection_requested or recovery_due) and not selector.pending:
                                 try:
                                     selector.request(frame, dict(capture_monotonic_ns=frame[2]))
-                                    purpose = 'manual' if selection_requested else 'recovery'
+                                    purpose = ('initial' if startup.pending else 'manual') if selection_requested else 'recovery'
                                     selection_requested = False
                                     selection_pending = True
                                     next_recovery_at = time.monotonic()+.75
@@ -583,10 +407,14 @@ def main():
                     if recovery.waiting:
                         record(dict(type='model_recovery_wait', reason=result.get('reason')))
                         user_notice = 'visual target lost; waiting for Robot Hold and new model center'
+                initial_attempt_running = startup.pending and bool(model_start.runtime)
                 start_packet = model_start.poll(
                     session, result, time.monotonic_ns(),
                     selecting=selection_requested or selection_pending or model_catching_up)
+                if initial_attempt_running and start_packet is None and not model_start.runtime:
+                    startup.failed(time.monotonic_ns())
                 if start_packet is not None:
+                    startup.cancel()
                     recovery.arm(session)
                     publish(COMMAND, start_packet)
                     record(dict(type='model_start', action=start_packet['action'], target_id=session.target))
@@ -622,12 +450,13 @@ def main():
                 cv2.putText(image, 'Robot: '+robot_text[:70], (10,25),0,.45,(0,255,255),1)
                 cv2.putText(image, result.get('reason','')[:80],(10,50),0,.45,(0,0,255),1)
                 cv2.putText(image, user_notice[:85],(10,150),0,.45,(0,165,255),1)
-                instructions = ('b: select + follow | d: select only | p: pause | r: resume | q: exit'
+                instructions = ('auto initial follow | b: reselect + follow | d: select | p: pause | r: resume | q: exit'
                                 if selector else 'click: select | b: begin | p: pause | r: resume | q: exit')
                 cv2.putText(image,instructions,(10,465),0,.45,(255,255,255),1)
                 cv2.imshow(window,image)
                 key = cv2.waitKey(1)&255
                 if key == ord('b') and selector is not None:
+                    startup.cancel()
                     try:
                         if (model_start.runtime or selection_requested or selection_pending
                                 or model_catching_up):
@@ -643,6 +472,7 @@ def main():
                     # Model b is handled asynchronously; never start on the old point.
                     key = -1
                 if key == ord('d') and selector is not None:
+                    startup.cancel()
                     model_start.cancel()
                     if session.following:
                         user_notice = 'pause before selecting another target'
@@ -667,6 +497,7 @@ def main():
                         record(dict(type='selection_rejected',reason=str(error)))
                 if key in (ord('b'),ord('r'),ord('p'),ord('q')):
                     action = {ord('b'):'begin',ord('r'):'resume',ord('p'):'pause',ord('q'):'end'}[key]
+                    startup.cancel()
                     model_start.cancel()
                     try:
                         # Publish initialized observation before begin; never command first.

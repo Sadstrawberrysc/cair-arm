@@ -5,3 +5,6 @@ __pycache__/
 
 # Local camera and robot runtime logs
 /log/
+
+# Detector model cache and local RGB-D samples
+/data/

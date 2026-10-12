@@ -3,4 +3,4 @@ numpy>=1.21
 opencv-python>=4.7
 inference
 # After installing inference, replace its CPU onnxruntime with
-# onnxruntime-gpu==1.20.2; see PROGRESS.md for the CUDA library path.
+# onnxruntime-gpu==1.20.2; see ARCHITECTURE.md for runtime boundaries.

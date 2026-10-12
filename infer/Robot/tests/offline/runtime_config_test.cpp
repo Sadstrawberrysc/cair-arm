@@ -119,8 +119,8 @@ int main() {
                 "ordinary planner keeps its existing joint speed envelope");
     polling.wrist_follow_calibration="wrist.json";
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==50.0, "wrist tracking error uses 50 mm");
-    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==2.0,
-                "wrist follow caps each planned joint at 2 deg/s");
+    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==4.0,
+                "wrist follow caps each planned joint at 4 deg/s");
     ok &= Check(polling.StatePollPeriodMs()==10, "wrist polling uses requested 10 ms period");
     return ok ? 0 : 1;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# No-contact wrist trial. Operator selects the point and presses b/r.
+# No-contact wrist trial. Model mode automatically selects and starts once ready.
 set -euo pipefail
 if (( $# != 0 )); then
   echo 'Usage: bash infer/Camera_wrist/start_robot.sh (no arguments)' >&2
@@ -15,7 +15,7 @@ fi
 mkdir -p -- "$wrist_dir/log"
 run_dir=$(mktemp -d "$wrist_dir/log/wrist_continuous_XXXXXXXX")
 echo "Wrist trial: no force sensor, candidate extrinsic; TCP displacement, total orientation, and TCP position tracking error limits disabled."
-echo "Continuous until Ctrl+C or fault; Hold pauses motion; model selection and b/r still required. Logs: $run_dir"
+echo "Continuous until Ctrl+C or fault; model mode automatically selects the initial target and follows when ready. Limits: 4 mm/s TCP, 4 deg/s orientation/joints. Logs: $run_dir"
 # Export after normal exit or a controller fault, preserving its exit status.
 export_simple_log() {
   if [[ -f "$run_dir/runtime.csv" ]]; then

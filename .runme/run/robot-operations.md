@@ -62,7 +62,21 @@ source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh && conda activate carot
 
 > 视觉窗口按 `t`（结束本轮）或 `q`（terminate 并退出），再在 `main_rm75` 终端按
 > `Ctrl+C`。
-# 腕部投影 observe 扩展（2026-09-15）
+
+## 7. 腕部模型 / 手动选点跟随
+
+合并后的腕部链路使用 `Camera_wrist` 专用相机与 Robot 入口，相机默认模型模式，
+无需传入模型参数。按 Redis → 相机 → Robot 顺序启动，Robot 就绪后自动从新帧
+选取初始目标，观测及目标回传确认有效后请求跟随；`--manual` 保留左键选点及人工开始。
+完整命名单元、开始/暂停/退出及离线检查见
+[腕部启动与运行](camera-wrist-operations.md)，模型配置与服务边界见
+[detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
+
+当前腕部 Robot 专用脚本为无力悬停候选试验；本 notebook 上面的 `start-main-rm75`
+用于超声闭环，腕部操作请使用 `start-wrist-robot` 单元。当前限制与运行状态见
+[腕部进展](../Progress/camera-wrist-progress.md)。
+
+## 历史：腕部投影 observe 扩展（2026-09-15）
 
 新增 `--wrist-projection-calibration FILE --wrist-global-calibration FILE`，
 仅允许与 `--observe`、启用 Redis、`--publish-every 1` 或 `2` 一起使用。
@@ -72,11 +86,11 @@ source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh && conda activate carot
 完整先后顺序、硬件运行前置条件与相机入口见
 [腕部投影操作说明](camera-wrist-operations.md)。
 
-## 腕部点击跟随模式（2026-09-16）
+## 历史：腕部点击跟随模式（2026-09-16）
 
-最小联动入口改为 Gemini 画面左键点击，不需要全局相机、数字人或60秒seed。
-完整独立观察、Redis观察、dry-run和有条件执行命令见
-[腕部点击启动说明](camera-wrist-operations.md)，
+当时的最小联动入口改为 Gemini 画面左键点击，不需要全局相机、数字人或60秒seed。
+下面记录原始显式模式的设计边界；当前默认模型 / 手动入口见
+[腕部启动说明](camera-wrist-operations.md)，
 [接口](../../infer/Camera_wrist/ARCHITECTURE.md)。
 Robot 显式参数为 `--wrist-follow FILE --publish-every 1`，结合 `--observe` 或
 `--dry-run-control`；纯离线测试使用 `--simulate --redis-enabled`。

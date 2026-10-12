@@ -126,7 +126,7 @@ try:
  assert state['follow_state']=='hold','pause not held'
  if args.auto_recovery:
   sys.path.insert(0,str(ROOT/'infer/Camera_wrist'))
-  from click_follow import ClickSession, ModelRecovery
+  from follow_session import ClickSession, ModelRecovery
   camera=ClickSession(state['calibration_sha256']);camera.accept_state(state,time.monotonic_ns())
   camera.select(); recovery=ModelRecovery(); auto_resumes=[]
   def camera_pump(seconds,valid=True):

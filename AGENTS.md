@@ -10,7 +10,8 @@
 
 - `infer/Robot/`：机器人控制与通信；入口为 `src/main_rm75.cpp`。
 - `intergrate_infer/`：在线超声推理；主入口为 `main_redis_seg_newphase_recovery_mode.py`。
-- `infer/Camera_RT/`：全局相机与粗定位；`infer/Camera_wrist/`：腕部相机与追踪。
+- `infer/Camera_RT/`：全局相机与粗定位；`infer/Camera_wrist/`：腕部相机、模型/手动选点与追踪，
+  `detector/` 子包负责模型服务。
 - `infer/hand_eye_calibration-main/`：手眼标定。
 - `infer/ContactPointShow/`、`infer/SensorMonitor/`：接触点与传感器辅助程序。
 - `scan_pilot/`、`pose_pilot/`、`segmentation/`、`encoder_pretrain/`：训练与实验。

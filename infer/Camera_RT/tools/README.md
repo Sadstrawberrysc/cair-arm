@@ -73,6 +73,15 @@ NVIDIA 模块。D455 已有 `/etc/udev/rules.d/99-realsense-libusb.rules`，产�
 python -m unittest tools/test_path_format.py
 ```
 
+采样顺序和深度反投影回归检查（不导入相机 / GPU 驱动、不连接设备）：
+
+```bash
+python -m unittest tools/test_sample_order.py tools/test_depth_projection.py
+```
+
+深度测试覆盖 Z16 米制转换、深度孔洞最近补点、全零深度拒绝和图像边界索引；
+不代表模型定位、深度补点或输出坐标已通过现场精度验收。
+
 `fixtures/` 中两份文件来自旧机器，只用于刻画格式。第一行是单位法向量，后续行是三维点。
 测试只检查三列有限数值和基本结构，不认可其空间坐标，也不比较两份文件数值。
 

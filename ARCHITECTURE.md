@@ -12,7 +12,9 @@
   沿目标 Tool -Z 后退 50 mm → `arm_probe_pose` 换算 Probe TCP 并调用控制器 MoveJ_P。
 - **腕部跟随**：`Camera_wrist/click_follow.py` 发布 RGB-D 追踪观测和请求 → Redis →
   Robot 按采集时刻转换坐标 → `WristFollowController` → 原 planner 与运动发送链。
-  Robot 回传相机位姿和请求确认；`projection_preview.py` 另支持全局种子投影与追踪预览。
+  默认模型模式由 `Camera_wrist/detector/` 子进程提供检测框中心，`--manual` 切换鼠标选点；
+  模型模式在 Robot 就绪后自动初始选点，通过有效观测和目标回传确认后请求跟随。Robot 回传相机位姿和请求确认；
+  `projection_preview.py` 另支持全局种子投影与追踪预览。
 - **超声设备/UI**：`py-xiaokai` → Redis → `SonoScape_api/redis_service.py` → 超声主机。
 
 ## 接口与计算
@@ -45,7 +47,9 @@ Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日�
 
 ## 详细架构文档
 
-- [无标记初始扫描点定位 Carotid_begin](infer/Carotid_begin/ARCHITECTURE.md)：Roboflow 模型实时腕部 RGB-D 检测与本地画框；本机 [最简启动](.runme/run/carotid-begin-operations.md)与[进展记录](.runme/Progress/carotid-begin-progress.md)。
+- [腕部模型服务 detector](infer/Camera_wrist/detector/ARCHITECTURE.md)：Roboflow 模型加载、单帧检测、配置与私有协议；
+  [最简启动](.runme/run/carotid-begin-operations.md)与[模型进展及历史](.runme/Progress/carotid-begin-progress.md)。
+  原 `Carotid_begin` 已并入 `Camera_wrist`，历史记录保留原名称。
 
 - [Robot](infer/Robot/ARCHITECTURE.md)、[超声推理](intergrate_infer/ARCHITECTURE.md)、
   [全局相机](infer/Camera_RT/ARCHITECTURE.md)、[传感器监视](infer/SensorMonitor/ARCHITECTURE.md)

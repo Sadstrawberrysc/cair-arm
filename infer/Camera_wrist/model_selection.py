@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from infer.Carotid_begin.live_protocol import pack_frame, recv_exact
+from infer.Camera_wrist.detector.protocol import MAX_READY, MAX_RESPONSE, pack_frame, recv_exact
 
 DEFAULT_DETECTOR_PYTHON = Path('/home/cair-jacen/anaconda3/envs/ultralytics/bin/python')
 DEFAULT_MKL_CORE = Path('/home/cair-jacen/anaconda3/pkgs/mkl-2023.1.0-h213fc3f_46344/lib/libmkl_core.so.2')
@@ -45,7 +45,7 @@ class ModelSelector:
         parent, child = socket.socketpair()
         self.socket = parent
         self.socket.settimeout(15)
-        command = [str(python), '-m', 'infer.Carotid_begin.model_worker',
+        command = [str(python), '-m', 'infer.Camera_wrist.detector.worker',
                    '--socket-fd', str(child.fileno()), '--model-id', model_id,
                    '--class-name', class_name, '--min-confidence', str(confidence),
                    '--margin', str(margin)]
@@ -59,7 +59,7 @@ class ModelSelector:
         try:
             self.socket.settimeout(60)
             length = struct.unpack('!I', recv_exact(self.socket, 4))[0]
-            if not 0 < length <= 4096:
+            if not 0 < length <= MAX_READY:
                 raise ValueError('invalid model worker readiness response')
             ready = json.loads(recv_exact(self.socket, length))
             if ready != {'ready': True, 'model_id': model_id}:
@@ -92,7 +92,7 @@ class ModelSelector:
             try:
                 self.socket.sendall(payload)
                 length = struct.unpack('!I', recv_exact(self.socket, 4))[0]
-                if not 0 < length <= 65536:
+                if not 0 < length <= MAX_RESPONSE:
                     raise ValueError('invalid model response size')
                 response = json.loads(recv_exact(self.socket, length))
                 self.results.put((frame, response, None))

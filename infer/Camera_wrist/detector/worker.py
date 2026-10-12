@@ -1,13 +1,12 @@
 """Persistent private-socket model worker for Camera_wrist model selection."""
 import argparse
 import os
-from pathlib import Path
 import socket
 
-from .config import ModelConfig
+from .config import DEFAULT_MODEL_CACHE, ModelConfig
 from .credentials import get_api_key
 from .gpu_model import load_cuda_model
-from .live_protocol import MAX_READY, send_json, unpack_frame
+from .protocol import MAX_READY, send_json, unpack_frame
 from .pipeline import DetectionPipeline
 
 
@@ -52,7 +51,7 @@ def main(argv=None):
         key = get_api_key()
         if not key:
             raise ValueError('Roboflow API Key missing; save it with credentials.py')
-        os.environ.setdefault('MODEL_CACHE_DIR', str(Path(__file__).parent / 'data/model_cache'))
+        os.environ.setdefault('MODEL_CACHE_DIR', str(DEFAULT_MODEL_CACHE))
         model = load_cuda_model(config.model_id, key)
         serve(sock, DetectionPipeline(model, config))
 

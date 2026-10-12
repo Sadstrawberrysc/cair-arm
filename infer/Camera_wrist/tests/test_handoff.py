@@ -70,6 +70,10 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(calls[1][3],60)
         pose=np.fromstring(commands[1][commands[1].index("--target-pose-m-rad")+1],sep=",")
         np.testing.assert_allclose(pose[:3],[.1,.2,.95])
+        # +X now follows the vessel: this fixture must send zero Euler angles
+        # rather than the former pi yaw, and publish the same corrected frame.
+        np.testing.assert_allclose(pose[3:], [0., 0., 0.], atol=1e-9)
+        np.testing.assert_allclose(seed["initial_tool_rotation_base"], np.eye(3), atol=1e-9)
 
     def test_dry_run_never_publishes(self):
         calls,commands,result,error=self.exercise(dry_run=True)
@@ -92,6 +96,40 @@ class HandoffTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual([c[0] for c in calls],["delete"])
         self.assertEqual(len(commands),2)
+
+
+class ShortAxisRotationTests(unittest.TestCase):
+    def test_oblique_frame_is_half_turn_about_local_z(self):
+        inward = np.array([1., 2., 3.])
+        tangent = np.array([4., -2., 1.])
+        z = inward / np.linalg.norm(inward)
+        projected = tangent - np.dot(tangent, z) * z
+        old_x = -projected / np.linalg.norm(projected)
+        old_frame = np.column_stack((old_x, np.cross(z, old_x), z))
+        rotation = launcher.short_axis_rotation(inward, tangent)
+        np.testing.assert_allclose(old_frame.T @ rotation,
+                                   np.diag([-1., -1., 1.]), atol=1e-12)
+        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(np.linalg.det(rotation), 1.)
+        surface = np.array([.2, -.3, .6])
+        np.testing.assert_allclose(surface + launcher.INITIAL_TOOL_Z_OFFSET_M * rotation[:, 2],
+                                   surface - .05 * z, atol=1e-12)
+
+    def test_controller_euler_preserves_corrected_oblique_frame(self):
+        rotation = launcher.short_axis_rotation(np.array([1., 2., 3.]),
+                                               np.array([4., -2., 1.]))
+        rx, ry, rz = launcher.controller_euler(rotation)
+        cx, cy, cz = np.cos([rx, ry, rz])
+        sx, sy, sz = np.sin([rx, ry, rz])
+        rebuilt = (np.array([[cz, -sz, 0.], [sz, cz, 0.], [0., 0., 1.]])
+                   @ np.array([[cy, 0., sy], [0., 1., 0.], [-sy, 0., cy]])
+                   @ np.array([[1., 0., 0.], [0., cx, -sx], [0., sx, cx]]))
+        np.testing.assert_allclose(rebuilt, rotation, atol=1e-12)
+
+    def test_degenerate_tangent_still_rejected(self):
+        with self.assertRaises(ValueError):
+            launcher.short_axis_rotation(np.array([0., 0., 1.]),
+                                         np.array([0., 0., -1.]))
 
 
 if __name__ == "__main__":

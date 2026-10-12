@@ -1,6 +1,11 @@
 """Validated model settings shared by the CLI and single-frame inference."""
 from dataclasses import dataclass
 import math
+from pathlib import Path
+
+
+DEFAULT_MODEL_ID = 'songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1'
+DEFAULT_MODEL_CACHE = Path(__file__).resolve().parents[1] / 'data' / 'model_cache'
 
 
 @dataclass(frozen=True)

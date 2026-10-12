@@ -3,7 +3,36 @@
 > 本文件是纳入 Git 的 Runme notebook；当前架构见
 > `infer/Camera_RT/ARCHITECTURE.md`。
 
-更新日期：2026-09-15
+更新日期：2026-10-12
+
+## 2026-10-12 初始末端朝向旋转 180°
+
+按用户反馈，`run_probe_target.py` 将 Tool +X 沿顶部首点到后续点的投影切向，
+相对原 -X 对齐绕局部 Tool Z 旋转 180°。Tool +Z 朝内与后退 50 mm 的目标位置不变，
+控制器欧拉角和可选腕部投影 seed 同步使用修正后的姿态；启动命令保持不变。
+12 项相机离线测试与 8 项模拟交接/姿态测试通过，覆盖斜向法向下的局部 Z 半圈旋转、
+位置不变、欧拉角还原及 seed 朝向一致。本轮未采集真实相机或执行机械臂运动。
+
+## 2026-10-12 初始点改为画面最上方
+
+按用户要求，采样像素改为 y 从小到大稳定排序；新快照第二行是最上方采样点，
+法向在该点邻域计算，下游切向从该点指向后续首个非重复点。
+机械臂仍读取本轮新快照的首点生成初始位姿，启动命令保持不变。
+此前“最下方首点”的记录保留为历史。
+12 项相机离线测试与 5 项模拟下游交接测试通过，含图像最上方点与三维 Y 最小点
+不一致的回归场景；本轮未采集真实相机或执行机械臂运动。
+
+## 2026-10-12 启动报错修复
+
+- 本机 OpenCV 为 5.0.0，`findNonZero` 返回 `N×2`，旧代码的三维索引导致退出。
+  深度补点改用 NumPy 行列坐标，补齐上下界裁剪，全零深度明确拒绝生成目标。
+- OpenCV 普通窗口配合停用输入法 / XCB GL 插件，避免混入 Conda Qt 5.15.2；
+  缺失的 wheel 字体目录改用系统字体。宿主两个空白窗口测试通过，只加载一套 Qt，
+  `QObject::moveToThread` 和字体警告均为零。
+- 渲染分桶容量设为单个网格的全部面数。CPU 与宿主 GPU 的 10,001 面合成网格
+  渲染检查通过；路径格式、采样顺序、深度反投影共 11 项离线测试通过。
+- 启动命令保持 `python infer/hand_eye_calibration-main/run_probe_target.py`。
+  本轮未采集真实相机画面、未连接或运动机械臂，完整现场流程仍待复验。
 
 ## 当前结论
 
@@ -73,8 +102,7 @@ SDK `camera_info.serial_number` 为运行身份，同时保留 USB descriptor se
 
 - 入口计算了 `device`，但多个模型和张量仍硬编码 `.cuda()`。
 - 未检测到人体时没有可靠的 `bbox is None` 分支。
-- 像素裁剪只限制上界，负坐标可能错误索引深度图。
-- 深度全部为零时，最近非零深度搜索可能失败。
+- 深度全部为零时明确报错退出，尚未实现无效深度帧的在线恢复。
 - 路径输出没有时间戳、设备身份、内参摘要、置信度或坐标 schema 版本。
 - `artery_path_rbt.txt` 没有当前生成器，历史含义不可信。
 
@@ -85,7 +113,7 @@ source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
 conda activate camera
 cd /home/cair-jacen/uspilot_ctrl-main/infer/Camera_RT
 python tools/preflight.py --static
-python -m unittest tools/test_path_format.py
+python -m unittest tools/test_path_format.py tools/test_sample_order.py tools/test_depth_projection.py
 python tools/preflight.py --runtime
 ```
 

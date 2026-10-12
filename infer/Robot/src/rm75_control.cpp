@@ -1286,12 +1286,12 @@ WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
     out.actual_gap_m = (in.actual_tcp.topRightCorner<3,1>() - in.surface_base).dot(n);
     Eigen::Vector3d delta = out.tcp_goal.topRightCorner<3,1>() - reference_.topRightCorner<3,1>();
     const double distance = delta.norm();
-    if (distance > .002*in.cycle_s) delta *= .002*in.cycle_s/distance;
+    if (distance > .004*in.cycle_s) delta *= .004*in.cycle_s/distance;
     out.tcp_reference = reference_;
     out.tcp_reference.topRightCorner<3,1>() += delta;
     Eigen::Quaterniond current(reference_.topLeftCorner<3,3>()), desired(rotation);
     const double angle = current.angularDistance(desired);
-    const double fraction = angle < 1e-12 ? 1. : std::min(1., (2.*M_PI/180.)*in.cycle_s/angle);
+    const double fraction = angle < 1e-12 ? 1. : std::min(1., (4.*M_PI/180.)*in.cycle_s/angle);
     out.tcp_reference.topLeftCorner<3,3>() = current.slerp(fraction, desired).normalized().toRotationMatrix();
     out.following = true; return out;
 }

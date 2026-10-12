@@ -157,8 +157,8 @@ int main() {
                     "real tilt beyond deadband updates orientation goal");
         const double angle_step = Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
             Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()));
-        ok &= Check(angle_step > 0.0 && angle_step <= 2.*M_PI/180.*input.cycle_s+1e-12,
-                    "filtered orientation advances within 2 deg/s bound");
+        ok &= Check(std::abs(angle_step-4.*M_PI/180.*input.cycle_s) < 1e-12,
+                    "filtered orientation advances at 4 deg/s for a distant goal");
     }
 
     WristFollowController wrist;
@@ -170,9 +170,8 @@ int main() {
     ok &= Check(wo.following && wo.reference_reset, "wrist explicit begin resets measured reference");
     ok &= Check((wo.tcp_goal.topRightCorner<3,1>()-Eigen::Vector3d(.01,0,.05)).norm()<1e-12,
                 "wrist adds exactly 50 mm outward");
-    ok &= Check(wo.tcp_reference.topRightCorner<3,1>().norm()>0.0
-                    && wo.tcp_reference.topRightCorner<3,1>().norm()<=.000020001,
-                "wrist TCP reference speed at most 2 mm/s");
+    ok &= Check(std::abs(wo.tcp_reference.topRightCorner<3,1>().norm()-.004*wi.cycle_s)<1e-12,
+                "wrist TCP reference advances at 4 mm/s for a distant goal");
     ok &= Check((wo.tcp_goal.topLeftCorner<3,3>().col(2)-Eigen::Vector3d(0,0,1)).norm()<1e-12,
                 "wrist Tool Z points inward");
     wrist.Commit(wo.tcp_reference);
@@ -192,7 +191,7 @@ int main() {
     wi.normal_base=Eigen::Vector3d(.1,0,-1).normalized();
     wo=wrist.Step(wi);
     ok &= Check(wo.following && Eigen::AngleAxisd(wo.tcp_reference.topLeftCorner<3,3>()).angle()
-                <=2.*M_PI/180.*.01+1e-9, "angular reference limited to 2 deg/s");
+                <=4.*M_PI/180.*.01+1e-9, "angular reference limited to 4 deg/s");
     wrist.Hold("planner_rejected");
     ok &= Check(!wrist.Step(wi).following, "planner rejection is latched");
     wi.normal_base=Eigen::Vector3d(1,0,0); wi.target_id="degenerate";

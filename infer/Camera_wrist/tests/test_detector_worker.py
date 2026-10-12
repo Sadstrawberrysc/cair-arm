@@ -2,21 +2,28 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import socket
 import struct
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from infer.Carotid_begin.config import ModelConfig
-from infer.Carotid_begin.live_protocol import (
+from infer.Camera_wrist.detector.config import ModelConfig
+from infer.Camera_wrist.detector.protocol import (
     MAX_PAYLOAD, pack_frame, recv_exact, send_json, unpack_frame,
 )
-from infer.Carotid_begin.model_worker import parse_args, serve
-from infer.Carotid_begin.pipeline import DetectionPipeline
+from infer.Camera_wrist.detector.worker import parse_args, serve
+from infer.Camera_wrist.detector.pipeline import DetectionPipeline
+from infer.Camera_wrist import model_selection
 
 
 def native_response(count=1, x=16):
@@ -93,6 +100,65 @@ class ModelWorkerTests(unittest.TestCase):
             finally:
                 client.shutdown(socket.SHUT_WR)
             task.result(timeout=3)
+
+    def test_selector_subprocess_uses_migrated_worker_and_roundtrips_capture(self):
+        """Run the real worker CLI/socket loop with an offline model substitute."""
+        child_code = textwrap.dedent('''
+            from types import SimpleNamespace
+            from infer.Camera_wrist.detector import worker
+
+            class OfflineModel:
+                def infer(self, image, confidence):
+                    assert image.shape == (32, 32, 3)
+                    assert confidence == .4
+                    return [SimpleNamespace(
+                        image=SimpleNamespace(width=32, height=32),
+                        predictions=[SimpleNamespace(x=16, y=16, width=8, height=10,
+                                                     confidence=.9, class_name='carotid')])]
+
+            worker.get_api_key = lambda: 'offline-test-key'
+            worker.load_cuda_model = lambda model_id, key: OfflineModel()
+            worker.main()
+        ''')
+        real_popen = subprocess.Popen
+        commands = []
+
+        def launch_offline_worker(command, **kwargs):
+            commands.append(command)
+            self.assertEqual(command[:3], [sys.executable, '-m',
+                                           'infer.Camera_wrist.detector.worker'])
+            # Preserve CLI options, cwd, environment, and inherited socket descriptor.
+            return real_popen([sys.executable, '-c', child_code, *command[3:]], **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake_torch_lib = Path(directory) / 'torch' / 'lib'
+            fake_torch_lib.mkdir(parents=True)
+            with patch.object(Path, 'glob', return_value=[fake_torch_lib]), \
+                    patch.object(model_selection.subprocess, 'Popen',
+                                 side_effect=launch_offline_worker):
+                selector = model_selection.ModelSelector(
+                    sys.executable, 'test/model', 'carotid', .4, 0,
+                    mkl_core=Path(directory) / 'missing-mkl', inference_confidence=.4)
+            try:
+                for _ in range(2):
+                    stamp = time.monotonic_ns()
+                    frame = (self.image, self.depth, stamp)
+                    selector.request(frame, {'capture_monotonic_ns': stamp})
+                    # Await the exchange thread without busy polling or fixed sleeps.
+                    completed = selector.results.get(timeout=5)
+                    selector.results.put(completed)
+                    source, buffered, result, error = selector.poll()
+                    self.assertIs(source, frame)
+                    self.assertEqual(buffered, [])
+                    self.assertIsNone(error)
+                    self.assertTrue(result['valid'])
+                    self.assertEqual(result['capture_monotonic_ns'], stamp)
+                    self.assertEqual(result['prediction']['scan_start'], [16., 16.])
+                    self.assertFalse(selector.pending)
+            finally:
+                selector.close()
+        self.assertEqual(len(commands), 1)
+        self.assertIn('--inference-confidence', commands[0])
 
     def test_metadata_is_checked_on_send_and_receive(self):
         for meta in [{}, [], {'capture_monotonic_ns': True}, {'capture_monotonic_ns': -1}]:
