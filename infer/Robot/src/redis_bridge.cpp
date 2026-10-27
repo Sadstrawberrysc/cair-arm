@@ -532,6 +532,7 @@ std::string RedisBridge::BuildSensorV1Json(const RedisSensorMessage& message) {
     output["valid"] = message.wrench_valid;
     output["sensor"] = {
         {"checksum_valid", message.checksum_valid},
+        {"checksum_available", message.checksum_available},
         {"stale", message.sensor_stale},
         {"io_status", message.sensor_io_status},
         {"io_error", message.sensor_io_error}};

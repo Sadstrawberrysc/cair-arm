@@ -5,7 +5,7 @@
 ## 主要链路
 
 - **超声闭环**：`intergrate_infer/main_redis_seg_newphase_recovery_mode.py` → Redis →
-  `infer/Robot/src/main_rm75.cpp` → RM75。Robot 融合机械臂状态与 Haptron 力数据，
+  `infer/Robot/src/main_rm75.cpp` → RM75。Robot 融合机械臂状态与 KWR57 力数据（兼容 Haptron），
   在 10 ms 周期内执行接触估计、控制计算、七轴 IK 与 ServoJ。
 - **全局初始定位**：`Camera_RT/cliff_demo.py` 保存左颈动脉相机坐标快照 →
   `hand_eye_calibration-main/run_probe_target.py` 用 D455 外参转换首点、构造短轴姿态，
@@ -46,6 +46,9 @@ Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日�
 禁止使用 `runme run --all`。
 
 ## 详细架构文档
+
+- [KWR57 ROS 2 Jazzy 驱动](ros2_ws/src/kwr57_driver/README.md)：独立串口采集，直接发布原始 SI
+  `WrenchStamped`；默认 `/kwr57/wrench`，不依赖 Redis/GUI。
 
 - [腕部模型服务 detector](infer/Camera_wrist/detector/ARCHITECTURE.md)：Roboflow 模型加载、单帧检测、配置与私有协议；
   [最简启动](.runme/run/carotid-begin-operations.md)与[模型进展及历史](.runme/Progress/carotid-begin-progress.md)。

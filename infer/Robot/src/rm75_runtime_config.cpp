@@ -24,12 +24,13 @@ RobotRuntimeConfig MakeImplicitRm75ProductionConfig(
     config.redis_enabled = true;
     config.robot_ip = "192.168.50.254";
     config.robot_port = 8080;
-    config.sensor_device =
-        "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0";
-    config.sensor_baud = 115200;
+    config.sensor_device = "/dev/ttyUSB0";
+    config.sensor_protocol = ForceSensorProtocol::kKwr57Rs422;
+    config.sensor_baud = 460800;
     config.calibration_path =
-        (directory / "rm75_force_calibration.json").string();
-    config.expected_sensor_id = "DU0DU5LC";
+        (directory / "kwr57_force_calibration.json").string();
+    // User-assigned calibration identity; the protocol exposes no hardware ID.
+    config.expected_sensor_id = "KWR57";
     config.probe_model_path =
         (directory / "../model/Lprobe-IFS.STL").lexically_normal().string();
     config.duration_s = 0;

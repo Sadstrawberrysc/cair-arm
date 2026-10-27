@@ -1,7 +1,7 @@
 # RM75 控制服务架构
 
 本文依据 **2026-10-02 当前工作区源码**，说明实际入口、线程边界、数据协议与停止路径。
-Robot 装配七轴反馈、Haptron 力觉、标定、接触估计、Redis 视觉意图、控制律、规划和日志；
+Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估计、Redis 视觉意图、控制律、规划和日志；
 唯一生产可执行文件为 `main_rm75`。历史六轴源码不在当前 CMake 构建链中。
 
 ## 运行模式与实现边界
@@ -21,9 +21,10 @@ Robot 装配七轴反馈、Haptron 力觉、标定、接触估计、Redis 视觉
 | 离线 parser / 控制 / 规划 / schema 检查 | 已实现，见 [构建与验证](#构建与验证) | 不能代替力准确度、动态定位、实体净空与停止验收 |
 | 接触超声与腕部无力悬停自动交接 | 当前未实现 | 规划扩展，不在当前入口状态机中 |
 
-无参数 profile 当前固定 RM75 `192.168.50.254:8080`、FTDI by-id 串口
-`DU0DU5LC`（115200 baud）、本机 Redis `127.0.0.1:7777`；标定文件从可执行文件目录
-读取 `rm75_force_calibration.json`，Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。
+无参数 profile 当前固定 RM75 `192.168.50.254:8080`、KWR57 RS422 串口
+`/dev/ttyUSB0`（460800 baud）、本机 Redis `127.0.0.1:7777`；标定文件从可执行文件目录
+读取 `kwr57_force_calibration.json`，标定身份为用户赋予的 `KWR57`（不是设备读回的序列号），
+Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。新标定文件尚需实际采集生成，不复用旧传感器标定。
 控制周期 10 ms、执行预热 2 s、无接触 tare 3 s、duration=0。
 Redis `terminate` 结束一轮扫描并返回 Armed idle，进程继续等待下一轮；正在执行的目标力卸载先完成卸载 / 制动。
 退出由停止信号、故障或配置时限触发。
@@ -37,7 +38,7 @@ Redis `terminate` 结束一轮扫描并返回 Armed idle，进程继续等待下
 flowchart TB
     RM["RM75 控制器"] <--> IO["transport I/O owner<br/>JSON-over-TCP、Stop 优先、ServoJ 单槽"]
     IO --> ST["RMStateReader<br/>最新七轴与 ArmTip 反馈"]
-    SENSOR["Haptron 串口"] --> FS["ForceSensorReader<br/>最新 SI wrench"]
+    SENSOR["KWR57 / Haptron 串口"] --> FS["ForceSensorReader<br/>最新 SI wrench"]
     REDIS["本机 Redis :7777"] <--> BR["RedisBridge<br/>订阅快照 / 后台发布"]
     CAL["Tool / Sensor / Camera 标定"] --> FRAME["CalibratedFrameChain"]
     ST --> LOOP["main_rm75 周期编排<br/>快照、安全与时效检查"]
@@ -58,7 +59,7 @@ flowchart TB
 | 模块 / 源码 | 公共接口 | 职责与依赖 |
 | --- | --- | --- |
 | [realman_transport](src/realman_command.cpp) | `RMCommand`、`RMStateReader`、`RMResult`、`BestEffortStopGuard` | 连接、JSON framing、反馈快照、异步 ServoJ 与确认 Stop；Threads、nlohmann/json |
-| [robot_sensor](src/force_sensor.cpp)、[contact_sensing](src/contact_sensing.cpp) | `ForceSensorReader`、`ForceCalibration`、`ContactLocation` | Modbus / legacy parser、SI 样本、重力 / tare 补偿、STL 接触估计；Threads、OpenSSL、Eigen |
+| [robot_sensor](src/force_sensor.cpp)、[contact_sensing](src/contact_sensing.cpp) | `ForceSensorReader`、`ForceCalibration`、`ContactLocation` | KWR57 / Modbus / legacy parser、SI 样本、重力 / tare 补偿、STL 接触估计；Threads、OpenSSL、Eigen |
 | [rm75_motion](src/rm75_control.cpp)、[kinematics](src/realman_kinematics.cpp) | `Rm75ControlLaw`、`WristFollowController`、`Rm75ServoPlanner`、`RMKinematics` | 控制状态与参考；planner 负责 IK / 安全规划，kinematics 提供七轴 FK / 6×7 Jacobian；Eigen |
 | [rm75_runtime_config](src/rm75_runtime_config.cpp) | `RobotRuntimeConfig`、profile 工厂、校验 | 配置装配及 `EffectiveSafety()` / `EffectivePlanner()`；依赖 motion |
 | [rm75_frame_chain](src/calibrated_frame_chain.cpp) | `CalibratedFrameChain`、`StopAndConfirmStationary()` | 不可变坐标链、相机位姿插值和 Probe TCP 静止确认；transport、sensor、Eigen |
@@ -368,3 +369,21 @@ ctest --test-dir infer/Robot/build --output-on-failure
 本轮只进行源码、文档链接、表格 / 图结构与差异检查，未执行编译、CTest 或实际设备运行。
 `build/` 中二进制、标定副本与日志是运行产物；有效运行配置、丢行数和最终停止结果以该次
 CSV / summary 为准，后续离线回放可复用无 I/O 控制与规划模块，完整回放工具尚未在此入口实现。
+
+## 2026-10-26 KWR57 RS422 适配
+
+默认协议改为 `kwr57-rs422`、460800/8N1、关闭流控。启动发送 `48 AA 0D 0A`，
+退出时有界尝试发送 `43 AA 0D 0A`；500 Hz 数据只更新最新快照，控制周期仍为 10 ms。
+解析器按 28 字节检查 `48/49 AA` 帧头、固定位置 CRLF、有限数值，支持拆包、粘包及噪声重同步；
+缓存最多 28 字节。六个小端 float32 按手册 kgf/kgf·m 解释，均乘 9.80665 转为 SI。
+
+KWR57 没有 CRC，`WrenchSample.checksum_available=false`、`checksum_valid=false`；
+`IntegrityValid()` 根据协议接受有效完整帧，旧协议仍要求 checksum。Redis v1 的
+`sensor.checksum_available` 是向后兼容的新增字段，旧消息缺失时监视器仍要求 checksum。
+CSV v2 列保持不变，KWR57 的 checksum 列为 false；summary 的 control 中补充协议、波特率
+和 checksum_available 信息。未知具体型号时，有效原始力矩门取原配置与 2 N·m 的较小值，
+原始力门仍为 50 N。传感器量程、无校验和的局限与接线见
+[KWR57 接入说明](../../docs/kwr57_sensor_integration.md)。
+
+`--sensor-protocol haptron-modbus` / `legacy-aa55` 保留旧协议，未指定波特率时自动使用 115200。
+标定采集工具同步支持 `--sensor-protocol`，输出 CSV 已经是 N、N·m，拟合时不应再次换算。

@@ -35,7 +35,8 @@ struct Options {
     std::string robot_ip;
     int robot_port = 8080;
     std::string sensor_device;
-    unsigned int sensor_baud = 115200;
+    unsigned int sensor_baud = 460800;
+    ForceSensorProtocol sensor_protocol = ForceSensorProtocol::kKwr57Rs422;
     std::string output_path;
     Eigen::Vector3d sensor_to_tool_rpy_deg = Eigen::Vector3d::Zero();
     bool sensor_to_tool_rpy_set = false;
@@ -56,7 +57,7 @@ void Usage(const char* program) {
         << "Interactively capture synchronized RM75 pose + raw wrench rows for\n"
         << "force_sensor_calibrate. This program is read-only and never sends\n"
         << "MoveJ, ServoJ, Hold or Stop commands.\n\n"
-        << "The force sensor uses Haptron Modbus RTU read-only queries.\n\n"
+        << "KWR57 uses stream start/stop commands; no robot motion is commanded.\n\n"
         << "Required:\n"
         << "  --robot-ip IP\n"
         << "  --sensor-device PATH\n"
@@ -65,7 +66,8 @@ void Usage(const char* program) {
         << "  --output FILE\n\n"
         << "Options:\n"
         << "  --robot-port PORT          default 8080\n"
-        << "  --sensor-baud BAUD         default 115200\n"
+        << "  --sensor-protocol NAME     kwr57-rs422 (default), haptron-modbus, legacy-aa55\n"
+        << "  --sensor-baud BAUD         default 460800 for KWR57, 115200 otherwise\n"
         << "  --poses N                  default 8, minimum 6\n"
         << "  --samples-per-pose N       default 20, minimum 5\n"
         << "  --capture-timeout-sec SEC  default 10\n"
@@ -114,6 +116,7 @@ bool ParseVector3(const std::string& text, Eigen::Vector3d& value) {
 }
 
 bool ParseOptions(int argc, char** argv, Options& options) {
+    bool sensor_baud_explicit = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
@@ -141,6 +144,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.sensor_device = value;
         } else if (argument == "--output") {
             options.output_path = value;
+        } else if (argument == "--sensor-protocol") {
+            if (!ParseForceSensorProtocol(value, options.sensor_protocol)) return false;
         } else if (argument == "--sensor-to-tool-rpy-deg") {
             if (!ParseVector3(value, options.sensor_to_tool_rpy_deg)) return false;
             options.sensor_to_tool_rpy_set = true;
@@ -157,6 +162,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
                 return false;
             }
             options.sensor_baud = static_cast<unsigned int>(integer);
+            sensor_baud_explicit = true;
         } else if (argument == "--poses") {
             if (integer < 6 || integer > 100) return false;
             options.pose_count = static_cast<int>(integer);
@@ -184,6 +190,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         }
     }
 
+    if (!sensor_baud_explicit) options.sensor_baud = DefaultForceSensorBaud(options.sensor_protocol);
     if (options.robot_ip.empty()
         || options.robot_ip.size() > RMConnectionConfig::kMaximumIpv4TextLength
         || options.sensor_device.empty() || options.output_path.empty()
@@ -199,7 +206,7 @@ bool ParseOptions(int argc, char** argv, Options& options) {
     return true;
 }
 
-bool RawWrenchWithinLimits(const WrenchSample& sample) {
+bool RawWrenchWithinLimits(const WrenchSample& sample, ForceSensorProtocol protocol) {
     for (std::size_t axis = kForceX; axis <= kForceZ; ++axis) {
         if (!std::isfinite(sample.wrench_si[axis])
             || std::abs(sample.wrench_si[axis]) > kRawForceLimitN) {
@@ -208,7 +215,8 @@ bool RawWrenchWithinLimits(const WrenchSample& sample) {
     }
     for (std::size_t axis = kTorqueX; axis <= kTorqueZ; ++axis) {
         if (!std::isfinite(sample.wrench_si[axis])
-            || std::abs(sample.wrench_si[axis]) > kRawTorqueLimitNm) {
+            || std::abs(sample.wrench_si[axis]) >
+                (protocol == ForceSensorProtocol::kKwr57Rs422 ? 2.0 : kRawTorqueLimitNm)) {
             return false;
         }
     }
@@ -225,8 +233,7 @@ void WriteCsvHeader(std::ostream& output,
            << "# sensor_device=" << options.sensor_device
            << "; sensor_baud=" << options.sensor_baud
            << "; sensor_protocol="
-           << ForceSensorProtocolName(
-                  ForceSensorProtocol::kHaptronModbusRtu)
+           << ForceSensorProtocolName(options.sensor_protocol)
            << '\n'
            << "# sensor_to_tool_rpy_deg="
            << FormatForceCalibrationCaptureRpyDeg(
@@ -287,7 +294,7 @@ bool WaitForInitialData(ForceSensorReader& sensor,
            && std::chrono::steady_clock::now() < deadline) {
         const WrenchSample wrench = sensor.LatestSample();
         const RobotStateSnapshot state = robot.Latest();
-        if (wrench.valid && !wrench.stale && wrench.checksum_valid
+        if (wrench.IntegrityValid() && !wrench.stale
             && wrench.io_status == ForceSensorIoStatus::kStreaming
             && wrench.io_error == 0 && state.valid && !state.stale
             && state.arm_err == 0 && state.sys_err == 0) {
@@ -351,8 +358,10 @@ ForceCalibrationCaptureResult CapturePoseWindow(
             collection_error = "robot state reader failed: " + robot_result.message;
             break;
         }
-        if (!RawWrenchWithinLimits(wrench)) {
-            collection_error = "raw wrench exceeded 50 N / 5 N*m capture limit";
+        if (!RawWrenchWithinLimits(wrench, options.sensor_protocol)) {
+            collection_error = options.sensor_protocol == ForceSensorProtocol::kKwr57Rs422
+                ? "raw wrench exceeded KWR57 50 N / 2 N*m capture limit"
+                : "raw wrench exceeded 50 N / 5 N*m capture limit";
             break;
         }
         observations.push_back({state, wrench});
@@ -446,6 +455,7 @@ int main(int argc, char** argv) {
     ForceSensorConfig sensor_config;
     sensor_config.device = options.sensor_device;
     sensor_config.baud_rate = options.sensor_baud;
+    sensor_config.protocol = options.sensor_protocol;
     sensor_config.stale_after =
         std::chrono::milliseconds(options.sensor_stale_ms);
     ForceSensorReader sensor(sensor_config);
@@ -784,11 +794,11 @@ ForceCalibrationCaptureResult CaptureForceCalibrationWindow(
                            ForceCalibrationCaptureError::kWrenchStale,
                            "wrench sample is stale", index);
         }
-        if (!wrench.checksum_valid) {
+        if (!wrench.IntegrityValid()) {
             return Failure(
                 std::move(result),
                 ForceCalibrationCaptureError::kWrenchChecksumInvalid,
-                "wrench checksum is invalid", index);
+                "wrench protocol integrity is invalid", index);
         }
         if (wrench.io_error != 0
             || wrench.io_status != ForceSensorIoStatus::kStreaming) {

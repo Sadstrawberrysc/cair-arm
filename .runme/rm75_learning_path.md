@@ -1,6 +1,6 @@
 # RM75 学习路径：从架构理解到可修改控制
 
-本手册用于从零理解当前 RM75 七轴、Haptron 六维力传感器和超声视觉闭环。学习顺序固定为：**源码阅读 → 日志观察 → 真机验证**。完成一个模块的检查项后，再进入下一模块。
+本手册用于从零理解当前 RM75 七轴、KWR57 六维力传感器（兼容 Haptron）和超声视觉闭环。学习顺序固定为：**源码阅读 → 日志观察 → 真机验证**。完成一个模块的检查项后，再进入下一模块。
 
 首先检查 Redis 是否已经在本机 `7777` 端口运行：
 
@@ -58,7 +58,7 @@ python main_redis_seg_newphase_recovery_mode.py
   → 七轴 IK / ServoJ
   → RM75
 
-Haptron Modbus → 原始 wrench → 标定补偿 → rm75_control
+KWR57 RS422 / Haptron Modbus → 原始 wrench → 标定补偿 → rm75_control
 RM75 状态反馈 ───────────────────────────┘
 ```
 
@@ -78,7 +78,7 @@ RM75 状态反馈 ────────────────────�
 | 模块 | 主要职责 |
 | --- | --- |
 | `realman_transport` | RM75 TCP 状态与 ServoJ/Stop 通信 |
-| `robot_sensor` | Haptron Modbus、标定补偿、接触点 |
+| `robot_sensor` | KWR57 RS422 / Haptron Modbus、标定补偿、接触点 |
 | `rm75_motion` | 力控状态机、IK、ServoJ 规划 |
 | `main_rm75` | 固定生产 profile、启动门、I/O 组合、日志 |
 

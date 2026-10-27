@@ -1,8 +1,10 @@
 #pragma once
 
 #include <string>
+#include <algorithm>
 
 #include <rm75_control.hpp>
+#include <force_sensor.hpp>
 
 enum class ControllerMode {
     kObserve,
@@ -36,7 +38,8 @@ struct RobotRuntimeConfig {
     std::string robot_ip = "192.168.50.254";
     int robot_port = 8080;
     std::string sensor_device = "/dev/ttyUSB0";
-    unsigned int sensor_baud = 115200;
+    unsigned int sensor_baud = 460800;
+    ForceSensorProtocol sensor_protocol = ForceSensorProtocol::kKwr57Rs422;
     int sensor_stale_ms = 50;
     int robot_stale_ms = 200;
     int command_stale_ms = 500;
@@ -66,6 +69,9 @@ struct RobotRuntimeConfig {
 
     Rm75RuntimeSafetyConfig EffectiveSafety() const {
         auto result = safety;
+        // Until the exact KWR57 variant is configured, respect KWR57A's 2 N*m.
+        if (sensor_protocol == ForceSensorProtocol::kKwr57Rs422)
+            result.raw_torque_limit_nm = std::min(result.raw_torque_limit_nm, 2.0);
         if (!wrist_follow_calibration.empty()) result.max_tracking_position_error_mm = safety.wrist_max_tracking_position_error_mm;
         return result;
     }

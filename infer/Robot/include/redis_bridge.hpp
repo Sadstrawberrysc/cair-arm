@@ -98,6 +98,7 @@ struct RedisSensorMessage {
     bool wrench_valid = false;
     bool contact_valid = false;
     bool checksum_valid = false;
+    bool checksum_available = true;
     bool sensor_stale = true;
     std::string sensor_io_status;
     int sensor_io_error = 0;

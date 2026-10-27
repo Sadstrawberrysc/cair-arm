@@ -35,9 +35,12 @@ const char* ForceSensorIoStatusName(ForceSensorIoStatus status) noexcept;
 enum class ForceSensorProtocol {
     kHaptronModbusRtu,
     kLegacyAa55Stream,
+    kKwr57Rs422,
 };
 
 const char* ForceSensorProtocolName(ForceSensorProtocol protocol) noexcept;
+bool ParseForceSensorProtocol(const std::string& name, ForceSensorProtocol& protocol);
+unsigned int DefaultForceSensorBaud(ForceSensorProtocol protocol) noexcept;
 
 /**
  * One force/torque observation in SI units.
@@ -52,12 +55,17 @@ struct WrenchSample {
     std::chrono::system_clock::time_point timestamp{};
     std::chrono::steady_clock::time_point monotonic_timestamp{};
     bool checksum_valid{false};
+    // KWR57 has framing checks only; never report a nonexistent CRC as valid.
+    bool checksum_available{true};
     bool valid{false};
     bool stale{true};
     ForceSensorIoStatus io_status{ForceSensorIoStatus::kDisconnected};
     int io_error{0};
 
     bool IsStale(std::chrono::milliseconds maximum_age) const noexcept;
+    bool IntegrityValid() const noexcept {
+        return valid && (!checksum_available || checksum_valid);
+    }
 };
 
 /** Parser statistics reset on Reset(). */
@@ -65,6 +73,7 @@ struct ForceSensorStatistics {
     std::uint64_t bytes_received{0};
     std::uint64_t valid_frames{0};
     std::uint64_t checksum_errors{0};
+    std::uint64_t framing_errors{0};
     std::uint64_t numeric_errors{0};
     std::uint64_t noise_bytes_discarded{0};
     std::uint64_t buffer_overflow_events{0};
@@ -119,10 +128,29 @@ private:
     std::uint64_t next_sequence_{1};
 };
 
+// Fixed-length binary KWR57 frames: 48/49 AA + 6 little-endian floats + CR LF.
+// The manual's kgf and kgf*m are converted to SI at this boundary.
+class Kwr57FrameParser {
+public:
+    static constexpr std::size_t kFrameSize = 28;
+    static constexpr double kGravity = 9.80665;
+    std::vector<WrenchSample> Feed(const std::uint8_t* data, std::size_t length);
+    std::vector<WrenchSample> Feed(
+        const std::uint8_t* data, std::size_t length,
+        std::chrono::system_clock::time_point timestamp,
+        std::chrono::steady_clock::time_point monotonic_timestamp);
+    void Reset();
+    ForceSensorStatistics statistics() const noexcept { return statistics_; }
+private:
+    std::vector<std::uint8_t> buffer_;
+    ForceSensorStatistics statistics_;
+    std::uint64_t next_sequence_{1};
+};
+
 struct ForceSensorConfig {
     std::string device{"/dev/ttyUSB0"};
-    unsigned int baud_rate{115200};
-    ForceSensorProtocol protocol{ForceSensorProtocol::kHaptronModbusRtu};
+    unsigned int baud_rate{460800};
+    ForceSensorProtocol protocol{ForceSensorProtocol::kKwr57Rs422};
     std::uint8_t modbus_slave_address{kHaptronDefaultSlaveAddress};
     std::chrono::milliseconds query_period{20};
     std::chrono::milliseconds response_timeout{50};
@@ -135,8 +163,8 @@ struct ForceSensorConfig {
 
 /**
  * Owns the serial descriptor and publishes a mutex-protected latest sample.
- * Start() opens the configured path synchronously. The worker performs only
- * serial reads and frame parsing, and Stop() is safe to call repeatedly.
+ * Start() opens the configured path synchronously. The worker performs serial
+ * acquisition and bounded protocol writes; Stop() is safe to call repeatedly.
  */
 class ForceSensorReader {
 public:
@@ -154,7 +182,7 @@ public:
 
 private:
     void WorkerLoop();
-    void LegacyStreamWorkerLoop();
+    void StreamWorkerLoop();
     void HaptronModbusWorkerLoop();
     void PublishIoStatus(ForceSensorIoStatus status,
                          int error_number,
@@ -163,6 +191,7 @@ private:
 
     ForceSensorConfig config_;
     ForceSensorFrameParser legacy_parser_;
+    Kwr57FrameParser kwr57_parser_;
     HaptronModbusResponseParser modbus_parser_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};

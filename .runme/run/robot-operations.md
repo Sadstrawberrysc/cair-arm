@@ -5,6 +5,12 @@
 
 > 无参数运行 `./main_rm75` 是真机运动模式，执行前确认探头悬空、急停可用。
 
+2026-10-26：力传感器默认改为 KWR57 RS422，`/dev/ttyUSB0`、460800/8N1。
+无参数入口读取可执行文件旁的 `kwr57_force_calibration.json`，配置身份 `KWR57`；
+本次尚未生成新标定，缺失文件时启动会拒绝，不复用旧 Haptron 标定。
+单独查看原始六轴数据可运行下方 SensorMonitor，详细行为见
+[KWR57 接入说明](../../docs/kwr57_sensor_integration.md)。
+
 ## 1. 构建 main_rm75
 
 ```bash {"name":"build-main-rm75","excludeFromRunAll":"true"}
@@ -48,7 +54,7 @@ phase=1 时才请求 RZ 对齐。按 `t` 结束本轮并回到 idle，按 `q` �
 
 ## 5. 启动传感器监视
 
-监视器自动选择数据源：单独运行时直连 `/dev/ttyUSB0`，显示 Sensor-frame 原始六轴
+监视器自动选择数据源：单独运行时按 KWR57/460800 直连 `/dev/ttyUSB0`，显示 Sensor-frame 原始六轴
 wrench；在 `main_rm75` 已启动后运行时，自动读取 Redis，原始值用实线、Tool-frame 补偿值用虚线。
 
 ```bash {"name":"start-sensor-monitor","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
@@ -57,6 +63,11 @@ source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh && conda activate carot
 
 直连模式独占串口。如果之后要启动 `main_rm75`，先退出监视器，启动 `main_rm75`，再重新
 运行上述同一条监视命令。
+
+SensorMonitor 现在默认自动保存原始六轴数据，可在窗口点击“结束采集并分析”。
+固定姿态长期记录也可无参数运行 `python infer/SensorMonitor/record.py`（仓库根目录、carotid 环境），
+Ctrl+C 保存退出后运行 `python infer/SensorMonitor/analyze.py` 分析最新记录。数据位于
+`infer/SensorMonitor/records/`，不纳入 Git。详细边界见[长期记录说明](../../docs/sensor_drift_recording.md)。
 
 ## 6. 停止顺序
 

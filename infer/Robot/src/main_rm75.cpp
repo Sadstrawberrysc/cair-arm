@@ -1,7 +1,7 @@
 // RM75 七轴机械臂生产控制器入口。
 //
 // 本文件负责“系统编排”，把各个独立模块串成一条实时控制链：
-//   RM75 状态线程 + Haptron 六维力传感器线程 + Redis 视觉命令线程
+//   RM75 状态线程 + KWR57 / Haptron 六维力传感器线程 + Redis 视觉命令线程
 //       -> 数据有效性与安全门
 //       -> 力补偿/接触估计
 //       -> 扫描状态机与笛卡尔增量
@@ -138,6 +138,8 @@ void Usage(const char* program) {
         << "Hardware/configuration:\n"
         << "  --robot-ip IP --robot-port PORT\n"
         << "  --sensor-device PATH --sensor-baud BAUD --sensor-stale-ms MS\n"
+        << "  --sensor-protocol kwr57-rs422|haptron-modbus|legacy-aa55\n"
+        << "    default kwr57-rs422 / 460800 baud; Haptron defaults to 115200\n"
         << "  --robot-stale-ms MS --command-stale-ms MS\n"
         << "  --calibration FILE --expected-sensor-id ID --probe-model FILE\n"
         << "  --redis-host HOST --redis-port PORT --no-redis\n"
@@ -189,6 +191,7 @@ bool ParseDouble(const char* text, double& output) {
 }
 
 bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
+    bool sensor_baud_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         auto value = [&]() -> const char* {
@@ -238,6 +241,10 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
             const char* item = value(); if (!item) return false; options.sensor_device = item;
         } else if (argument == "--sensor-baud") {
             const char* item = value(); if (!item || !ParseUnsigned(item, options.sensor_baud)) return false;
+            sensor_baud_explicit = true;
+        } else if (argument == "--sensor-protocol") {
+            const char* item = value();
+            if (!item || !ParseForceSensorProtocol(item, options.sensor_protocol)) return false;
         } else if (argument == "--sensor-stale-ms") {
             const char* item = value(); if (!item || !ParseInt(item, options.sensor_stale_ms)) return false;
         } else if (argument == "--robot-stale-ms") {
@@ -284,6 +291,7 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
         }
     }
 
+    if (!sensor_baud_explicit) options.sensor_baud = DefaultForceSensorBaud(options.sensor_protocol);
     return ValidateRobotRuntimeConfig(options);
 }
 
@@ -390,7 +398,7 @@ RuntimeTareResult CollectRuntimeTare(
             result.error = "runtime tare lost healthy robot feedback";
             return result;
         }
-        if (!sample.valid || sample.stale || !sample.checksum_valid
+        if (!sample.IntegrityValid() || sample.stale
             || sample.io_status != ForceSensorIoStatus::kStreaming
             || sample.io_error != 0) {
             result.error = "runtime tare lost healthy force-sensor data";
@@ -813,6 +821,7 @@ int main(int argc, char** argv) {
     ForceSensorConfig sensor_config;
     sensor_config.device = options.sensor_device;
     sensor_config.baud_rate = options.sensor_baud;
+    sensor_config.protocol = options.sensor_protocol;
     sensor_config.query_period = std::chrono::milliseconds(options.period_ms);
     sensor_config.stale_after = std::chrono::milliseconds(options.sensor_stale_ms);
     std::unique_ptr<ForceSensorReader> force_reader;
@@ -1024,6 +1033,10 @@ int main(int argc, char** argv) {
               << "joint_speed_cap_deg_s: " << planner_config.max_joint_speed_deg_s << '\n'
               << "sensor_protocol: "
               << ForceSensorProtocolName(sensor_config.protocol) << '\n'
+              << "sensor_baud: " << sensor_config.baud_rate << '\n'
+              << "sensor_integrity: "
+              << (sensor_config.protocol == ForceSensorProtocol::kKwr57Rs422
+                      ? "framing-only (no checksum on wire)" : "checksum") << '\n'
               << "sensor_stale_ms: " << options.sensor_stale_ms << '\n'
               << "robot_state_poll_ms: " << options.StatePollPeriodMs() << '\n'
               << "robot_stale_ms: " << options.robot_stale_ms << '\n'
@@ -1504,7 +1517,7 @@ int main(int argc, char** argv) {
             raw_wrench,
             safety_config.raw_force_limit_n,
             safety_config.raw_torque_limit_nm);
-        if (force_sample.valid && !force_sample.stale
+        if (force_sample.IntegrityValid() && !force_sample.stale
             && raw_wrench_in_range) {
             compensated = calibration.Compensate(raw_wrench,
                                                  rotation_base_from_sensor,
@@ -2255,6 +2268,7 @@ int main(int argc, char** argv) {
             message.wrench_valid = wrench_valid;
             message.contact_valid = contact.valid;
             message.checksum_valid = force_sample.checksum_valid;
+            message.checksum_available = force_sample.checksum_available;
             message.sensor_stale = force_sample.stale;
             message.sensor_io_status =
                 ForceSensorIoStatusName(force_sample.io_status);
@@ -2516,6 +2530,9 @@ int main(int argc, char** argv) {
     summary_data.mode = ModeName(options.mode);
     summary_data.simulated = options.simulate;
     summary_data.force_sensor_enabled = !options.wrist_no_force;
+    summary_data.sensor_protocol = ForceSensorProtocolName(options.sensor_protocol);
+    summary_data.sensor_baud = options.sensor_baud;
+    summary_data.sensor_checksum_available = options.sensor_protocol != ForceSensorProtocol::kKwr57Rs422;
     summary_data.wrist_candidate_trial = options.wrist_candidate_trial;
     summary_data.wrist_unlimited_excursion = options.wrist_unlimited_excursion;
     summary_data.wrist_unlimited_translation = options.wrist_unlimited_translation;

@@ -207,6 +207,9 @@ struct RuntimeSummaryData {
     std::string mode;
     bool simulated = false;
     bool force_sensor_enabled = true;
+    std::string sensor_protocol;
+    unsigned int sensor_baud = 0;
+    bool sensor_checksum_available = true;
     bool wrist_candidate_trial = false;
     bool wrist_unlimited_excursion = false;
     bool wrist_unlimited_translation = false;

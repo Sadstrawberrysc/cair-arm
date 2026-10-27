@@ -56,7 +56,7 @@ target_link_libraries(rm75_runtime_config PUBLIC
     rm75_motion
 )
 
-# Haptron sensor, calibration compensation and contact estimation.
+# Force/torque sensors, calibration compensation and contact estimation.
 add_library(robot_sensor STATIC
     src/force_sensor.cpp
     src/contact_sensing.cpp

@@ -32,6 +32,9 @@ bool BaudRateToTermios(unsigned int baud_rate, speed_t* speed) {
 #ifdef B230400
         case 230400: *speed = B230400; return true;
 #endif
+#ifdef B460800
+        case 460800: *speed = B460800; return true;
+#endif
 #ifdef B1000000
         case 1000000: *speed = B1000000; return true;
 #endif
@@ -68,6 +71,7 @@ bool ConfigureSerialPort(int fd, unsigned int baud_rate, int* error_number) {
     options.c_cflag |= CS8;
     options.c_cflag &= static_cast<tcflag_t>(~PARENB);
     options.c_cflag &= static_cast<tcflag_t>(~CSTOPB);
+    options.c_cflag &= static_cast<tcflag_t>(~CRTSCTS);
     options.c_cc[VMIN] = 0;
     options.c_cc[VTIME] = 0;
     if (::cfsetispeed(&options, speed) != 0 ||
@@ -133,6 +137,39 @@ float DecodeLittleEndianFloat(const std::uint8_t* bytes) noexcept {
     return value;
 }
 
+// Nonblocking descriptor, bounded partial writes; also used for shutdown.
+bool WriteKwr57Command(int fd, std::uint8_t command, int* error_number) noexcept {
+    const std::array<std::uint8_t, 4> bytes{{command, 0xaa, 0x0d, 0x0a}};
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(100);
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error_number = ETIMEDOUT;
+            return false;
+        }
+        pollfd descriptor{fd, POLLOUT, 0};
+        const int result = ::poll(&descriptor, 1, 10);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            *error_number = errno;
+            return false;
+        }
+        if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            *error_number = EIO;
+            return false;
+        }
+        if (result == 0 || !(descriptor.revents & POLLOUT)) continue;
+        const ssize_t count = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count > 0) offset += static_cast<std::size_t>(count);
+        else if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            *error_number = errno;
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 const char* ForceSensorIoStatusName(ForceSensorIoStatus status) noexcept {
@@ -152,8 +189,26 @@ const char* ForceSensorProtocolName(ForceSensorProtocol protocol) noexcept {
             return "haptron-modbus";
         case ForceSensorProtocol::kLegacyAa55Stream:
             return "legacy-aa55";
+        case ForceSensorProtocol::kKwr57Rs422:
+            return "kwr57-rs422";
     }
     return "unknown";
+}
+
+bool ParseForceSensorProtocol(const std::string& name, ForceSensorProtocol& protocol) {
+    for (const auto candidate : {ForceSensorProtocol::kHaptronModbusRtu,
+                                 ForceSensorProtocol::kLegacyAa55Stream,
+                                 ForceSensorProtocol::kKwr57Rs422}) {
+        if (name == ForceSensorProtocolName(candidate)) {
+            protocol = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+unsigned int DefaultForceSensorBaud(ForceSensorProtocol protocol) noexcept {
+    return protocol == ForceSensorProtocol::kKwr57Rs422 ? 460800U : 115200U;
 }
 
 bool WrenchSample::IsStale(std::chrono::milliseconds maximum_age) const
@@ -339,6 +394,77 @@ void ForceSensorFrameParser::UpdateBufferStatistics() noexcept {
         std::max(statistics_.peak_buffered_bytes, receive_buffer_.size());
 }
 
+std::vector<WrenchSample> Kwr57FrameParser::Feed(const std::uint8_t* data,
+                                               std::size_t length) {
+    return Feed(data, length, std::chrono::system_clock::now(),
+                std::chrono::steady_clock::now());
+}
+
+std::vector<WrenchSample> Kwr57FrameParser::Feed(
+    const std::uint8_t* data, std::size_t length,
+    std::chrono::system_clock::time_point timestamp,
+    std::chrono::steady_clock::time_point monotonic_timestamp) {
+    std::vector<WrenchSample> samples;
+    if (data == nullptr) return samples;
+    statistics_.bytes_received += length;
+    // Parse between individual appends: storage never exceeds one 28-byte frame,
+    // even for unbounded noise or a large input chunk. Payload CR/LF is binary.
+    for (std::size_t offset = 0; offset < length; ++offset) {
+        buffer_.push_back(data[offset]);
+        statistics_.peak_buffered_bytes = std::max(
+            statistics_.peak_buffered_bytes, buffer_.size());
+        while (!buffer_.empty()) {
+            if (buffer_[0] != 0x48 && buffer_[0] != 0x49) {
+                buffer_.erase(buffer_.begin());
+                ++statistics_.noise_bytes_discarded;
+                continue;
+            }
+            if (buffer_.size() < 2) break;
+            if (buffer_[1] != 0xaa) {
+                buffer_.erase(buffer_.begin());
+                ++statistics_.noise_bytes_discarded;
+                continue;
+            }
+            if (buffer_.size() < kFrameSize) break;
+            if (buffer_[26] != 0x0d || buffer_[27] != 0x0a) {
+                ++statistics_.framing_errors;
+                ++statistics_.noise_bytes_discarded;
+                buffer_.erase(buffer_.begin());
+                continue;
+            }
+            WrenchSample sample;
+            sample.timestamp = timestamp;
+            sample.monotonic_timestamp = monotonic_timestamp;
+            sample.checksum_available = false;
+            sample.io_status = ForceSensorIoStatus::kStreaming;
+            bool finite = true;
+            for (std::size_t axis = 0; axis < 6; ++axis) {
+                const float value = DecodeLittleEndianFloat(buffer_.data() + 2 + axis * 4);
+                finite = finite && std::isfinite(value);
+                sample.wrench_si[axis] = static_cast<double>(value) * kGravity;
+            }
+            if (finite) {
+                sample.sequence = next_sequence_++;
+                sample.valid = true;
+                sample.stale = false;
+                samples.push_back(sample);
+                ++statistics_.valid_frames;
+            } else {
+                ++statistics_.numeric_errors;
+            }
+            buffer_.clear();
+        }
+    }
+    statistics_.buffered_bytes = buffer_.size();
+    return samples;
+}
+
+void Kwr57FrameParser::Reset() {
+    buffer_.clear();
+    statistics_ = ForceSensorStatistics{};
+    next_sequence_ = 1;
+}
+
 ForceSensorReader::ForceSensorReader(ForceSensorConfig config)
     : config_(std::move(config)),
       legacy_parser_(config_.maximum_buffer_bytes),
@@ -398,14 +524,25 @@ bool ForceSensorReader::Start() {
     }
 
     legacy_parser_.Reset();
+    kwr57_parser_.Reset();
     modbus_parser_.Reset();
     serial_fd_.store(fd);
+    if (config_.protocol == ForceSensorProtocol::kKwr57Rs422
+        && !WriteKwr57Command(fd, 0x48, &error_number)) {
+        ClosePort();
+        PublishIoStatus(ForceSensorIoStatus::kIoError, error_number,
+                        ErrorMessage("start KWR57 stream", error_number));
+        return false;
+    }
     running_.store(true);
     PublishIoStatus(ForceSensorIoStatus::kStreaming, 0, std::string{});
     try {
         worker_ = std::thread(&ForceSensorReader::WorkerLoop, this);
     } catch (...) {
         running_.store(false);
+        if (config_.protocol == ForceSensorProtocol::kKwr57Rs422) {
+            (void)WriteKwr57Command(fd, 0x43, &error_number);
+        }
         ClosePort();
         PublishIoStatus(ForceSensorIoStatus::kIoError, EAGAIN,
                         "failed to start force sensor reader thread");
@@ -446,9 +583,16 @@ void ForceSensorReader::WorkerLoop() {
     if (config_.protocol == ForceSensorProtocol::kHaptronModbusRtu) {
         HaptronModbusWorkerLoop();
     } else {
-        LegacyStreamWorkerLoop();
+        StreamWorkerLoop();
     }
 
+    if (config_.protocol == ForceSensorProtocol::kKwr57Rs422) {
+        int error_number = 0;
+        if (!WriteKwr57Command(serial_fd_.load(), 0x43, &error_number)) {
+            PublishIoStatus(ForceSensorIoStatus::kIoError, error_number,
+                            ErrorMessage("stop KWR57 stream", error_number));
+        }
+    }
     ClosePort();
     running_.store(false);
     if (stop_requested_.load()) {
@@ -456,7 +600,7 @@ void ForceSensorReader::WorkerLoop() {
     }
 }
 
-void ForceSensorReader::LegacyStreamWorkerLoop() {
+void ForceSensorReader::StreamWorkerLoop() {
     std::vector<std::uint8_t> read_buffer(config_.read_chunk_bytes);
     // Cap the poll duration so Stop() remains responsive even if a caller uses
     // an accidentally large timeout.
@@ -495,8 +639,9 @@ void ForceSensorReader::LegacyStreamWorkerLoop() {
 
         const ssize_t count = ::read(fd, read_buffer.data(), read_buffer.size());
         if (count > 0) {
-            const auto samples = legacy_parser_.Feed(
-                read_buffer.data(), static_cast<std::size_t>(count));
+            const auto samples = config_.protocol == ForceSensorProtocol::kKwr57Rs422
+                ? kwr57_parser_.Feed(read_buffer.data(), static_cast<std::size_t>(count))
+                : legacy_parser_.Feed(read_buffer.data(), static_cast<std::size_t>(count));
             std::lock_guard<std::mutex> lock(state_mutex_);
             for (const WrenchSample& sample : samples) {
                 latest_sample_ = sample;
@@ -696,6 +841,7 @@ void ForceSensorReader::PublishIoStatus(ForceSensorIoStatus status,
 void ForceSensorReader::ClosePort() noexcept {
     const int fd = serial_fd_.exchange(-1);
     if (fd >= 0) {
+        (void)::ioctl(fd, TIOCNXCL);
         (void)::close(fd);
     }
 }

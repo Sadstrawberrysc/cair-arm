@@ -432,6 +432,9 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
         {"mailbox_pending", servo.pending()},
         {"outstanding", data.servo_outstanding}};
     summary["control"]["force_sensor_enabled"] = data.force_sensor_enabled;
+    summary["control"]["sensor_protocol"] = data.sensor_protocol;
+    summary["control"]["sensor_baud"] = data.sensor_baud;
+    summary["control"]["sensor_checksum_available"] = data.sensor_checksum_available;
     summary["control"]["wrist_candidate_trial"] = data.wrist_candidate_trial;
     const bool translation_limit = !(data.wrist_unlimited_excursion || data.wrist_unlimited_translation);
     summary["control"]["wrist_total_excursion_limits_enabled"] = translation_limit;
