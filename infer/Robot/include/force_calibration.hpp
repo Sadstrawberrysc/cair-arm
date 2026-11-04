@@ -27,7 +27,7 @@ struct CompensatedWrench {
 // All public values use SI units: N, N*m and m.
 class ForceCalibration {
 public:
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
 
     int schema_version = kSchemaVersion;
     std::string sensor_id;
@@ -51,7 +51,9 @@ public:
     Eigen::Vector3d torque_bias_nm = Eigen::Vector3d::Zero();
     Eigen::Vector3d center_of_mass_sensor_m = Eigen::Vector3d::Zero();
 
-    // R_tool_from_sensor uses the controller ZYX convention (Rz*Ry*Rx).
+    // Legacy name: rotation_tool_from_sensor is R_ArmTip_Sensor (Rz*Ry*Rx).
+    // Independent probe working axes: R_Sensor_Tool; identity for legacy files.
+    Eigen::Matrix3d rotation_sensor_from_probe = Eigen::Matrix3d::Identity();
     // translation_sensor_to_tool_m is the vector from the sensor origin to
     // the configured tool origin, expressed in sensor axes. The probe TCP is
     // likewise expressed from the sensor origin in sensor axes.

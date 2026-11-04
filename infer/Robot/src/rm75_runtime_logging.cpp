@@ -240,9 +240,9 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
         {"probe_model", calibration.probe_model},
         {"probe_model_sha256", data.selected_probe_sha256},
         {"controller_pose_frame", "arm_tip"},
-        {"control_tool_frame", "sensor"},
+        {"control_tool_frame", "probe"},
         {"legacy_rotation_field_interpretation",
-         "rotation_arm_tip_from_tool_sensor"},
+         "rotation_arm_tip_from_sensor"},
         {"rotation_arm_tip_from_tool_row_major", {
             config.rotation_pose_from_tool(0, 0),
             config.rotation_pose_from_tool(0, 1),
@@ -263,6 +263,12 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
             calibration.rotation_tool_from_sensor(2, 0),
             calibration.rotation_tool_from_sensor(2, 1),
             calibration.rotation_tool_from_sensor(2, 2)}},
+        {"rotation_sensor_from_probe_row_major", {
+            calibration.rotation_sensor_from_probe(0,0), calibration.rotation_sensor_from_probe(0,1),
+            calibration.rotation_sensor_from_probe(0,2), calibration.rotation_sensor_from_probe(1,0),
+            calibration.rotation_sensor_from_probe(1,1), calibration.rotation_sensor_from_probe(1,2),
+            calibration.rotation_sensor_from_probe(2,0), calibration.rotation_sensor_from_probe(2,1),
+            calibration.rotation_sensor_from_probe(2,2)}},
         {"translation_sensor_to_tool_m", {
             calibration.translation_sensor_to_tool_m.x(),
             calibration.translation_sensor_to_tool_m.y(),

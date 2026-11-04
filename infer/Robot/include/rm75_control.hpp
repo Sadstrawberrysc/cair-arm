@@ -178,8 +178,8 @@ struct Rm75ControlConfig {
     double trigger_alignment_tolerance_m = 0.008; // Trigger 阶段允许的 |视觉 Y| 阈值
     double trigger_alignment_stable_duration_s = 0.4; // Trigger 对齐锁存前稳定时间
 
-    // ===== 7. Base → Arm_Tip → Tool/Sensor → Probe TCP 坐标链 =====
-    // 控制器位姿表示 Base → Arm_Tip；控制增量定义在当前与传感器重合的 Tool 坐标。
+    // ===== 7. Base → Arm_Tip → Sensor → Tool → Probe TCP 坐标链 =====
+    // 控制器位姿表示 Base → Arm_Tip；控制增量定义在探头工作轴 Tool 坐标。
     // 该固定旋转把 Tool 向量映射到 Arm_Tip 后，再合成控制器目标位姿。
     Eigen::Matrix3d rotation_pose_from_tool = Eigen::Matrix3d::Identity();
     // 探头 TCP 在物理 Tool 坐标中的位置。当前假定 Arm_Tip 与 Tool 原点重合，
@@ -191,10 +191,10 @@ struct Rm75ControlInput {
     // 当前“理想笛卡尔参考”位姿，格式 [x,y,z,rx,ry,rz]，位置 m、角度 rad。
     Eigen::Matrix<double, 6, 1> current_pose =
         Eigen::Matrix<double, 6, 1>::Zero();
-    // 已完成偏置、重力、质心和 tare 补偿，并表达在 Tool/Sensor 的 wrench。
+    // 已完成偏置、重力、质心和 tare 补偿，并表达在 探头 Tool 的 wrench。
     Eigen::Matrix<double, 6, 1> compensated_wrench_tool =
         Eigen::Matrix<double, 6, 1>::Zero();
-    // STL 估计的接触点，相对 Probe TCP 的 Tool/Sensor 坐标（m）。
+    // STL 估计的接触点，相对 Probe TCP 的 探头 Tool 坐标（m）。
     Eigen::Vector3d contact_point_probe_m = Eigen::Vector3d::Zero();
     double robot_model_position_error_m = 0.0;
     // 实际 TCP 对模型目标的 Tool-Y 投影误差；X/Z 误差不会阻塞 Y 对齐。

@@ -540,7 +540,7 @@ std::string RedisBridge::BuildSensorV1Json(const RedisSensorMessage& message) {
     output["compensated_wrench_tool"] = WrenchJson(message.compensated_wrench_tool);
     output["contact"] = {
         {"valid", message.contact_valid},
-        {"frame", "probe_tcp_sensor_aligned"},
+        {"frame", "probe_tcp_tool"},
         {"point_probe_m", VectorJson(message.contact_point_probe_m)},
         {"wrench_residual_nm", message.contact_residual_nm},
         {"equivalent_point_error_m", message.contact_point_error_m},

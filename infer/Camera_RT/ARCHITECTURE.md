@@ -22,30 +22,6 @@
 
 ## 系统架构与模块
 
-```mermaid
-flowchart TD
-    RS["RealSense<br/>彩色 + 深度"] --> ALIGN["rs.align：depth → color"]
-    ALIGN --> RGB["彩色图"]
-    ALIGN --> DEPTH["对齐深度、内参、depth_scale"]
-    subgraph CAMERA["cliff_demo 单进程 · camera 环境"]
-        RGB --> DET["Faster R-CNN COCO 检测<br/>get_one_box 选择框"]
-        DET --> CROP["process_image + bbox_info"]
-        CROP --> CLIFF["CLIFF HR48<br/>旋转矩阵、betas、crop camera"]
-        CLIFF --> FULL["cam_crop2full<br/>全图相机参数"]
-        CLIFF --> SKIN["SMPL 皮肤网格：计算但不直接叠加"]
-        CLIFF --> ANATOMY["AnatomyModel<br/>骨骼 / 血管姿态与体型蒙皮"]
-        ANATOMY --> RENDER["PyTorch3D render_mesh"]
-        FULL --> RENDER
-        RENDER --> VIEW["OpenCV result / color stream"]
-        RENDER --> PIXELS["六个血管顶点像素<br/>top_first_pixels 排序"]
-        PIXELS --> GEOM["kpt_2d_to_3d + 首点邻域 SVD"]
-        DEPTH --> GEOM
-        GEOM --> SAVE["按 s / Esc 覆盖 artery_path.txt"]
-    end
-    SAVE -->|"快照文件"| HAND["相邻 run_probe_target<br/>取首点、外参转换、短轴姿态"]
-    HAND --> TOOL["Robot arm_probe_pose<br/>独立的定位调用"]
-```
-
 | 模块 | 当前职责 / 数据 | 源码位置 |
 | --- | --- | --- |
 | `cliff_demo` | 设备与窗口生命周期、模型编排、渲染、反投影、文本保存 | [cliff_demo.py](cliff_demo.py) |
@@ -64,38 +40,10 @@ flowchart TD
 
 ## 逐帧与保存时序
 
-```mermaid
-sequenceDiagram
-    actor U as 操作者
-    participant C as cliff_demo
-    participant D as RealSense
-    participant M as 检测 / CLIFF / 解剖模型
-    participant V as OpenCV
-    participant F as artery_path.txt
-    C->>C: 加载 CUDA 模型和本机资产
-    C->>D: 配置流后 start；读取彩色内参和 depth_scale
-    C->>C: 注册 atexit 清理；加载骨骼 / 血管资产
-    loop 同一主线程逐帧执行
-        C->>D: wait_for_frames + align
-        D-->>C: 彩色与对齐深度
-        C->>M: 选框、crop、CLIFF、蒙皮与渲染
-        M-->>C: 叠加图及六个血管像素
-        C->>C: 顶部优先排序、深度反投影、首点附近 SVD 法向
-        C->>V: 显示两窗口并 waitKey
-        alt 按 s 或 Esc
-            U->>C: 保存当前结果
-            C->>F: 覆盖：法向一行 + 路径点
-        else 按 q
-            U->>C: 不写本帧，退出循环
-        end
-    end
-    C->>D: 正常退出时 pipeline.stop
-    C->>V: destroyAllWindows
-```
-
+`cliff_demo.py` 逐帧读取对齐 RGB-D，完成人体检测、CLIFF / 解剖渲染、像素排序、反投影和首点法向估计。
 Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文件不会因随后按 `q` 被删除。
 正常退出主动清理；注册的 `atexit` 在常规解释器退出时兜底释放资源，不保证强制终止时执行。
-没有独立采集线程、结果队列或曝光时间映射；该图不承诺推理帧率和端到端延迟。
+采集、推理与窗口事件在同一主线程执行，没有结果队列或曝光时间映射，实际帧率和端到端延迟需测量。
 
 ## 快照接口与几何语义
 
@@ -126,7 +74,7 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 800×600。文件内坐标来自缩放前的原图；画面里的标记不能据此认作 P0 真值。
 旧 `artery_path_rbt.txt` 没有可信生成器或当前 schema，文件名不能证明坐标属于机器人。
 
-## 实际下游交接
+## 下游初始定位
 
 | 步骤 | 已实现行为 | 源码 / 验收边界 |
 | --- | --- | --- |
@@ -137,50 +85,7 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 | 单点调用 | 传 `--target-pose-m-rad --controller-movej-p` 给 `arm_probe_pose` | [Robot 维护工具](../Robot/tests/tools/arm_probe_pose.cpp)；默认编排可执行运动，非只读相机功能 |
 | 可选投影 seed | `--wrist-handoff` 起始先删除旧 seed；非 dry-run、定位子进程成功退出且两份外参摘要未变才写入 TTL 60 秒 seed | `scope=projection_preview_only`；不授权腕部自动运动；dry-run 也会删除旧 seed，但不发布新 seed |
 
-```mermaid
-sequenceDiagram
-    actor U as 操作者
-    participant H as run_probe_target
-    participant C as cliff_demo 子进程
-    participant F as artery_path.txt
-    participant T as arm_probe_pose 子进程
-    participant R as Redis seed
-    opt 指定 wrist-handoff
-        H->>R: 删除上一 seed，读取两份标定摘要
-    end
-    H->>H: 加载外参，检查工具二进制与 Tool 标定
-    H->>F: 保存旧文件签名
-    H->>C: 启动相机并等待退出
-    U->>C: s 保存后 q 退出；或 Esc 保存退出
-    C->>F: 覆盖相机坐标快照
-    C-->>H: 退出码
-    alt 相机退出码非零
-        H->>H: 终止交接
-    else 相机成功退出
-        H->>F: 检查新签名，读取内容，再检查签名未变
-        H->>H: 校验三列有限值、法向 / 切向与短轴姿态
-        alt 快照或几何检查失败
-            H->>H: 终止交接，不调用定位工具
-        else 检查通过
-            H->>T: 六维 Probe TCP 目标，controller-movej-p
-            alt dry-run
-                T-->>H: 目标预览退出；不验证控制器 IK
-            else 真实定位
-                T-->>H: 一次定位调用及退出码
-                opt 子进程成功且启用 handoff
-                    H->>H: 再读两份外参的原始字节摘要
-                    alt 摘要与起始值一致
-                        H->>R: 写入表面点 seed，TTL 60 s
-                    else 摘要变化
-                        H->>H: 拒绝发布 seed
-                    end
-                end
-            end
-        end
-    end
-```
-
-图中检查是文件一致性与数值 / 几何退化门，不能证明模型选对血管或深度来自同一表面。
+交接检查是文件一致性与数值 / 几何退化门，不能证明模型选对血管或深度来自同一表面。
 `artery_path.txt` 本身没有曝光时间；重新保存只满足本次文件变化要求。
 摘要变化会拒绝 seed 发布；单独的 `scope=projection_preview_only` 不启动腕部运动。
 
@@ -205,7 +110,7 @@ Faster R-CNN 权重另由 Torch 缓存提供。入口不会自动运行预检或
 | 检测类别 / 无框、像素与深度、局部平面质量、采集元数据 | 规划补齐 | 当前不能宣称存在这些完整拒绝门 |
 | 真实采集、人体叠加、独立空间 / 外参 / 动态时序验收 | 待验收 | 不能以预检或格式测试代替 |
 
-本次文档更新只核对当前源码，不新增设备运行或真机验收记录。长期原因见
+长期原因见
 [DECISIONS.md](DECISIONS.md)，本机操作与历史状态见
 [Camera_RT 操作 notebook](../../.runme/run/camera-rt-operations.md)和
-[Camera_RT 进展 notebook](../../.runme/Progress/camera-rt-progress.md)。本机 `.runme/` 不随仓库分发。
+[Camera_RT 进展 notebook](../../.runme/Progress/camera-rt-progress.md)。`.runme/` Markdown 随 Git 维护，运行数据不纳入 Git。

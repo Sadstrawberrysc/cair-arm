@@ -40,6 +40,8 @@ bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal
 bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal.sh robot
 ```
 
+## 4. 操作与配置
+
 初始选点失败时每隔至少 0.1 秒重试，等待唯一目标、有效深度和新鲜追踪结果。
 腕部速度为 TCP 参考 4 mm/s、姿态参考及每关节命令上限 4°/s。
 窗口按 `b` 可重新选点并请求跟随；`d` 只选点，`p` 暂停并取消自动开始和恢复。

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "sensor_id": "REPLACE_WITH_SENSOR_ID",
   "probe_model": "Lprobe-IFS.STL",
   "probe_model_sha256": "REPLACE_WITH_PROBE_MODEL_SHA256",
@@ -27,11 +27,18 @@
   },
   "sensor_to_tool": {
     "rotation_row_major": [
+      0.8660254037844387, -0.49999999999999994, 0.0,
+      0.49999999999999994, 0.8660254037844387, 0.0,
+      0.0, 0.0, 1.0
+    ],
+    "translation_sensor_to_tool_m": [0.0, 0.0, -0.0125]
+  },
+  "probe_to_sensor": {
+    "rotation_row_major": [
       1.0, 0.0, 0.0,
       0.0, 1.0, 0.0,
       0.0, 0.0, 1.0
-    ],
-    "translation_sensor_to_tool_m": [0.0, 0.0, 0.0]
+    ]
   },
-  "probe_tcp_sensor_m": [0.0, 0.0, 0.0]
+  "probe_tcp_sensor_m": [0.0, 0.0, 0.188]
 }

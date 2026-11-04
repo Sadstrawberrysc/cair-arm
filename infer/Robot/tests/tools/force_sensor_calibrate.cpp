@@ -24,6 +24,7 @@ struct Options {
     std::string probe_file;
     std::string probe_model_sha256;
     Eigen::Vector3d sensor_to_tool_rpy_deg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d probe_to_sensor_rpy_deg = Eigen::Vector3d::Zero();
     Eigen::Vector3d sensor_to_tool_translation_m = Eigen::Vector3d::Zero();
     Eigen::Vector3d probe_tcp_sensor_m = Eigen::Vector3d::Zero();
     bool sensor_to_tool_rpy_set = false;
@@ -40,6 +41,7 @@ struct CaptureCsvMetadata {
     bool capture_complete = false;
     bool sensor_to_tool_rpy_set = false;
     Eigen::Vector3d sensor_to_tool_rpy_deg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d probe_to_sensor_rpy_deg = Eigen::Vector3d::Zero();
 };
 
 void Usage(const char* program) {
@@ -57,7 +59,8 @@ void Usage(const char* program) {
         << "  --sensor-to-tool-rpy-deg RX,RY,RZ\n"
         << "  --sensor-to-tool-translation-m X,Y,Z\n"
         << "  --probe-tcp-sensor-m X,Y,Z\n"
-        << "    R_tool_from_sensor uses Rz*Ry*Rx. Translation is the\n"
+        << "  --probe-to-sensor-rpy-deg RX,RY,RZ  probe axes in Sensor, default 0,0,0\n"
+        << "    Legacy sensor-to-tool RPY is R_ArmTip_Sensor = Rz*Ry*Rx. Translation is the\n"
         << "    sensor-origin to tool-origin vector expressed in sensor axes;\n"
         << "    probe TCP coordinates are also expressed in sensor axes.\n"
         << "  --tool-chain-verified     assert independently measured R/t/TCP\n"
@@ -121,6 +124,9 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             const char* item = value();
             if (item == nullptr) return false;
             options.probe_file = item;
+        } else if (argument == "--probe-to-sensor-rpy-deg") {
+            const char* item = value();
+            if (item == nullptr || !ParseVector3(item, options.probe_to_sensor_rpy_deg)) return false;
         } else if (argument == "--sensor-to-tool-rpy-deg") {
             const char* item = value();
             if (item == nullptr
@@ -194,6 +200,14 @@ bool ReadSamples(const std::string& path,
             } else if (line == "# capture_complete=true") {
                 metadata.capture_complete = true;
             } else {
+                constexpr const char* kProbePrefix = "# probe_to_sensor_rpy_deg=";
+                if (line.rfind(kProbePrefix, 0) == 0) {
+                    if (!ParseVector3(line.substr(std::strlen(kProbePrefix)),
+                                      metadata.probe_to_sensor_rpy_deg)) {
+                        error = "invalid probe rotation capture metadata";
+                        return false;
+                    }
+                }
                 constexpr const char* kRpyPrefix =
                     "# sensor_to_tool_rpy_deg=";
                 if (line.rfind(kRpyPrefix, 0) == 0) {
@@ -307,6 +321,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (capture_metadata.generated_by_capture
+        && (RotationBaseFromControllerEuler(capture_metadata.probe_to_sensor_rpy_deg * (M_PI / 180.0))
+            - RotationBaseFromControllerEuler(options.probe_to_sensor_rpy_deg * (M_PI / 180.0))).norm() > 1e-10) {
+        std::cerr << "--probe-to-sensor-rpy-deg does not match capture CSV metadata\n";
+        return 3;
+    }
     if (!options.probe_file.empty()) {
         const std::string probe_filename =
             std::filesystem::path(options.probe_file).filename().string();
@@ -353,6 +373,8 @@ int main(int argc, char** argv) {
     calibration.translation_sensor_to_tool_m =
         options.sensor_to_tool_translation_m;
     calibration.probe_tcp_sensor_m = options.probe_tcp_sensor_m;
+    calibration.rotation_sensor_from_probe = RotationBaseFromControllerEuler(
+        options.probe_to_sensor_rpy_deg * (M_PI / 180.0));
     double force_rms_n = 0.0;
     double torque_rms_nm = 0.0;
     double force_max_n = 0.0;

@@ -1,6 +1,6 @@
 # Camera_wrist 架构
 
-本文依据 **2026-10-12 当前工作区源码**。Orbbec Gemini 305 提供腕部同步 RGB-D，
+Orbbec Gemini 305 提供腕部同步 RGB-D，
 本模块负责选点、局部追踪、表面法向和观测发布；Robot 独占坐标转换、规划与运动发送。
 `click_follow.py` 与启动脚本无参数时均使用 Roboflow 模型检测 `carotid`；
 模型模式在 Robot 就绪后自动初始选点，有效观测及目标回传确认后请求跟随；`b` 重选并跟随、`d` 只选点。
@@ -45,29 +45,11 @@
 在仓库根目录执行 `bash infer/Camera_wrist/start_camera.sh`，或在 `camera` 环境直接运行
 `python infer/Camera_wrist/click_follow.py`，均默认进入模型模式，无需传入模型参数。
 默认 ID 为 `songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1`；模型模式使用既有 Robot
-`click_follow` 协议和 LocalTracker。其选点路径为：
-
-```mermaid
-flowchart LR
-  A["Gemini 同步 RGB-D"] --> B["b / d 或已确认暂停后的恢复重选<br/>下一帧作为源帧"]
-  B --> C["ultralytics 子进程：Roboflow 检测"]
-  C --> D{"唯一 carotid 框中心合格?<br/>源时间一致且缓存未溢出"}
-  B --> E["后续 RGB-D 帧缓存：最多 45 帧"]
-  D -->|是| F["源帧初始化 LocalTracker"]
-  E --> F
-  F --> G["按采集顺序赶到当前帧"]
-  G --> H{"质量与 200 ms 时效合格?"}
-  H -->|是| I["新 target_id，先发布 Redis 观测"]
-  I --> J["ModelStart 等新目标回传后 begin / resume<br/>d 仅观察；已有恢复意图时 ModelRecovery 请求 resume"]
-  D -->|否| X["拒绝选点，不发送开始请求"]
-  H -->|否| X
-  X -->|已有恢复意图且暂停回执匹配| R["约 0.75 秒重试间隔；新帧重选"]
-  R --> B
-```
+`click_follow` 协议和 LocalTracker。选点使用下一完整源帧，经检测、源帧追踪及赶帧后发布新目标；Robot 回传目标身份后再请求 begin / resume。
 
 手动模式使用 `bash infer/Camera_wrist/start_camera.sh --manual`，或直接运行
 `python infer/Camera_wrist/click_follow.py --manual`；此模式不启动模型子进程，左键选点后
-沿用光流、深度几何和 Redis 请求链，观测有效后由自动初始开始或 `b/r` 请求跟随。
+沿用光流、深度几何和 Redis 请求链，观测有效后由人工 `b/r` 请求跟随。
 模型模式禁用鼠标，检测等待期间清除
 旧目标；帧缓冲最多 45 帧；超限、时间间断或跟踪失败均拒绝。追帧结束若过期，
 等待新鲜相机帧且暂不创建目标，2 秒内仍不能追上则拒绝。模型输出只是
@@ -132,60 +114,7 @@ Robot 主动 `wrist_pose_time_unmatched` Hold 也可恢复：
 已排队后的 Robot 重启、故障、状态接收异常或 Redis 发布失败取消初始意图；人工 `b/d/r/p/q`
 也取消该意图。`b` 仍可重新排队选点和跟随，手动模式保持鼠标选点及人工开始。
 
-```mermaid
-flowchart TD
-    A["Gemini 305"] --> B["Close Range Default<br/>视差模式 2：256，读回确认"]
-    B --> C["彩色 MJPG + 深度 Y16<br/>640×480，30 FPS"]
-    C --> D["深度对齐彩色<br/>流内参、深度尺度、采集时钟检查"]
-    D --> E["模型自动初始选点 / b / d 或鼠标选点<br/>初始化目标 ID 与局部纹理"]
-    E --> F["局部光流更新目标像素<br/>恢复三维点、拟合外法向"]
-    F --> G{"观测有效?"}
-    G -->|是| O["Redis observation<br/>点、法向、质量、原始采集时间"]
-    G -->|否| H["有目标时发布无效观测并锁存丢失<br/>跟随意图存在时请求暂停"]
-    U["操作请求 / 心跳"] --> CMD["Redis command"]
-    O --> R["Robot RedisBridge<br/>身份、序号、时效、质量检查"]
-    CMD --> R
-    R --> T["按采集时间插值位姿<br/>转换表面点与法向到 Base"]
-    T --> W["WristFollowController<br/>50 mm 法向悬停目标与连续姿态"]
-    W --> P["参考：TCP 4 mm/s、姿态 4°/s<br/>planner：每关节命令 4°/s、IK 与限位"]
-    P --> S["运行保护与异步发送门<br/>ServoJ 单槽发送"]
-    S -->|Execute 且发送门通过| ARM["RM75 实体机械臂"]
-    ARM --> ST["RMStateReader<br/>10 ms 查询请求周期"]
-    ST --> T
-    ST --> PUB["Redis state<br/>相机位姿、会话、跟随状态与拒绝原因"]
-    PUB --> E
-    H --> HOLD["Robot Hold：等待有效新点"]
-    HOLD -->|恢复意图有效且本进程暂停回执匹配| AUTO["新帧重选<br/>新目标回传后自动 resume"]
-    AUTO --> E
-    R -->|拒绝或断流| HOLD
-    P -->|规划拒绝| HOLD
-    S -->|致命保护触发| STOP["Fault / StopMotion<br/>静止确认及结果记录"]
-```
-
-模型模式自动初始开始及 `b` 重选的顺序如下；新目标回传是身份确认，后续规划和发送仍由 Robot 决定。
-
-```mermaid
-sequenceDiagram
-    actor U as 操作者
-    participant C as click_follow / ModelStart
-    participant M as 模型进程
-    participant T as LocalTracker
-    participant R as Robot（经 Redis）
-    U->>C: 启动默认模型相机；或 b 重选
-    C->>C: 检查新鲜 Hold、无故障，清除旧点
-    C->>M: 下一完整源帧，缓存后续帧
-    M-->>C: 唯一合格 carotid 框中心及源时间
-    C->>T: 源帧初始化并逐帧赶到当前帧
-    alt 检测、追踪或状态检查失败
-        C->>C: 取消当次待启动，记录原因；初始选点允许间隔重试
-    else 目标有效且新鲜
-        C->>R: 发布新 target_id 的 observation
-        R-->>C: 同会话、同目标的新鲜状态
-        C->>R: 首次 begin；有开始历史则 resume
-        R->>R: 观测检查、位姿插值、规划及执行门
-        R-->>C: 请求回执及 following / hold
-    end
-```
+新目标回传只确认身份，后续规划和发送仍由 Robot 决定。
 
 ### 相机观测生成
 
@@ -241,59 +170,6 @@ Tool-X 使用上一参考姿态的 X 轴在新切平面上的投影，退化则 
 
 ### 操作、Hold 与退出
 
-```mermaid
-stateDiagram-v2
-    [*] --> Waiting: 相机与 Robot 启动
-    Waiting --> Selecting: 模型自动初始选点；或 b
-    Hold --> Selecting: 模型 b；或恢复暂停回执确认
-    Selecting --> Observing: 新选点有效，发布新目标
-    Selecting --> Hold: 检测、追踪或状态检查失败
-    Waiting --> Observing: d 或鼠标选点有效
-    Observing --> Selecting: 模型 b 清除旧点，重新选点
-    Observing --> Following: ModelStart 确认目标后 begin/resume
-    Observing --> Following: 鼠标模式首次 b；有开始历史时 r
-    Following --> Following: 有效观测、心跳及计划提交
-    Following --> Hold: p / 观测丢失 / 超时 / 规划拒绝
-    Observing --> Hold: 观测失效或开始请求被拒
-    Hold --> Reselected: 人工 d / 左键选点有效
-    Reselected --> Selecting: 模型 b 重新选点
-    Reselected --> Following: 有开始历史时 r；鼠标模式首次 b
-    Following --> Fault: 运行保护触发
-    Hold --> Fault: 运行保护触发
-    Following --> CameraExited: q，发送 end
-    Observing --> CameraExited: q
-    Hold --> CameraExited: q
-    CameraExited --> Hold: Robot 收到结束或通信超时
-    Fault --> [*]: StopMotion 与静止确认结果记录
-```
-
-```mermaid
-sequenceDiagram
-    participant C as 相机 / ModelRecovery
-    participant R as Robot
-    participant M as 模型 / LocalTracker
-    alt 视觉观测失效且已有跟随意图
-        C->>R: 无效 observation；新的 pause 请求
-    else 同会话目标的 wrist_pose_time_unmatched Hold
-        R-->>C: 本进程请求回执且无故障的 Hold
-        C->>R: 新的 pause 请求
-    end
-    R-->>C: 新鲜 Hold，匹配 pause 的 producer / sequence
-    loop 意图与会话有效且尚无有效新点，约 0.75 秒间隔重试
-        C->>M: 新源帧重选并赶帧
-        M-->>C: 有效新鲜点及法向，或拒绝原因
-    end
-    alt 获得有效新点且恢复意图仍有效
-        C->>R: 有效 observation，新 target_id
-        R-->>C: 同一新目标的状态回传
-        C->>R: resume
-        R-->>C: following；或拒绝并保持 Hold
-    else 人工取消、会话或通信检查失败
-        C->>C: 取消恢复，保持 Hold
-    end
-```
-
-图中 Selecting / Observing / Reselected 描述相机交互阶段，不是 Robot 的控制枚举。
 按 `d` 或左键仅选点，不启动运动；跟随期间不能直接换点。心跳不会刷新观测采集年龄。
 模型模式首次人工开始/恢复后保留跟随意图：视觉丢失先请求暂停，确认本进程
 暂停回执后自动重选新的框中心；观测有效且 Robot 回传新目标 ID 后自动请求
@@ -332,7 +208,7 @@ StopMotion、确认静止并写入结束摘要；终端脚本转发这些停止�
 
 ## Redis 接口
 
-实例：127.0.0.1:7777。位置 m，矩阵采用列向量，T_A_B 将 B 映射到 A。
+实例：`127.0.0.1:7777`。位置 m，矩阵采用列向量，`T_A_B` 将 B 映射到 A。
 SHA-256 按标定文件原始字节计算，包括空白。
 
 | 名称 | 类型/方向 |
@@ -342,9 +218,9 @@ SHA-256 按标定文件原始字节计算，包括空白。
 | robot:wrist:command:v1 | Pub/Sub，点击入口 → Robot |
 | robot:wrist:seed:v1 | TTL 60 秒键，粗定位 → 投影模式；点击模式不读写 |
 
-### 点击模式
+### 跟随模式（scope=click_follow）
 
-Robot 参数为 --wrist-follow FILE，状态 scope=click_follow，与投影模式互斥。
+Robot 参数为 `--wrist-follow FILE`，状态 `scope=click_follow`，与投影模式互斥。
 
 观测/命令公共字段：version=1、runtime_session_id、producer_id、target_id、sequence、
 timestamp_monotonic_ns、boot_id、calibration_sha256（腕部摘要字符串）、
@@ -377,17 +253,14 @@ sequence、timestamp_monotonic_ns、valid、T_base_camera、control_state，以�
   surface_base_m、normal_base、goal_tcp_base_m；
 - pose_time_basis=host_feedback_receive_not_controller_sample。
 
-Robot 计算 T_base_camera=T_base_armtip*T_armtip_camera；目标为 surface_base+0.050*normal_out_base。
-Tool-Z 朝内、Tool-X 切平面连续，恢复从实测 TCP/关节建立参考，再经 planner；限速见使用说明。
-
-### 时序
+### 采集与反馈时序
 
 [projection_preview.py](projection_preview.py) 中共享 CaptureClock 将 SDK global capture 映射到同机单调时钟：30 帧预热，wall/monotonic 采样跨度 <=1 ms、
 相邻偏移变化 <=2 ms、彩深差 <=20 ms。采集时间递增、观测年龄 <=200 ms。
 按采集时刻插值 Robot 位姿（平移线性、旋转 SLERP），跨度 <=50 ms，不外推。
 状态保留原反馈序号和接收时间，不因重发刷新；机器人接收时刻不是控制器采样时刻，延迟需独立量测。
 
-### 投影模式
+### 投影模式（scope=projection_preview_only）
 
 scope=projection_preview_only；不发布观测/命令，--track 结果仅写日志。
 与点击状态共用 channel，但 calibration_sha256 为 {global,wrist} 对象，不能混用。
@@ -406,17 +279,6 @@ Robot 启动读取有效 seed 后固定身份；预览遇到运行会话变化�
 预览启动时检查 seed 有效期、boot、相机序列号和两份标定摘要，固定该身份；
 启动后不重读 seed，也不因 Redis TTL 到期自动换目标。最多保留 100 条状态，
 使用上一相机帧等待包围采集时间的位姿，按同一 200 ms / 50 ms 门限处理；投影失败只记录和显示原因。
-
-```mermaid
-flowchart LR
-    S["Redis seed<br/>Base 表面点，不含 50 mm 偏置"] --> V["启动校验<br/>有效期、boot、序列号、两份摘要"]
-    V --> P["上一相机帧 + 位姿插值<br/>投影红点及深度检查"]
-    R["Robot projection_preview_only state"] --> P
-    C["Gemini 同步 RGB-D"] --> P
-    P --> I["i 初始化可选 LocalTracker"]
-    I --> L["本地显示与日志；p 清除追踪"]
-    P --> L
-```
 
 实现入口：[click_follow.py](click_follow.py)、[wrist_projection.py](wrist_projection.py)、
 [RedisBridge](../Robot/src/redis_bridge.cpp)。操作见本机

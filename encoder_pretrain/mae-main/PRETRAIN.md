@@ -1,7 +1,12 @@
-## Pre-training MAE
+# MAE 预训练
+
+以下保留上游 ImageNet 训练配置和参考结果，未在本次整理中重跑。
+在本目录运行；先填写 JOB_DIR 和 IMAGENET_DIR，环境与许可见 [README](README.md)。
+
+## 多节点示例
 
 To pre-train ViT-Large (recommended default) with **multi-node distributed training**, run the following on 8 nodes with 8 GPUs each:
-```
+```bash
 python submitit_pretrain.py \
     --job_dir ${JOB_DIR} \
     --nodes 8 \
@@ -15,6 +20,9 @@ python submitit_pretrain.py \
     --blr 1.5e-4 --weight_decay 0.05 \
     --data_path ${IMAGENET_DIR}
 ```
+
+## 参数与参考结果
+
 - Here the effective batch size is 64 (`batch_size` per gpu) * 8 (`nodes`) * 8 (gpus per node) = 4096. If memory or # gpus is limited, use `--accum_iter` to maintain the effective batch size, which is `batch_size` (per gpu) * `nodes` * 8 (gpus per node) * `accum_iter`.
 - `blr` is the base learning rate. The actual `lr` is computed by the [linear scaling rule](https://arxiv.org/abs/1706.02677): `lr` = `blr` * effective batch size / 256.
 - Here we use `--norm_pix_loss` as the target for better representation learning. To train a baseline model (e.g., for visualization), use pixel-based construction and turn off `--norm_pix_loss`.

@@ -1,6 +1,6 @@
 # RM75 控制服务架构
 
-本文依据 **2026-10-02 当前工作区源码**，说明实际入口、线程边界、数据协议与停止路径。
+本文说明当前入口、线程边界、数据协议与停止路径；运行与验证历史见[项目进展](../../.runme/Progress/project-progress.md)。
 Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估计、Redis 视觉意图、控制律、规划和日志；
 唯一生产可执行文件为 `main_rm75`。历史六轴源码不在当前 CMake 构建链中。
 
@@ -23,7 +23,7 @@ Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估
 
 无参数 profile 当前固定 RM75 `192.168.50.254:8080`、KWR57 RS422 串口
 `/dev/ttyUSB0`（460800 baud）、本机 Redis `127.0.0.1:7777`；标定文件从可执行文件目录
-读取 `kwr57_force_calibration.json`，标定身份为用户赋予的 `KWR57`（不是设备读回的序列号），
+读取 `rm75_force_calibration.json`，标定身份为用户赋予的 `KWR57`（不是设备读回的序列号），
 Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。新标定文件尚需实际采集生成，不复用旧传感器标定。
 控制周期 10 ms、执行预热 2 s、无接触 tare 3 s、duration=0。
 Redis `terminate` 结束一轮扫描并返回 Armed idle，进程继续等待下一轮；正在执行的目标力卸载先完成卸载 / 制动。
@@ -85,45 +85,22 @@ Eigen ≥3.3、OpenSSL、Threads、hiredis；JSON 头文件来自仓库 include�
 | `ControlLaw::Step()` / `WristFollowController::Step()` | 只产生参考 / 状态，不发送硬件命令；腕部 `Commit()` 仅在有效计划成功提交后推进参考 |
 | `Rm75ServoPlanner::Plan()` | 必须 `valid=true` 才可提交；IK、阻尼、关节限位与奇异检查由 planner 统一执行 |
 | `RedisBridge::EvaluateCommandForControl()` | 超声视觉意图进入控制层的失效拒绝门；连接状态与 payload 从同一快照读取 |
-| `CalibratedFrameChain` | 从已校验标定构造，统一 Probe TCP、Tool-Y、Base←Tool/Sensor 与 Camera 变换；不在入口手工拼装重复矩阵 |
+| `CalibratedFrameChain` | 从已校验标定构造，统一 Probe TCP、Tool-Y、独立的 Base←Sensor / Base←Tool 与 Camera 变换；不在入口手工拼装重复矩阵 |
 | `AsyncRuntimeLogger::PushAndMeasure()` | 提交周期记录，后台 writer 独占 CSV；summary 只在最终快照上构造 |
 
 位置统一用 m、旋转矩阵采用列向量；`T_A_B` 将 B 中的坐标映射到 A。
+标定 schema v2 在原文件新增 `probe_to_sensor.rotation_row_major`，表示 `R_S_T`。
+原 `sensor_to_tool.rotation_row_major` 继续表示 `R_A_S`，仅探头控制使用其乘积
+`R_A_T = R_A_S * R_S_T`；Sensor 下的重力补偿、wrench 和 STL 估计不使用合成旋转。
+v1 文件读取时按 `R_S_T = I` 升级；v2 必须提供新字段，写出统一为 v2。
+力与力矩保持原 Tool 参考原点（不改为 TCP），接触偏移则相对 TCP 后转入探头工作轴。
+
 生产反馈为 ArmTip，控制目标涉及 Probe TCP，二者通过标定链转换，不能混用。
 `RMKinematics` 只提供七轴 FK / Jacobian 与限位读取，不能用历史六轴接口绕过 planner。
 
 ## 线程、周期与数据流
 
-```mermaid
-sequenceDiagram
-    participant ST as 状态线程
-    participant FS as 力传感器线程
-    participant BR as Redis 订阅线程
-    participant C as main_rm75 周期
-    participant P as 控制器 / Planner
-    participant IO as transport I/O
-    participant OUT as Redis 发布 / CSV writer
-    ST-->>C: Latest RobotStateSnapshot
-    FS-->>C: Latest WrenchSample（有力模式）
-    BR-->>C: 最新命令 / 腕部观测快照
-    C->>C: 有效、陈旧、量程、运行与时序门
-    alt 超声控制
-        C->>C: wrench 补偿、接触估计、意图判定
-    else 腕部跟随
-        C->>C: 采集时间位姿插值，点与法向变换到 Base
-    end
-    C->>P: Step；需要运动时 Plan
-    P-->>C: 控制状态与计划 valid / error
-    alt Execute、有效计划且发送门通过
-        C->>IO: TryServoJ：提交单槽目标
-        IO->>IO: 后台发送并更新 Servo 状态
-    else Hold / 拒绝
-        C->>C: 保持或重建参考，记录原因
-    end
-    C->>OUT: 遥测 / 状态 / 周期日志快照
-```
-
-图示为稳态周期。控制线程不直接进行正常周期的 socket / 串口读写、Redis JSON 发布或 CSV 落盘；
+稳态周期读取状态、力与 Redis 快照，经有效性 / 时效 / 量程检查后执行 Step 和 Plan。控制线程不直接进行正常周期的 socket / 串口读写、Redis JSON 发布或 CSV 落盘；
 启动、故障和退出阶段的确认停止允许等待反馈。`TryServoJ` 的成功只表示提交成功，
 实际发送结果由异步 Servo 状态检查；不能据此宣称控制器执行完成。
 反馈恢复时重建参考，并等待更新的生产者命令，不能继续旧意图。
@@ -146,28 +123,6 @@ sequenceDiagram
 `phase_idx` 是视觉意图，不是 Robot 状态；状态还取决于接触锁存、力稳定和旋转锁存。
 入口可另行覆盖为 Hold / Fault；腕部无力模式不经过这些分支。
 
-```mermaid
-flowchart TD
-    INPUT["有效 Robot / wrench 与控制意图"] --> ARMED{"motion_armed?"}
-    ARMED -->|否| OBS["observe"]
-    ARMED -->|是| FORCE["接触锁存、目标力卸载优先判断"]
-    FORCE --> IDLE{"idle / terminate<br/>且不处于卸载 / 制动?"}
-    IDLE -->|是| WAIT["armed：清理本轮运动状态"]
-    IDLE -->|否| Z["更新 Tool-Z<br/>接近 / 导纳 / 卸载 / 制动 / 重新接触"]
-    Z --> CONTACT{"已锁存接触?"}
-    CONTACT -->|否| APPROACH["approach"]
-    CONTACT -->|是| READY{"已完成力稳定<br/>且无卸载 / 恢复过渡?"}
-    READY -->|否| SETTLE["force_settle"]
-    READY -->|是| ROT{"旋转已锁存?"}
-    ROT -->|是| ROTATE["rotate_align"]
-    ROT -->|否| PHASE{"phase_idx = 1?"}
-    PHASE -->|是| TRIGGER["trigger_align<br/>横向误差连续合格后锁存旋转"]
-    TRIGGER -->|"连续 0.4 s，误差 <8 mm"| ROTATE
-    PHASE -->|否| SCAN_GATE{"phase_idx = 0 / 2<br/>且误差 ≤0.8 mm?"}
-    SCAN_GATE -->|是| SCAN["scan"]
-    SCAN_GATE -->|否| SETTLE
-```
-
 | 状态 / 条件 | 当前参考行为与默认门限 | 锁存 / 边界 |
 | --- | --- | --- |
 | `armed` | idle 或 terminate，通常不生成扫描增量 | 卸载 / 制动尚未结束时推迟此分支；terminate 不退出 Redis 控制进程 |
@@ -185,25 +140,8 @@ flowchart TD
 替换有限修正余量；重复序号不重复累加角修正。Y 的瞬时力门为 `abs(Fz)>1.2 N`，
 `visual_y_force_stable_duration_s` 当前只保留给配置 / 日志，不参与 Y 门控。
 
-目标力卸载是独立轴向优先层。图中分解为内部阶段，`target_force_unloading` 包含卸载和制动，
-`target_force_recovering` 包含重新接触和恢复导纳；这些阶段不是新增 supervisor 枚举：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Normal
-    Normal --> Unloading: 已接触且 Fz ≤目标力减 1 N，连续 0.5 s
-    Unloading --> Braking: Fz 回到目标力或更浅
-    Braking --> Unloading: 再次超过卸载力门
-    Braking --> Reacquiring: 速度制动至零，action 仍有效且非 terminate
-    Braking --> Armed: 速度制动至零，idle 或 terminate
-    Reacquiring --> Restoring: abs(Fz) ≥0.99 N
-    Restoring --> Reacquiring: abs(Fz) <0.99 N
-    Restoring --> Normal: 目标力误差 ≤0.8 N 连续 0.5 s
-    Reacquiring --> Armed: idle 或 terminate
-    Restoring --> Armed: idle 或 terminate
-    Reacquiring --> Unloading: 再次超力达到进入条件
-    Restoring --> Unloading: 再次超力达到进入条件
-```
+目标力卸载是独立轴向优先层：Normal → Unloading → Braking → Reacquiring → Restoring。`target_force_unloading` 包含卸载和制动，
+`target_force_recovering` 包含重新接触和恢复导纳；这些阶段不是新增 supervisor 枚举。
 
 卸载请求 -Tool-Z，默认最高 10 mm/s，接近目标力时线性减速；回到目标力后以
 50 mm/s² 制动到零。需要重新接触时请求 +Tool-Z 5 mm/s，恢复导纳时最高 2 mm/s、
@@ -255,8 +193,8 @@ Robot 的 `SubscriberLoop()` / `EvaluateCommandForControl()` 实际检查连接�
 **没有强制验证新 session 必须先发送 idle**；启动 Usage 和注释中的握手说明不能当作已实现接收门。
 补接收端握手状态机属于后续工作，本次未改动控制逻辑。
 
-sensor v1 使用 N / N·m / m，接触 frame 为 `probe_tcp_sensor_aligned`；
-监控的解析与选源行为见 [SensorMonitor 架构](../SensorMonitor/ARCHITECTURE.md)。
+sensor v1 使用 N / N·m / m，接触 frame 为 `probe_tcp_tool`（TCP 相对位置、探头工作轴）；
+项目通过 Redis 发布此遥测，不依赖 SensorMonitor；该独立工具启动后可自动识别并只读订阅，见 [SensorMonitor 架构](../SensorMonitor/ARCHITECTURE.md)。
 腕部协议除 envelope 年龄 / 序号外，还检查 runtime session、boot、标定原始字节 SHA-256、
 producer、target、frame / 单位、采集时间与几何质量。新目标只在 Hold 接管，
 解除 Hold 需要有效新目标及对应显式请求，普通心跳不能恢复。
@@ -286,28 +224,6 @@ Tool-X 由上一参考 X 轴在切平面的投影生成，退化则 Hold。完�
 其他反馈与运行保护仍可禁止动作。腕部 Hold 可发送保持关节目标，也不等于物理静止确认。
 
 ## 停止与退出时序
-
-```mermaid
-sequenceDiagram
-    participant E as 信号 / 故障 / 时限
-    participant C as main_rm75
-    participant IO as RMCommand I/O
-    participant ST as RMStateReader
-    participant L as 日志 / summary
-    E->>C: INT / TERM / HUP 标志，或运行故障
-    C->>IO: Execute 路径 StopAndConfirmStationary
-    IO->>IO: Stop 优先 mailbox，有界确认重试
-    IO-->>C: StopMotion 回执成功或失败
-    alt 回执成功
-        loop 等待连续 5 次健康新反馈（默认确认窗口 3000 ms）
-            ST-->>C: 原序号、关节、Probe TCP、姿态
-            C->>C: 相邻变化与窗口累计变化检查
-        end
-    end
-    C->>C: 停止状态 / 力采集，发布最终状态后停止 Redis
-    C->>L: logger.Stop，排空 CSV 并结束 writer
-    C->>L: 从最终快照构造 summary v2 并落盘
-```
 
 [StopAndConfirmStationary](src/calibrated_frame_chain.cpp) 先确认 Stop 回执，再要求连续 5 次
 新反馈有效、未陈旧且 arm / system error 为零，同时满足下表；运动使计数归零并重建窗口锚点。
@@ -366,11 +282,11 @@ ctest --test-dir infer/Robot/build --output-on-failure
 | [runtime_schema.hpp](include/runtime_schema.hpp) | CSV 列顺序 / 单位和 summary 契约；不在入口追加平行序列化 |
 
 离线测试不访问 Robot、串口或 Redis 服务，通过也不表示真机验收完成。
-本轮只进行源码、文档链接、表格 / 图结构与差异检查，未执行编译、CTest 或实际设备运行。
+实际验证结果按日期记录在[项目进展](../../.runme/Progress/project-progress.md)，本文不代表一次新的编译或设备验收。
 `build/` 中二进制、标定副本与日志是运行产物；有效运行配置、丢行数和最终停止结果以该次
 CSV / summary 为准，后续离线回放可复用无 I/O 控制与规划模块，完整回放工具尚未在此入口实现。
 
-## 2026-10-26 KWR57 RS422 适配
+## KWR57 协议边界
 
 默认协议改为 `kwr57-rs422`、460800/8N1、关闭流控。启动发送 `48 AA 0D 0A`，
 退出时有界尝试发送 `43 AA 0D 0A`；500 Hz 数据只更新最新快照，控制周期仍为 10 ms。
@@ -379,7 +295,7 @@ CSV / summary 为准，后续离线回放可复用无 I/O 控制与规划模块�
 
 KWR57 没有 CRC，`WrenchSample.checksum_available=false`、`checksum_valid=false`；
 `IntegrityValid()` 根据协议接受有效完整帧，旧协议仍要求 checksum。Redis v1 的
-`sensor.checksum_available` 是向后兼容的新增字段，旧消息缺失时监视器仍要求 checksum。
+`sensor.checksum_available` 是向后兼容的新增字段，旧消息缺失时 SensorMonitor 按有 checksum 处理。
 CSV v2 列保持不变，KWR57 的 checksum 列为 false；summary 的 control 中补充协议、波特率
 和 checksum_available 信息。未知具体型号时，有效原始力矩门取原配置与 2 N·m 的较小值，
 原始力门仍为 50 N。传感器量程、无校验和的局限与接线见

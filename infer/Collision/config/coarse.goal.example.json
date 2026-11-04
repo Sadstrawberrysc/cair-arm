@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "coarse_target": {
+    "artery_path_file": "../../Camera_RT/artery_path.txt",
+    "camera_calibration_file": "../../hand_eye_calibration-main/d455_to_rm75_base.json",
+    "tool_calibration_file": "../../Robot/build/rm75_force_calibration.json",
+    "arm_tip_link": "Link7",
+    "standoff_m": 0.20,
+    "max_target_age_s": 0,
+    "surface_match_tolerance_m": 0,
+    "ik_options": {
+      "attempts": 8,
+      "iterations": 80,
+      "timeout_s": 4.0,
+      "yaw_offsets_deg": [0],
+      "tilt_offsets_deg": [[0, 0], [0, 9], [9, 0], [-9, 0], [0, -9]],
+      "max_normal_deviation_deg": 10,
+      "max_candidates_per_pose": 1,
+      "position_tolerance_m": 0.001,
+      "rotation_tolerance_rad": 0.01
+    }
+  },
+  "planning_options": {
+    "allow_unknown_space": true,
+    "skip_start_precheck": true,
+    "timeout_s": 60.0,
+    "range": 0.3,
+    "max_queries": 20000,
+    "shortcut_attempts": 10,
+    "seed": 42
+  }
+}

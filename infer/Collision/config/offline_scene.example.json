@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "scene": {
+    "id": "offline-manual-example-v1",
+    "calibration_id": "manual-base-frame-not-camera-calibration",
+    "frame": "base_link",
+    "captured_at_ns": 0,
+    "known_space": {
+      "min_m": [-2.0, -2.0, -0.2],
+      "max_m": [2.0, 2.0, 2.0]
+    },
+    "obstacles": [
+      {
+        "id": "example-fixed-box",
+        "shape": "box",
+        "size_m": [0.25, 0.25, 0.50],
+        "xyz_m": [0.50, 0.0, 0.60],
+        "rpy_rad": [0.0, 0.0, 0.0]
+      }
+    ]
+  },
+  "now_ns": 0,
+  "joint_positions_rad": {
+    "joint1": 0.0,
+    "joint2": 0.0,
+    "joint3": 0.0,
+    "joint4": 0.0,
+    "joint5": 0.0,
+    "joint6": 0.0,
+    "joint7": 0.0
+  },
+  "options": {
+    "clearance_m": 0.005,
+    "numerical_guard_m": 0.000001,
+    "max_scene_age_ns": 500000000,
+    "max_state_checks": 2048,
+    "max_subdivision_depth": 20
+  },
+  "self_collision_exclusions": []
+}

@@ -1245,6 +1245,13 @@ bool ForceCalibration::Validate(std::string* error) const {
             return false;
         }
     }
+    if (!rotation_sensor_from_probe.array().isFinite().all()
+        || (rotation_sensor_from_probe.transpose() * rotation_sensor_from_probe
+            - Eigen::Matrix3d::Identity()).norm() > 1e-6
+        || std::abs(rotation_sensor_from_probe.determinant() - 1.0) > 1e-6) {
+        SetError(error, "rotation_sensor_from_probe is not a proper rotation");
+        return false;
+    }
     const Eigen::Matrix3d should_be_identity =
         rotation_tool_from_sensor.transpose() * rotation_tool_from_sensor;
     if ((should_be_identity - Eigen::Matrix3d::Identity()).norm() > 1e-6
@@ -1286,6 +1293,21 @@ bool ForceCalibration::LoadJson(const std::string& path, std::string* error) {
 
     try {
         schema_version = input.at("schema_version").get<int>();
+        rotation_sensor_from_probe.setIdentity();
+        if (schema_version == 2) {
+            if (!JsonToMatrix(input.at("probe_to_sensor").at("rotation_row_major"),
+                              rotation_sensor_from_probe)) {
+                SetError(error, "invalid probe_to_sensor rotation");
+                return false;
+            }
+        } else if (schema_version == 1) {
+            if (input.contains("probe_to_sensor")) {
+                SetError(error, "probe_to_sensor requires schema_version 2");
+                return false;
+            }
+            // Upgrade the legacy coincident-axis model in memory.
+            schema_version = kSchemaVersion;
+        }
         sensor_id = input.at("sensor_id").get<std::string>();
         probe_model = input.at("probe_model").get<std::string>();
         probe_model_sha256 = input.value("probe_model_sha256", std::string());
@@ -1366,6 +1388,8 @@ bool ForceCalibration::SaveJson(const std::string& path, std::string* error) con
     output["sensor_to_tool"] = {
         {"rotation_row_major", MatrixToJson(rotation_tool_from_sensor)},
         {"translation_sensor_to_tool_m", VectorToJson(translation_sensor_to_tool_m)}};
+    output["probe_to_sensor"] = {
+        {"rotation_row_major", MatrixToJson(rotation_sensor_from_probe)}};
     output["probe_tcp_sensor_m"] = VectorToJson(probe_tcp_sensor_m);
 
     const std::filesystem::path output_path(path);
@@ -1427,8 +1451,8 @@ CompensatedWrench ForceCalibration::Compensate(
     const Eigen::Vector3d torque_at_tool_sensor =
         compensated_torque
         - translation_sensor_to_tool_m.cross(compensated_force);
-    result.tool.head<3>() = rotation_tool_from_sensor * compensated_force;
-    result.tool.tail<3>() = rotation_tool_from_sensor * torque_at_tool_sensor;
+    result.tool.head<3>() = rotation_sensor_from_probe.transpose() * compensated_force;
+    result.tool.tail<3>() = rotation_sensor_from_probe.transpose() * torque_at_tool_sensor;
     result.valid = true;
     return result;
 }

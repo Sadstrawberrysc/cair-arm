@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "region_min_m": [-1.0, -1.0, -0.2],
+  "region_max_m": [1.0, 1.0, 1.5],
+  "voxel_m": 0.01,
+  "min_depth_m": 0.05,
+  "max_depth_m": 3.0,
+  "mask_padding_m": 0.01,
+  "robot_occlusion_filter": true,
+  "outlier_radius_m": 0.03,
+  "outlier_min_neighbors": 5,
+  "endpoint_padding_voxels": 0,
+  "max_points": 60000,
+  "max_voxels": 300000,
+  "max_feedback_offset_ns": 100000000,
+  "max_frame_age_ns": 61000000000,
+  "clearance_m": 0.02,
+  "self_collision_exclusions": [
+    {
+      "first_link": "Link7",
+      "second_link": "camera_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "Link7",
+      "second_link": "connector_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "Link7",
+      "second_link": "force_sensor_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "Link7",
+      "second_link": "Lprobe_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "camera_link",
+      "second_link": "connector_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "camera_link",
+      "second_link": "force_sensor_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "camera_link",
+      "second_link": "Lprobe_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "connector_link",
+      "second_link": "force_sensor_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "connector_link",
+      "second_link": "Lprobe_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "force_sensor_link",
+      "second_link": "Lprobe_link",
+      "reason": "用户确认末端装配正常；两连杆属于同一固定附件组件，无相对运动"
+    },
+    {
+      "first_link": "base_link",
+      "second_link": "Link1",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link1",
+      "second_link": "Link2",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link2",
+      "second_link": "Link3",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link3",
+      "second_link": "Link4",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link4",
+      "second_link": "Link5",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link5",
+      "second_link": "Link6",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "Link6",
+      "second_link": "Link7",
+      "reason": "用户明确要求关闭活动关节相邻连杆之间的全部自碰撞和自净空检查"
+    },
+    {
+      "first_link": "support_link",
+      "second_link": "base_link",
+      "reason": "用户确认同轴固定圆柱支撑与机械臂底座正常安装接触，排除该对自碰撞及自净空检查"
+    }
+  ]
+}

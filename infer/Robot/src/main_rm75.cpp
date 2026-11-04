@@ -418,7 +418,7 @@ RuntimeTareResult CollectRuntimeTare(
             return result;
         }
         const CompensatedWrench compensated = calibration.Compensate(
-            raw, frame_chain.RotationBaseFromTool(robot.pose));
+            raw, frame_chain.RotationBaseFromSensor(robot.pose));
         if (!compensated.valid) {
             result.error = "runtime tare compensation failed: "
                 + compensated.error;
@@ -514,19 +514,16 @@ void ApplyRuntimeTare(const Eigen::Matrix<double, 6, 1>& sensor_offset,
     compensated.sensor -= sensor_offset;
 }
 
-// On this RM75 installation the logical Tool axes are coincident with the
-// force-sensor axes. The legacy calibration field named sensor_to_tool stores
-// the fixed Arm_Tip <- Sensor mount rotation needed to combine controller pose
-// feedback with sensor gravity compensation; it must not rotate the wrench a
-// second time when exposing it in the logical Tool frame.
-void ExpressWrenchInSensorAlignedToolFrame(
+// Shift moments at the existing Tool origin, then express in probe working axes.
+void ExpressWrenchInProbeToolFrame(
     const CalibratedFrameChain& frame_chain,
     CompensatedWrench& compensated) {
     if (!compensated.valid) return;
-    const Eigen::Vector3d force_tool = compensated.sensor.head<3>();
+    const Eigen::Vector3d force_sensor = compensated.sensor.head<3>();
     const Eigen::Vector3d torque_tool = compensated.sensor.tail<3>()
-        - frame_chain.TranslationSensorToToolM().cross(force_tool);
-    compensated.tool << force_tool, torque_tool;
+        - frame_chain.TranslationSensorToToolM().cross(force_sensor);
+    compensated.tool << frame_chain.SensorVectorInTool(force_sensor),
+        frame_chain.SensorVectorInTool(torque_tool);
 }
 
 }  // namespace
@@ -755,9 +752,8 @@ int main(int argc, char** argv) {
     Rm75ControlConfig control_config = options.control;
     Rm75RuntimeSafetyConfig safety_config = options.EffectiveSafety();
     control_config.cycle_s = options.period_ms / 1000.0;
-    // RMState pose is Base -> Arm_Tip. The current hardware Tool frame is
-    // coincident with Sensor, while Arm_Tip and Tool differ by the calibrated
-    // fixed 30-degree Z mount rotation. Keep control deltas in Tool/Sensor.
+    // RMState pose is Base -> Arm_Tip. Compose Sensor mount and independent
+    // probe axes for control; gravity compensation uses only the Sensor mount.
     const CalibratedFrameChain frame_chain(calibration);
     Eigen::Matrix4d wrist_arm_camera=Eigen::Matrix4d::Identity();
     std::string wrist_hash, wrist_global_hash;
@@ -1112,7 +1108,7 @@ int main(int argc, char** argv) {
               << "configured_maximum_orientation_excursion_deg: "
               << safety_config.maximum_orientation_excursion_deg << '\n'
               << "controller_pose_frame: arm_tip\n"
-              << "control_tool_frame: sensor\n"
+              << "control_tool_frame: probe\n"
               << "rotation_arm_tip_from_tool_row_major: ["
               << control_config.rotation_pose_from_tool(0, 0) << ' '
               << control_config.rotation_pose_from_tool(0, 1) << ' '
@@ -1123,6 +1119,8 @@ int main(int argc, char** argv) {
               << control_config.rotation_pose_from_tool(2, 0) << ' '
               << control_config.rotation_pose_from_tool(2, 1) << ' '
               << control_config.rotation_pose_from_tool(2, 2) << "]\n"
+              << "rotation_sensor_from_probe: ["
+              << calibration.rotation_sensor_from_probe << "]\n"
               << "probe_tcp_sensor_m: ["
               << frame_chain.ProbeTcpSensorM().transpose() << "]\n"
               << "probe_tcp_tool_m: ["
@@ -1499,7 +1497,7 @@ int main(int argc, char** argv) {
             force_sample.monotonic_timestamp = cycle_started;
             force_sample.io_status = ForceSensorIoStatus::kStreaming;
             const Eigen::Matrix3d rotation_base_from_sensor =
-                frame_chain.RotationBaseFromTool(model_pose);
+                frame_chain.RotationBaseFromSensor(model_pose);
             const Eigen::Vector3d gravity_sensor =
                 rotation_base_from_sensor.transpose() * calibration.gravity_base_n;
             raw_wrench.head<3>() = calibration.force_bias_n + gravity_sensor;
@@ -1509,7 +1507,7 @@ int main(int argc, char** argv) {
         }
 
         const Eigen::Matrix3d rotation_base_from_sensor =
-            frame_chain.RotationBaseFromTool(robot_state.pose);
+            frame_chain.RotationBaseFromSensor(robot_state.pose);
         // 补偿顺序：原始量程检查 -> 标定的零点/重力/质心补偿 -> 本次 tare
         // -> 表达到逻辑 Tool 坐标。control_wrench 最终由控制律进一步处理。
         CompensatedWrench compensated;
@@ -1527,7 +1525,7 @@ int main(int argc, char** argv) {
                 ApplyRuntimeTare(runtime_tare.sensor_offset,
                                  compensated);
             }
-            ExpressWrenchInSensorAlignedToolFrame(frame_chain, compensated);
+            ExpressWrenchInProbeToolFrame(frame_chain, compensated);
         } else if (!raw_wrench_in_range) {
             compensated.error = "force_sensor_raw_overrange";
         } else {
@@ -1709,7 +1707,7 @@ int main(int argc, char** argv) {
         }
 
         // 5.5 调用扫描/力控状态机。
-        // 输入保持在 Tool/Sensor 坐标，输出是相对当前理想参考的 6D 目标增量；
+        // 输入保持在 探头 Tool 坐标，输出是相对当前理想参考的 6D 目标增量；
         // approach、force_settle、scan、trigger_align、rotate_align 等状态均在
         // Rm75ControlLaw::Step 内决定。
         Rm75ControlInput control_input;
@@ -1722,10 +1720,9 @@ int main(int argc, char** argv) {
         control_input.robot_model_tool_y_error_m =
             robot_model_tool_y_error_m;
         if (contact.valid) {
-            // ContactLocation returns Sensor coordinates, which are already
-            // the physical Tool coordinates on this installation.
+            // ContactLocation uses Sensor axes; control uses TCP-relative probe axes.
             control_input.contact_point_probe_m =
-                contact.point - frame_chain.ProbeTcpSensorM();
+                frame_chain.ContactPointRelativeTcpTool(contact.point);
         } else {
             control_input.contact_point_probe_m.setZero();
         }
@@ -2259,7 +2256,7 @@ int main(int argc, char** argv) {
             message.legacy_contact_point_sensor_m = contact.point;
             if (contact.valid) {
                 message.contact_point_probe_m =
-                    contact.point - frame_chain.ProbeTcpSensorM();
+                    frame_chain.ContactPointRelativeTcpTool(contact.point);
             }
             message.contact_residual_nm = contact.valid ? contact.residual : 0.0;
             message.contact_point_error_m =

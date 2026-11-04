@@ -18,8 +18,7 @@ RealSense RGB-D
   → CLIFF HR48 人体姿态与体型
   → SMPL + AnatomyModel 骨骼/血管网格
   → PyTorch3D 投影与 OpenCV 叠加
-  → artery_path.txt（相机光学坐标，m）
-  → 按 s 写入 artery_path.txt（法向 + 采样点）
+  → 按 s 写入 artery_path.txt（相机光学坐标，m；法向 + 顶部优先采样点）
 ```
 
 主要文件：
@@ -77,13 +76,13 @@ python cliff_demo.py
 - `artery_path.txt` 第一行是相机坐标法向量，后续行是相机三维点，单位为米。
 - `artery_path_rbt.txt` 没有可信生成器，文件名不能证明数据属于机器人坐标。
 - 新机器、新位置或相机重新固定后，旧路径与旧外参全部失效。
-- `infer/Calibration` 使用 accepted 外参把一次快照离线转换为 RM75 Base 坐标。
+- 当前交接由 `../hand_eye_calibration-main/run_probe_target.py` 和 `transform_point.py` 完成；历史 `infer/Calibration` 目录已不存在。
 - 未验证相机内参、深度尺度、时间同步和外参残差前，不得生成机器人目标。
 - 未经用户明确授权和现场安全确认，不得启动 `main_rm75` 或发送运动命令。
-- Robot 只能消费 Calibration 生成且摘要匹配的 Base 路径，不能直接读取相机坐标。
+- 当前定位脚本转换新快照后调用 `arm_probe_pose --controller-movej-p`；历史 accepted Base 路径是另一接口，不能混用。
 - 相机功能调试不得通过启动机器人来验证坐标方向。
 - 模型权重、SMPL 资产、视频、缓存和实时路径文件不得提交到 Git。
 - 不要直接用当前 `requirements.txt` 批量覆盖已验证的 `camera` 环境。
 - 修改依赖时先更新预检基线，并在 `DECISIONS.md` 记录兼容性决定。
-- 每次只处理一个功能点；环境和静态验证通过后再改实时推理。
+- 按当前任务完成必要实现与相关验证；环境或设备受阻时继续推进离线工作，明确记录未验收范围。
 - 后续公共接口、坐标语义或标定格式变更必须同步模块和根级决策日志。

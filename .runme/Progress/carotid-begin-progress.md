@@ -7,37 +7,15 @@
 > Notebook 整理及模块合并日期：2026-10-02。下方历史验证结果保留原记录的日期与执行范围，迁移未新增实测。
 > 历史验证命令标记为 `ignore=true`，仅供查阅；日常启动在 run notebook 中逐个执行。
 
-## 当前组织与入口（2026-10-02）
+## 当前组织与待验收
 
-`infer/Carotid_begin/` 的模型代码已并入 `infer/Camera_wrist/detector/`，相机和模型仍为
-独立进程，分别使用 `camera` 与 `ultralytics` 环境，经私有 socketpair 交换 RGB-D 和结果。
-常驻服务入口改为 `python -m infer.Camera_wrist.detector.worker`，由相机自动启动。
-会话、单键开始和恢复状态机提取到 `Camera_wrist/follow_session.py`。
+原 `Carotid_begin` 已并入 `Camera_wrist/detector/`。默认模型 ID 取 `detector/config.py`，显式 CLI 优先于环境变量；
+相机默认模型模式，`--manual` 保留手动跟踪，始终连接 Redis。2026-10-12 起模型在 Robot 就绪后自动选点并请求跟随，
+TCP / 姿态 / 每关节命令限速为 4 mm/s、4°/s、4°/s；下方 10-02 的人工首次开始和限速值保留历史语义。
 
-`click_follow.py` 与 `start_camera.sh` 无参数均默认模型模式，模型 ID 在
-[detector/config.py](../../infer/Camera_wrist/detector/config.py) 的 `DEFAULT_MODEL_ID` 定义；
-显式 `--model-id` 优先于环境变量 `CAROTID_MODEL_ID`。手动选点保留，使用
-`bash infer/Camera_wrist/start_camera.sh --manual`；左键选点后沿用光流、深度和 Robot 请求链。
-启动或模型加载不自动发送跟随开始请求，Robot 公共协议和控制未因本次合并改变。
-
-默认缓存迁到 `Camera_wrist/data/model_cache/`，`MODEL_CACHE_DIR` 仍可覆盖；
-凭据继续读 `~/.config/carotid_begin/roboflow_api_key`，无需重录。测试统一到
-`Camera_wrist/tests/`；默认选点/推理阈值均为 0.4，旧记录的 0.5 是当时配置。
-当前 `camera` 环境离线入口为
-`/home/cair-jacen/anaconda3/envs/camera/bin/python -m unittest discover -s infer/Camera_wrist/tests -v`。
-本次 `camera` / `carotid` 各 79 项、`ultralytics` 模型相关 14 项离线测试通过，包含
-真实 socketpair 与假模型 worker；未运行真实 GPU 推理、相机、Redis 回环或机械臂运动。
-详细范围见
-[腕部进展](camera-wrist-progress.md#2026-10-02carotid_begin-合并到腕部模块)。
-其他索引见 [项目进展](project-progress.md)和[早期方案历史](yolo-roboflow-visual-servo-plan.md)。
-下方旧目录、入口、无 Redis 分支及通过数是历史记录，不作为迁移后的当前能力或启动命令。
-
-## 当前待验收事项
-
-- 第 9 版模型的真实 RGB-D 选点与连续融合、模型丢失后的恢复，以及手动模式的现场跟踪。
-- 模型框中心与实际扫描点的独立真值、多对象/会话定位误差和错选率。
-- 腕部外参、TCP 几何、采集/反馈时序和悬停净空；源码迁移与离线通过不补足这些证据。
-- 接触人体及超声力控交接仍未在当前链路实现，属于后续扩展。
+模型进程使用 ultralytics，SDK 使用 camera，经私有 socketpair 交互；Robot 负责坐标与运动。
+当前仍需真实目标连续融合 / 恢复、独立扫描点真值、外参 / TCP / 时序与净空验收；接触和超声力控交接未实现。
+当前验证与启动见 [腕部进展](camera-wrist-progress.md)和 [腕部操作](../run/camera-wrist-operations.md)。
 
 ## 合并前证据汇总（2026-10-02）
 
@@ -178,33 +156,11 @@ ServoJ 规划增加每个关节 **1°/s** 的命令步长上限，即 10 ms 周�
 
 57 项相机离线测试通过；未执行真机验证。需重启相机进程后使用新按键流程。
 
-## 历史运行说明（2026-10-02）
+## 历史启动约定（2026-10-02）
 
-Redis 需运行于 `127.0.0.1:7777`；相机和 Robot 入口不会自动启动 Redis。
-启动 / 检查命令已迁到 [最简启动 notebook](../run/carotid-begin-operations.md)。
-
-`PONG` 表示已运行，无需重复启动。旧流程在独立 Redis 终端运行服务，
-并在相机与 Robot 运行期间保持该终端运行；新 notebook 使用后台服务入口。
-
-服务只监听本机，关闭 RDB 定时保存和 AOF 持久化；确认 `PONG` 后再启动相机和 Robot。
-
-Redis 只负责消息中转。窗口显示 `waiting for Robot state` 表示尚未收到有效
-机器人状态，还需要 Robot 程序正常运行并发布状态；仅启动 Redis 不会消除
-该提示。相机每次启动都连接 Redis 并订阅 Robot 状态；独立视觉启动参数
-已取消。收到状态只建立通信，模型模式首次按 `b` 自动选点并请求跟随。
-
-通过启动 notebook 打开**相机终端**，等待相机窗口出现有效 RGB-D 与目标框。
-
-现场确认探头与人体完全分离、预期运动范围没有人或障碍、急停可立即使用后，
-通过启动 notebook 的 **Robot 单元**打开持续运行的空中跟随试验。
-
-相机窗口首次只需按 `b`：自动检测选点，等待新鲜跟踪点及 Robot 新目标确认后
-请求开始。`d` 保留为只选点、不运动。之后视觉点丢失会先暂停，自动从新
-检测框中心重建点；新目标观测送达 Robot 后自动恢复，无需重复按 `d/r`。
-没有有效点时保持 Hold。`p` 取消自动跟随并暂停；人工暂停、通信异常或
-Robot 非视觉拒绝后，可按 `b` 自动重选并请求恢复；也可用 `d` 重选、`r` 恢复。`q` 退出相机，Robot 用 `Ctrl+C`
-走 StopMotion。没有有效框和新鲜三维观测时，不能开始跟随。
-
+Redis → 相机 → Robot；Redis 单独存在不会消除 `waiting for Robot state`。
+当时首次按 b 选点并请求开始，d 只选点，视觉丢失后暂停确认 / 重选 / resume；p 取消、q 退出相机，Robot 用 Ctrl+C 停止。
+这段人工首次开始约定已由 2026-10-12 模型自动初始开始替代；当前命令见[启动手册](../run/carotid-begin-operations.md)。
 
 ## 运行配置与诊断记录（2026-10-02）
 

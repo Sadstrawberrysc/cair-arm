@@ -40,6 +40,7 @@ struct Options {
     std::string output_path;
     Eigen::Vector3d sensor_to_tool_rpy_deg = Eigen::Vector3d::Zero();
     bool sensor_to_tool_rpy_set = false;
+    Eigen::Vector3d probe_to_sensor_rpy_deg = Eigen::Vector3d::Zero();
     int pose_count = 8;
     int samples_per_pose = 20;
     int capture_timeout_s = 10;
@@ -62,7 +63,8 @@ void Usage(const char* program) {
         << "  --robot-ip IP\n"
         << "  --sensor-device PATH\n"
         << "  --sensor-to-tool-rpy-deg RX,RY,RZ\n"
-        << "      Independently measured R_tool_from_sensor = Rz*Ry*Rx\n"
+        << "      Independently measured R_ArmTip_Sensor = Rz*Ry*Rx\n"
+        << "  --probe-to-sensor-rpy-deg RX,RY,RZ  probe axes in Sensor, default 0,0,0\n"
         << "  --output FILE\n\n"
         << "Options:\n"
         << "  --robot-port PORT          default 8080\n"
@@ -146,6 +148,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.output_path = value;
         } else if (argument == "--sensor-protocol") {
             if (!ParseForceSensorProtocol(value, options.sensor_protocol)) return false;
+        } else if (argument == "--probe-to-sensor-rpy-deg") {
+            if (!ParseVector3(value, options.probe_to_sensor_rpy_deg)) return false;
         } else if (argument == "--sensor-to-tool-rpy-deg") {
             if (!ParseVector3(value, options.sensor_to_tool_rpy_deg)) return false;
             options.sensor_to_tool_rpy_set = true;
@@ -239,6 +243,8 @@ void WriteCsvHeader(std::ostream& output,
            << FormatForceCalibrationCaptureRpyDeg(
                   options.sensor_to_tool_rpy_deg)
            << '\n'
+           << "# probe_to_sensor_rpy_deg="
+           << FormatForceCalibrationCaptureRpyDeg(options.probe_to_sensor_rpy_deg) << '\n'
            << "# minimum_window_duration_ms="
            << options.minimum_window_duration_ms << '\n'
            << "# rotation_tool_from_sensor_row_major=";

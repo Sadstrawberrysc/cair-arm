@@ -1,311 +1,91 @@
 # USPilot 项目进展（Runme notebook）
 
-> 本文件是纳入 Git 的 Runme notebook。项目当前架构以根级和模块级
-> `ARCHITECTURE.md` 为准；本文件保存进展、验证证据、待办和历史运行结论。
+当前状态核对：2026-10-30。本文记录有效入口、待办与历史证据；接口见
+[系统架构](../../ARCHITECTURE.md)，启动见 [Robot 操作](../run/robot-operations.md)。
+历史测试和真机记录保留原执行范围，本次文档整理不代表新增设备验收。
 
-更新日期：2026-10-26
+## 当前状态
 
-本文记录当前工作树中 RM75 视觉力控闭环的实际实现、有效配置、已知分叉和待验收项。
-架构边界见 [ARCHITECTURE.md](../../ARCHITECTURE.md)，启动顺序见
-[RM75 启动与运行](../run/robot-operations.md)，源码阅读路径见
-[RM75 学习路径](../rm75_learning_path.md)。
-
-## 2026-10-26 固定姿态长期记录与时间漂移分析
-
-SensorMonitor 默认记录，新增无界面 record.py 和无参数最新会话分析 analyze.py。
-用户已确认传感器预热 30 min；默认从记录起点分析，不再额外排除前 30 min，
-新会话元数据保存采集前预热条件，历史记录不补写预热事实。
-记录在界面降频前接收全部有效 KWR57 帧，独立线程按小时 CSV 轮转、每秒落盘，
-输出时间漂移曲线、首尾差、波动、预热后斜率和数据质量。分析分箱按记录时长自适应，
-1 min 使用 1 s 分箱，输出完整短时结果；长记录逐级增大箱宽以控制内存。
-没有同步温度测量，不计算温度系数。
-用临时模拟数据核对跨小时文件及已知六轴斜率，伪串口约 500 Hz 下保存 600 帧而界面约 50 Hz，
-并检查界面关闭后的正常落盘；未启动真实传感器或 Robot，不新增测试文件。
-使用方式见[长期记录说明](../../docs/sensor_drift_recording.md)。
-
-## 2026-10-26 KWR57 RS422 软件适配
-
-用户已确认新传感器单次与 500 Hz 连续输出正常。默认采集改为 KWR57/460800/8N1，
-Robot、SensorMonitor 直连及标定采集均支持；保留旧 Haptron/AA55。新增固定 28 字节解析、
-kgf/kgf·m 到 SI 的换算、流启停、显式无 checksum 语义，KWR57 有效原始力矩门最多 2 N·m。
-默认串口暂为 `/dev/ttyUSB0`；新标定路径 `kwr57_force_calibration.json`、配置身份 `KWR57`，
-未复制旧标定或生成占位标定。待办仍是实际单位/轴向、装配标定和实机控制验收。
-源码适配后 `main_rm75` 与两个标定工具构建通过，此前完成过离线检查。
-按用户后续要求，已删除本次新增的测试代码及其构建引用，保留原有测试；
-本次未连接真实串口、Redis 或机器人。详细实现与构建入口见
-[KWR57 接入说明](../../docs/kwr57_sensor_integration.md)。下方 Haptron 运行配置及标定值为历史记录。
-
-## 2026-10-02 腕部模型模块合并
-
-原 `Carotid_begin` 模型服务并入 `Camera_wrist/detector/`，相机默认无需参数进入模型模式，
-`--manual` 保留手动选点跟踪。采集和模型继续在两个环境/进程中运行，Robot 公共协议和控制
-沿用现状；启动不自动请求运动。源码与入口见 [腕部架构](../../infer/Camera_wrist/ARCHITECTURE.md)
-及 [detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)，本次检查和运行边界见
-[腕部进展](camera-wrist-progress.md#当前入口与验证2026-10-02)；
-[模型进展](carotid-begin-progress.md)和[早期方案历史](yolo-roboflow-visual-servo-plan.md)保留模型与试验沿革。
-
-模型默认 ID、类别/阈值入口见 `detector/config.py` 和相机 CLI，worker 包名为
-`infer.Camera_wrist.detector.worker`，缓存位于 `Camera_wrist/data/model_cache/`。
-相机始终连接 Redis，不再支持 `--no-redis`；收到 Robot 状态不自动发起运动。
-离线验证统一到 `infer/Camera_wrist/tests/`：`camera` / `carotid` 各 79 项、
-`ultralytics` 模型相关 14 项通过，使用假模型和离线输入；本次未运行真实 GPU、相机、
-Redis 回环或机械臂运动。真实目标选点/恢复、独立定位真值、外参、时序和悬停净空仍待验收。
-日常入口见 [腕部操作](../run/camera-wrist-operations.md)与[模型最简启动](../run/carotid-begin-operations.md)。
-下方 09 月条目保留当时实现与验证，腕部当前入口以本节和腕部进展为准。
-
-## 2026-09-23 Runme 启动入口核查
-
-- 已逐一检查 `.runme/README.md`、`run/` 的五本操作 notebook 和 `Progress/` 的三本进展 notebook。操作单元均有稳定名称并排除 Run All；进展里的文字/历史命令标记为不执行。
-- `start-wrist-camera` 的重复进程检查改为只匹配实际 Python 进程，避免将 Runme 的 Bash 包装命令误判为相机；保留图形进程前台与交互终端。移除了宽泛的 `xhost +local:` 放行，仅在缺少 DISPLAY 时检查本机 X11 socket 并补充显示变量。相机单元本轮未重新运行，真实画面与退出行为仍需现场确认。
-- Redis 7777 的启动单元改为已有服务时复用。Runme CLI 实际执行 `start-redis-7777` 两次均返回 PONG，随后 `redis-7777-ping` 返回 PONG；`git-status` 单元也成功执行。
-- 接触点显示原来使用不存在的 `ics` 环境及 STL 路径；改用 `carotid`，安装 PyVista 0.49.0 / VTK 9.7.0，并读取已有 `infer/Robot/model/Lprobe-IFS.STL`。本机 Mesa 与 Conda `libstdc++` 冲突导致首次图形启动退出码 139；指定系统 `/usr/lib/x86_64-linux-gnu/libstdc++.so.6` 后，窗口进程运行至受控停止，并显示已连接 Redis、监听 `sensor_data`。系统 notebook 已写入同一环境设置。
-- 标定单元统一激活 `camera` 环境；采集 IP 和手动目标坐标改为交互输入；求解默认选本模块最新完整采集目录，避免固定旧样本。未运行会连接机械臂、相机或发送 MoveJ 的单元。
-- 本轮不做离线测试。相机、超声采集、传感器串口、RM75 真机运动与标定采集的完整运行仍取决于设备在场、现场条件和人工交互，不能仅凭 notebook 静态检查宣称通过。
-
-## 当前结论
-
-系统已形成可运行的闭环链路：视觉端通过 Redis v1 发布 Tool-Y、RZ、phase、action 和
-recovery 意图；`main_rm75` 在 10 ms 周期内融合 RM75 与 Haptron 快照，依次完成原始量程
-检查、标定/tare 补偿、接触估计、状态机、七轴数值 IK、安全规划和异步 ServoJ 下发。
-
-当前仍是**使用 provisional 标定的工程调试系统**，不是完成计量与端到端验收的生产系统。
-已建立第一批纯离线 CTest，覆盖 Redis parser/freshness 与输出 schema、AA55/Haptron frame
-parser、基础控制状态、planner 非法输入/限位拒绝，以及 CSV/summary schema 契约。完整的
-session replay、反馈恢复、mailbox 并发和周期回放 harness 仍待补充。
-
-### 颈动脉单点 MoveJ 工具
-
-当前采用一次文件快照，不再使用实时 Redis target-track。`arm_probe_pose` 维护工具以
-`--artery-path-base` 作为唯一新增接口，从 sidecar 隐式校验 accepted 相机外参、Base 路径及
-摘要，固定选择第一点并沿单位外法向偏置 50 mm，读取 RM75 当前状态后保持 Probe TCP 姿态
-执行安全 IK。默认 dry-run 不发送运动；真实执行要求
-`--execute --confirm-single-movej`，只允许一次 MoveJ，并受关节限位、奇异和最终 2 mm
-误差门约束。9/9 CTest 已通过。2026-09-04 用户确认并授权记录
-ArmTip→Probe TCP 的 188 mm 长度与安装旋转有效，部署文件现为 `tool_chain_verified=true`；
-该新入口没有笛卡尔距离门，但保留默认 60°最大单关节变化门；2026-09-07 按用户要求将其
-局部限位预警改为3°，与3°硬停止门一致（生产 planner 默认仍为10°）；
-长距离 MoveJ 的环境碰撞风险只能现场人工检查。旧 `arm_preset_pose` 颈动脉入口的历史门控
-调整不自动继承到新入口；生产 planner 默认值和3°硬停止门不变。
-
-数字人单点新增分层接口：`hand_eye_calibration-main/transform_point.py` 使用用户确认的新
-外参把 D455 光学坐标点变为 Base 位置，`arm_probe_pose --target-position-base-m` 再保持
-连接时的 Probe TCP 姿态组成六维目标。新外参目前记录为用户确认、尚无独立验证报告，
-真机前必须 dry-run 并核对 Base 方向和已知点。
-
-`hand_eye_calibration-main/run_probe_target.py` 已串联数字人采样、新外参首点转换和
-Robot 位置模式；未更新快照或相机异常退出会终止流程。按用户要求，编排入口默认速度1、
-自动传入双执行参数执行单次 MoveJ；`--dry-run` 只规划。仅做离线验证，尚未完成本入口的真机验收。
-
-### 配置所有权已统一并通过真机复核
-
-`RobotRuntimeConfig` 统一装配入口参数及 `Rm75ControlConfig`、`Rm75ServoPlannerConfig`、
-`Rm75RuntimeSafetyConfig`。无参数 profile 不再复制力控、扫描或 tracking 标量；启动校验、
-控制对象、终端输出和 summary 均读取同一有效配置。控制/安全 CLI 已移除，Redis
-`desired_force_n` 仍是协议边界明确提供的单次命令覆盖。
-
-当前 profile 的实际与校验基线均为 `-2 N`、`2 cm/s` 接近和 `1 cm/s` 扫描，名称改为不携带
-目标力的 `rm75_redis_visual_closed_loop_tcp188`。生产入口、全部 maintenance tools 均已
-离线编译通过，批次 2 的 5/5 CTest 通过，并已获得本轮真机确认。
-显式 `--no-redis` provisional 执行仍受原有 `1 mm / 0.05 cm/s` 更严格准入门约束；控制/安全
-CLI 移除后，当前默认 `2 cm/s` 配置会使该调试路径 fail-closed，不得将其当作无参数生产入口
-的替代启动方式。
-
-## 在线链路
-
-```text {"ignore":"true"}
-超声图像
-  → intergrate_infer/main_redis_seg_newphase_recovery_mode.py
-  → Redis 127.0.0.1:7777（command/status/sensor v1）
-  → main_rm75（10 ms，只消费内存快照）
-  → Rm75ControlLaw（状态机与 Tool-X/Y/Z/RZ 增量）
-  → Rm75ServoPlanner（6×7 Jacobian、IK、限位/奇异/速度检查）
-  → RMCommand ServoJ mailbox
-  → RM75
-
-Haptron Modbus RTU → ForceSensorReader → 标定与 runtime tare → 接触点估计 ─┘
-RM75 TCP 状态线程 ────────────────────────────────────────────────────┘
-```
-
-| 项目 | 当前实现 |
+| 模块 | 实现与边界 |
 | --- | --- |
-| RM75 | `192.168.50.254:8080`，JSON-over-TCP，七关节状态与 ServoJ |
-| Haptron | `/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0DU5LC-if00-port0`，`115200/8N1`，Modbus RTU |
-| Redis | `127.0.0.1:7777`；命令 fresh 门 500 ms，视觉心跳 200 ms |
-| 控制周期 | 10 ms；连续两次超期或任一周期超过 40 ms 触发 deadline fault |
-| 标定 | `infer/Robot/build/rm75_force_calibration.json` |
-| 探头模型 | `infer/Robot/model/Lprobe-IFS.STL`，启动时核对 SHA-256 |
-| Tool/TCP | Tool 与 Sensor 原点重合；Probe TCP 为 sensor 原点 `+Z 0.188 m`；Arm_Tip→Tool 固定旋转来自标定 |
-| 日志 | 控制周期记录由后台线程写 CSV，结束时生成 schema v2 summary JSON |
+| 超声闭环 | Redis v1 意图 → 10 ms 控制 → 接触 / 力控 → 七轴 planner → 异步 ServoJ；端到端仿体与计量验收未完成 |
+| 力传感器 | 默认 KWR57 RS422/460800，保留 Haptron / AA55；单位、轴向和新装配多姿态标定待实测 |
+| SensorMonitor（可选工具） | 独立监控，自动识别项目 Redis 遥测或独立串口，无需传参。清零 / CSV / PNG 仅供本地查看，不参与项目控制 |
+| 全局定位 | 新相机快照的顶部首点，短轴 +X 沿切向、+Z 朝内，后退 50 mm；控制器 MoveJ_P，默认速度 3 |
+| 腕部跟随 | 模型默认自动初始选点与请求，手动模式人工开始；无力候选脚本持续运行，TCP / 姿态 / 每关节命令限速为 4 mm/s、4°/s、4°/s |
+| 相机标定 | `calibrate_realsense.py` / `calibrate_gemini.py` 默认采集 50 组后求解；提前结束不求解，不自动部署 |
+| Collision | [几何／FCL](../../infer/Collision/README.md)、[只读监测](../../infer/Collision/MONITOR.md)：保留用户确认的 URDF，已实现 D455／独立机械臂状态源、单帧 OctoMap、距离与 3D 回放；下载 SDK 头文件直接链接匹配预编译库，无 SDK 构建，13 项 CTest 通过；实机、安装接触策略、生产反馈桥接、OMPL 和运动仍待完成 |
 
-无参数 `./main_rm75` 是真机 execute 模式：先停止遗留运动并确认静止，完成 3 s 悬空 tare，
-再等待新 Redis session 的 idle 握手和 fresh moving 命令。断线、过期/回放命令、反馈短暂陈旧
-或 ServoJ mailbox 暂时阻塞进入 Hold；可恢复 Hold 释放前必须收到更新的生产者命令。
+相机、模型、离线规划可用不代表实际定位精度、力残差、时序或净空合格。
+新 session 先发 idle 是视觉端约定，Robot 接收端尚无独立 idle 握手状态机。
 
-## 当前实际生效配置
+SensorMonitor 无需来源参数：启动时检查项目遥测，选定 Redis 后断流停止，不回退串口。
+已有选源 / 协议、伪串口及隔离 Redis 回环验证通过；这些软件检查不代表真实传感器或机器人验收。
 
-以下值取自当前 `Rm75ControlConfig`、`Rm75ServoPlannerConfig` 和
-`Rm75RuntimeSafetyConfig`。它们是控制对象和 summary 的实际来源，不是无参数 profile 中
-尚未注入的 `Options` 值。
+## 当前配置与装配
 
-| 模块 | 当前实际值 |
+| 项目 | 配置 |
 | --- | --- |
-| 目标轴向力 | `Fz = -2 N` |
-| 接触门 | `|Fz| >= 0.99 N`，接触后锁存至 idle/reset |
-| Tool-Z 导纳 | `M=3`、`D=20`；普通速度上限 `0.002 m/s`；加速度上限 `0.01 m/s²` |
-| 悬空接近 | `+Tool-Z`，`0.020 m/s` |
-| 超力卸载 | 相对目标额外压入 `1.0 N` 且持续 `0.50 s`；最大卸载 `0.010 m/s`；重新接近 `0.005 m/s` |
-| Tool-Y | 比例增益 `1.0 s⁻¹`，方向 `-1`；单周期 `0.5 mm`；Scan 缩放 `0.8`，Rotate 缩放 `0.3` |
-| Tool-Y 门 | `|Fz| > 1.2 N`；实际 TCP 落后 `20 mm` 暂停、回到 `10 mm` 恢复；Y 主导且达到 `5 mm` 可重建参考 |
-| Tool-X | 力位于 `-2±0.8 N` 且连续 `0.5 s` 后沿 `-Tool-X` 以 `0.010 m/s` 连续扫描 |
-| Tool-RZ | 增益 `0.05`，最大 `5°/s`，Trigger 后累计执行额度 `120°` |
-| 接触姿态 | wrench/contact Kalman 开启；接触点驱动 Roll；Pitch 增益为 `0` |
-| 丢失恢复 | phase 2 中 X/RZ=0、冻结 Roll/Pitch；固定 Tool-Y `0.0002 m/s`，单次最多 `20 mm` |
-| wrench 硬门 | 原始与补偿力 `50 N`，力矩 `5 N·m`；硬门在滤波前检查 |
-| 规划 | 10 ms、阻尼 `0.001`、关节限位停止裕量 `3°`、最小任务奇异值 `1e-5`、关节加速度 `90°/s²` |
-| 跟踪 fault | 关节 `20°`、位置 `25 mm`；姿态门 `0` 表示关闭独立姿态跟踪 fault |
+| RM75 / Redis | `192.168.50.254:8080` / `127.0.0.1:7777` |
+| KWR57 | `/dev/ttyUSB0`，460800/8N1；有效原始力门 50 N、力矩门最多 2 N·m；协议无 CRC |
+| 部署力标定 | 可执行文件旁 `rm75_force_calibration.json`，无参数入口要求 `sensor_id=KWR57`；文件名不代表新传感器标定完成 |
+| Tool 几何 | Sensor 安装 +30°、探头相对 Sensor 0°、Sensor→TCP 188 mm、安装平移 `[0,0,-0.0125]` m，ArmTip→TCP 200.5 mm |
+| 几何确认 | 用户要求保留 `tool_chain_verified=true`；记录用户确认，不等于新增独立测量 |
+| 力验证 | `quality.residuals_verified=false`；旧 Haptron v10 拟合不能当作新 KWR57 标定 |
+| 全局外参 | 本轮 D455 50 组结果已按授权部署；`user_confirmed=true`，独立验证 false，未叠加旧经验修正 |
+| 腕部外参 | 候选 `T_armtip_camera`，独立验证尚未完成 |
 
-### 当前视觉端配置
+装配参数、覆盖路径和执行记录见 [末端替换](../run/end-effector-replacement.md)。
+全局同批次位置一致性 RMS 2.670 mm、最大 7.487 mm，不代替独立定位误差。
 
-| 模块 | 当前值 |
+## 控制与视觉基线
+
+| 项目 | 当前值 / 行为 |
 | --- | --- |
-| phase 模型 | `weights/runs_ConvNeXtBase_single.pth`；原始五分类映射到 Scan/Trigger/Action |
-| phase debounce | Scan `8` 帧且概率 `>=0.60`；Trigger/Action 各 `3` 帧且概率 `>=0.55` |
-| Tool-Y 调理 | 死区 `0.00001 m`（0.01 mm）；EMA 当前帧权重 `0.7`；换向确认 `1` 帧 |
-| recovery | YOLO 与分割同时连续丢失 `20` 帧进入；同时有效连续 `5` 帧退出 |
-| 自动结束 | 最新 raw phase 为 rota、检测有效、血管像素达到旋转前 `3×`、`|RZ|<=12°`，连续 `20` 帧后 terminate |
-| 发布门 | `b` 只开启 action/轴向过程；按 `m` 后才发布扫描所需 Y/RZ/phase；每 200 ms 心跳重发 |
+| 周期 / 陈旧门 | 控制 10 ms；力 50 ms、Robot 200 ms、超声命令 500 ms；视觉心跳 200 ms |
+| 目标力 / 接近 | -2 N / +Tool-Z 20 mm/s；接触锁存 0.99 N |
+| Z 导纳 / 稳定 | M=3、D=20，最高 2 mm/s；力误差 ≤0.8 N、`abs(Fz)≥2 N` 连续 0.5 s |
+| 卸载 / 重接触 | 比目标更负 1 N 持续 0.5 s 后卸载，最高 10 mm/s；重接触 5 mm/s；idle 禁止重新接近 |
+| Y 居中 | 增益 1.0 s⁻¹、符号 -1、最多 0.5 mm/周期；Scan / Rotate 缩放 0.8 / 0.3 |
+| Y 跟踪 | 暂停 / 恢复 20 / 10 mm；Y 主导误差 ≥5 mm 可重建参考，腕部不使用此重置 |
+| X / RZ | -Tool-X 10 mm/s 连续扫描；RZ 5°/s、额度 120°；Trigger 的 Y 门 8 mm / 0.4 s |
+| recovery | 左 -Y、右 +Y，锁存旋转前轴，0.2 mm/s、最多 20 mm；停 X/RZ、冻结 Roll/Pitch、保留 Z |
+| planner / 跟踪 | 关节停止裕量 3°；普通位置误差门 25 mm、关节 20°；腕部位置配置 50 mm，候选脚本关闭该位置门 |
+| phase | ConvNeXt-Base 五分类映射三阶段；Scan 8 帧 / 0.60，Trigger、Action 各 3 帧 / 0.55 |
+| Y 调理 / recovery 判定 | 死区 0.01 mm、EMA 0.7、换向 1 帧；检测与分割同时丢失 20 帧进入、同时有效 5 帧退出 |
+| 自动结束 | raw phase=rota、检测有效、血管像素达旋转前 3×、`abs(RZ)≤12°` 连续 20 帧 |
 
-视觉源码中的一处 recovery 注释仍写 `0.002 m/s`，但真实速度由 C++ 控制配置决定，当前为
-`0.0002 m/s`。恢复方向以当前 C++ 约定为准：图像左侧锁存为 `-Tool-Y`，右侧为
-`+Tool-Y`，并使用进入旋转前锁存的 Tool-Y 基方向。
+完整参数以源码和该次 summary `control` 为准；视觉 recovery 的旧速度注释不改变 C++ 配置。
 
-## 标定状态
+## 历史里程碑与验证
 
-当前唯一部署标定 `rm75_force_calibration.json` 来源于v10采集，文件创建于
-`2026-08-20T08:33:57Z`，传感器 ID 为
-`DU0DU5LC`，探头模型摘要已
-记录。质量结果为：
-
-| 指标 | 当前值 | 接受门 |
-| --- | ---: | ---: |
-| Force RMS | `0.7881 N` | — |
-| Force max | `1.2488 N` | `0.6 N` |
-| Torque RMS | `0.02095 N·m` | — |
-| Torque max | `0.05099 N·m` | `0.1 N·m` |
-
-`residuals_verified=false`；`tool_chain_verified=true` 只记录用户对 188 mm Probe TCP 长度和
-安装旋转的确认。“唯一部署/最终选用”不表示力标定已通过正式计量验收。当前文件只能在显式 provisional
-commissioning 约束与悬空 tare 下使用。tare 只能消除本次静态偏置，不能替代多姿态重力、
-质量、质心以及 R/t/TCP 验证。
-
-启动 tare 为 3 s，静止跨度门为关节 `0.02°`、TCP `0.35 mm`、姿态 `0.10°`；provisional
-运行在施加 tare 前还要求合力/合力矩不超过 `5 N / 0.5 N·m`。
-
-## 已完成与待验收
-
-| 能力 | 状态 | 当前说明 |
-| --- | --- | --- |
-| RM75 TCP、状态快照、ServoJ、Hold、Stop | 已实现，已真机复核 | `RMCommand` 只保留 `RMResult`/`Try*` API；旧 wrapper、重复收发/JSON 镜像及 framer 无消费状态已删除；单一 I/O owner 和 Stop 路径不变 |
-| 七轴 FK、6×7 Jacobian、数值 IK | 已实现，已真机复核 | `RMKinematics` 私有持有非零 MDH 参数和关节限位；恒零 a/关节 offset/tool offset 不再占用运行状态，外部限位接口和 IK 规划逻辑不变 |
-| Haptron Modbus 与线程安全快照 | 已实现，已真机复核 | reader 统计镜像、无调用 getter 和 stale 转发已删除；parser seam、checksum、sequence、stale 与 fail-closed 条件不变 |
-| 标定加载、模型摘要、runtime tare | 已实现，正式标定未完成 | runtime tare 保留在入口安全门；v10 force max 不合格，tool chain 未验证 |
-| 接触点估计 | 已实现，已真机复核 | 删除无人读取的面片索引和加载阶段已拒绝的退化模型周期错误；错误码后续数值、Redis/CSV 字段、平面求解和残差门不变 |
-| Z 导纳、超力卸载、制动与重接触 | 已实现，仿体验收未完成 | 卸载在 Redis Hold 下仍可独立工作；idle 不自动重接近 |
-| Tool-Y/X/RZ 状态机 | 已实现，端到端验收未完成 | 包含跟踪暂停/恢复、Y 主导重建参考、连续扫描和 RZ 额度 |
-| 旋转丢失恢复 | 已实现，真机验收未完成 | X/RZ 归零、固定基方向 Y 搜索、20 mm 上限、保留 Z 力控 |
-| Redis v1 session/sequence/freshness | 已实现 | 新连接清空旧命令；重复/回放/过期/断开全部 fail-closed |
-| 反馈恢复与新命令屏障 | 已实现 | 从实测关节重建参考，禁止恢复后继续旧视觉命令 |
-| 异步 Redis 与运行日志 | 已实现，已真机复核 | 控制循环不做阻塞 Redis、JSON 序列化或磁盘写入；CSV writer 已提取至 `rm75_runtime_logging` |
-| CSV/summary 诊断 | 已实现，已真机复核 | `RuntimeSummaryData` 单次构造 summary v2，字段、单位和 CSV 126 列契约保持不变 |
-| 标定坐标链 | 已集中，已真机复核 | `CalibratedFrameChain` 唯一提供 Base→Arm_Tip→Tool/Sensor→Probe TCP 变换；生产和维护目标编译、6/6 CTest 通过 |
-| 自动测试 / 回放 harness | 部分完成 | 已注册 6 个纯离线 CTest，含有效配置和坐标链等价测试；session replay、反馈恢复、mailbox 并发和完整周期回放仍待覆盖 |
-
-生产 CMake 已删除只打印 warning、从不创建 target 的 legacy 空选项；旧六轴源码继续仅作
-历史参考，维护工具仍由 `BUILD_MAINTENANCE_TOOLS` 显式构建。
-
-批次 5 API 收缩已完成并通过真机确认：生产与 maintenance tools 均使用强类型连接和结构化
-结果；transport、运动学、接触估计和传感器公共面已完成无调用项清理，legacy 六轴源码不参与
-当前构建。RM75 状态 JSON 分帧、ServoJ/Stop 返回和断线 fail-closed 行为已复核通过。
-
-## 当前状态机
-
-```text {"ignore":"true"}
-Initializing / Observe
-  → Armed / Redis Hold
-    └─ fresh moving（b）→ Approach：+Tool-Z 接近
-        └─ 接触 → Contact / ForceSettle：Z 导纳，等待稳定力带
-            └─ fresh scan（m）→ Scan：-Tool-X + Tool-Y + Z 力控
-                └─ phase=1 → TriggerAlign → RotateAlign：停止 X，保留 Y/Z，执行 RZ
-                    └─ phase=2 且 recovery=true
-                        → X/RZ=0，冻结 Roll/Pitch，固定基方向搜索 Y，保留 Z
-
-任意运动阶段：目标相对超力 → Unload → Brake
-  moving 且需要时 → Reacquire → 普通 Z 导纳
-  idle → Armed，不自动重接近
-
-Redis/反馈/mailbox 可恢复异常 → Hold → 重建参考 + 等待更新命令
-真实硬件、安全门、规划或 deadline 故障 → Fault → Stop/静止确认 → 退出
-terminate/t → 本轮完成并回到 Armed；Ctrl+C → Stop 并退出
-```
-
-## 日志与故障定位
-
-每次运行生成 CSV 和同路径的 `.summary.json`。无参数 profile 默认写入：
-
-```text {"ignore":"true"}
-infer/Robot/build/logs/*.csv
-infer/Robot/build/logs/*.summary.json
-```
-
-优先检查：
-
-| 字段 | 用途 |
+| 日期 / 阶段 | 事实与验证范围 |
 | --- | --- |
-| `result`、`fault_code`、`completion_reason` | 区分正常结束、terminate、Ctrl+C 和 fault |
-| summary `control` | 确认本次真正生效的目标力、速度、跟踪门和恢复参数 |
-| `command_session_id`、producer/receive sequence、`command_age_ms`、hold reason | 定位重连、回放、过期或新命令屏障 |
-| `requested_dx/dy/dz_tool_m`、旋转增量 | 判断控制律是否真正请求该自由度 |
-| `control_fz_n`、unloading/recovering | 判断普通导纳、卸载、制动和重接触 |
-| `recovery_search_active`、locked side、velocity/distance/limit | 判断恢复方向、速度和 20 mm 上限 |
-| actual/model error、tracking paused/rebase | 判断实际 TCP 是否跟上及是否重建参考 |
-| Servo submitted/consumed/sent/result sequence | 判断 mailbox 或异步发送故障 |
-| work time、lateness、missed periods | 判断 10 ms 调度与 deadline fault |
+| 2026-08-20 v10 力标定 | Haptron 身份 `DU0DU5LC`；Force RMS 0.7881 N、max 1.2488 N（门 0.6 N）；Torque RMS 0.02095 N·m、max 0.05099 N·m（门 0.1 N·m）；残差未通过 |
+| 2026-09-04～09-07 单点工具 | accepted Base 路径、摘要和本地 IK 工具曾通过 9/9 CTest；用户确认 188 mm 几何，`arm_probe_pose` 预警改为 3°；当前定位已改用控制器 MoveJ_P，不能套用本地 IK 验证范围 |
+| 配置 / API 收缩批次 | 配置所有权、Try* 结果、transport 单 I/O owner、七轴 FK / planner、坐标链与异步日志已统一；批次 2 记录 5/5、坐标链阶段 6/6 CTest，并有当时真机复核；不延伸为新装配验收 |
+| 2026-09-15 腕部投影 | observe 位姿与 seed 交接：12 项 Python、7 项 CTest；相机恢复后采集 120 帧 30 fps，预热后 91 帧时钟检查通过、约 37 ms 帧龄；未做粗定位运动，投影待验收 |
+| 2026-09-16 点击跟随 | RGB-D / Redis / 50 mm 悬停参考及 planner 接通；离线与隔离 Redis 仿真不涉及真实 ServoJ；原超声 / 投影入口保留 |
+| 2026-09-23 Runme 核查 | 命名单元排除 Run All，Redis 复用检查返回 PONG；接触显示改用 carotid / 现有 STL，系统 libstdc++ 解决图形退出；未运行运动或标定采集单元。历史“默认选最新批次”现已由显式标定入口替代 |
+| 2026-10-02 模型合并 | Carotid_begin → Camera_wrist/detector；camera / carotid 各 79 项、ultralytics 模型相关 14 项离线通过，含假 worker / socketpair；当轮无真实 GPU、相机、Redis 回环或运动 |
+| 2026-10-12 腕部更新 | 自动初始开始与限速 4：90 项腕部测试、Robot 6/6 CTest；未运行真实相机或机械臂。设备枚举为 0 台的诊断另见腕部进展 |
+| 2026-10-26 KWR57 | 用户确认单次及 500 Hz 输出；软件适配与两个标定工具构建通过；按要求删除新增测试，保留原测试；当轮未连真实设备 |
+| 2026-10-26 旧记录工具 | 曾有小时轮转、漂移拟合和多格式报告，临时模拟 / 伪串口验证；这些已由当前双来源监控、单 CSV、软件清零和 PNG 分析替代，历史预热条件不追溯写入新会话 |
+| 2026-10-29～10-30 装配 | schema v2 分离 Sensor / Tool 旋转，探头更正为 0°、平移改 -12.5 mm；历史记录含工具构建与 7/7 CTest，未做新装配真机验收 |
+| 2026-10-30 KWR57 复核 | main_rm75、离线测试和两标定工具构建成功，CTest 7/7；临时拆包 / 单位 / 噪声 / 伪终端检查，未连真机；见接入说明 |
 
-Redis 命令异常通常进入 Hold 而不退出；机器人/传感器持续失效、原始或补偿 wrench 超硬门、
-关节限位、IK/奇异、ServoJ 失败、全局跟踪误差、deadline 或无法确认 Stop 会进入 Fault。
+更多证据见 [全局相机进展](camera-rt-progress.md)、[腕部进展](camera-wrist-progress.md)、
+[模型进展](carotid-begin-progress.md)和 [KWR57 接入](../../docs/kwr57_sensor_integration.md)。
+历史日志和模型数据留在本机，不因文档更新纳入 Git。
 
-## 下一步优先级
+## 待办与诊断
 
-1. **确认 runtime tare 回退基线（P0）**：采集、统计和稳定门已恢复至 `main_rm75.cpp`；确认
-   3 s 样本数、Sensor-frame offset 和拒绝原因仍与原基线一致。
-2. **完成正式标定（P0）**：独立核对 R/t/TCP，重新采集低外力多姿态样本，将 force max
-   降至 `<=0.6 N`，设置 residual/tool-chain verified 后完成多姿态悬空验收。
-3. 修正视觉 recovery 速度注释，并离线/真机确认左右侧到 Tool-Y 的符号、旋转前基方向、
-   `0.2 mm/s` 搜索速度和 `20 mm` 停止上限。
-4. 在软质仿体上依次验收接触点真值、Z 稳态、超力卸载、idle 不重接近、Tool-Y、Tool-X、
-   phase/RZ 及自动 terminate；每次只改变一个参数并保留 CSV/summary。
-5. 在现有 parser/freshness、传感器帧、基础状态机、planner 和 schema CTest 上继续补齐
-   session replay、反馈恢复、mailbox 并发和完整周期回放，再执行长时间真机稳定性验证。
+1. 用已知载荷确认 KWR57 单位、轴向和型号，完成新装配重力 / 零偏 / 质心标定及独立 R/t/TCP 核验。
+2. 核查 3 s 悬空 tare、采样数量、Sensor-frame offset 与拒绝原因；tare 不代替正式标定。
+3. 完成相机外参、动态时序、真实扫描点与 TCP 间距的独立验证；复测腕部自动开始、丢失恢复与停止。
+4. 在工装 / 仿体依次验证 Z 稳态、卸载 / idle 不重接近、接触点、Y/X、phase/RZ、recovery 与 terminate。
+5. 按实际缺口补 session replay、反馈恢复、mailbox 并发和周期回放，再做长时稳定性记录。
 
-不要在 `main_rm75` 运行期间清理 `infer/Robot/build/logs/`。所有真机操作必须遵守
-[AGENTS.md](../../AGENTS.md) 的硬约束。
-# 2026-09-15：腕部交接投影扩展
-
-新增显式 observe 腕部相机位姿发布，默认生产/超声行为不变，不新增 Robot 源文件。
-粗定位成功后可生成未偏置表面点种子；腕部可执行独立候选投影预览。
-12 项 Python 离线测试及 Robot 7 项 CTest 通过；没有运行真实机器人。
-当前 SDK 枚举 0 台 Gemini，现场投影核验未完成。腕部跟踪、法向与 ServoJ 消费尚未接入。
-详见 [腕部进展](camera-wrist-progress.md) 和 [第一阶段操作](../run/camera-wrist-operations.md)。
-## 2026-09-15 腕部相机接入检查补充
-
-重新接入Gemini后已解决单设备USB权限问题并完成120帧彩深30fps检查，先前“0台设备”阻塞解除。
-预览固定使用640×480 Y16 30fps深度流，时钟预热后91帧通过，采集帧年龄约37ms。
-Redis7777已运行，当前无本轮种子；未启动Robot或粗定位运动，现场投影核验仍待完成。
-
-## 2026-09-16：腕部点击 → Redis → 50mm悬停跟随
-
-已实现独立点击入口、无种子运行状态、腕部观测/命令消费者、控制参考与原planner连接。
-原全局投影与超声入口保留，新增模式必须显式选择。原日志schema不变，额外腕部CSV按cycle关联。
-离线与私有Redis仿真验证不涉及真实运动；当前相机点击实测、空间/时序验证及真机跟随尚未验收。
-候选腕部外参和部署力标定的验收状态未改动，真实执行入口保留拒绝门。
-详见 [点击运行说明](../run/camera-wrist-operations.md)。
+排查先看 summary 的首个 fault、control 有效配置、命令年龄 / 序号，再对照 CSV 请求与实际 TCP、
+ServoJ 提交 / 发送结果和周期超期；Redis Hold 通常不退出进程，硬件 / 规划 / deadline 故障进入停止路径。
+运行期间不清理 `build/logs/`。源码阅读见 [学习路径](../rm75_learning_path.md)。

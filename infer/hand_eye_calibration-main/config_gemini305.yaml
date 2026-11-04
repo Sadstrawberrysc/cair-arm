@@ -1,0 +1,5 @@
+# Gemini 305 腕部相机标定棋盘；XX/YY 为内部角点数，L 单位为米。
+checkerboard_args:
+  XX: 9
+  YY: 6
+  L: 0.025

@@ -1,5 +1,8 @@
 #include <cmath>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <json.hpp>
 
 #include <calibrated_frame_chain.hpp>
 
@@ -88,6 +91,77 @@ int main() {
                          * RotationBaseFromControllerEuler(
                                reference.tail<3>()).transpose()),
                 "orientation delta multiplication order is unchanged");
+
+    // New installation: keep Sensor +30, add probe +30; TCP position stays fixed.
+    ForceCalibration rotated = calibration;
+    rotated.rotation_sensor_from_probe = calibration.rotation_tool_from_sensor;
+    rotated.gravity_base_n = Eigen::Vector3d(.3, -.5, -5.0);
+    rotated.force_bias_n = Eigen::Vector3d(.1, .2, .3);
+    rotated.torque_bias_nm = Eigen::Vector3d(.01, .02, .03);
+    rotated.center_of_mass_sensor_m = Eigen::Vector3d(.01, -.02, .04);
+    rotated.sensor_id = "offline-test";
+    rotated.created_at = "2026-10-29T00:00:00Z";
+    rotated.probe_model = "Lprobe-IFS.STL";
+    const CalibratedFrameChain rotated_chain(rotated);
+    const Eigen::Matrix3d r_sensor_tool = rotated.rotation_sensor_from_probe;
+    ok &= Check(Near(rotated_chain.RotationArmTipFromTool(),
+                     Eigen::AngleAxisd(M_PI/3, Eigen::Vector3d::UnitZ()).toRotationMatrix()),
+                "Sensor +30 and probe +30 compose to +60 degrees");
+    ok &= Check(Near(rotated_chain.ProbeTcpBase(pose), chain.ProbeTcpBase(pose))
+                && Near(rotated_chain.ProbeTcpToolM(), r_sensor_tool.transpose()*expected_probe_tool),
+                "probe axes rotate without moving TCP or changing the Tool origin");
+    ok &= Check(Near(rotated_chain.ArmTipPoseFromTcp(rotated_chain.ToolTcpPoseBase(pose)),pose,1e-10),
+                "rotated probe TCP roundtrip includes nonzero mount translation");
+    const Eigen::Vector3d force_sensor(2., -3., 4.);
+    const Eigen::Vector3d contact_sensor(.025, .015, .190);
+    const Eigen::Vector3d torque_sensor = contact_sensor.cross(force_sensor);
+    const Eigen::Matrix3d base_sensor = rotated_chain.RotationBaseFromSensor(pose);
+    const Eigen::Vector3d gravity_sensor = base_sensor.transpose()*rotated.gravity_base_n;
+    Eigen::Matrix<double,6,1> raw;
+    raw.head<3>() = force_sensor + gravity_sensor + rotated.force_bias_n;
+    raw.tail<3>() = torque_sensor + rotated.center_of_mass_sensor_m.cross(gravity_sensor)
+                   + rotated.torque_bias_nm;
+    const auto wrench = rotated.Compensate(raw, base_sensor);
+    ok &= Check(wrench.valid && Near(wrench.sensor.head<3>(), force_sensor)
+                && Near(wrench.sensor.tail<3>(), torque_sensor)
+                && Near(base_sensor, chain.RotationBaseFromSensor(pose)),
+                "probe rotation does not enter Sensor gravity compensation");
+    const Eigen::Vector3d expected_force = r_sensor_tool.transpose()*force_sensor;
+    const Eigen::Vector3d contact_tool = r_sensor_tool.transpose()
+        *(contact_sensor-rotated.translation_sensor_to_tool_m);
+    ok &= Check(Near(wrench.tool.head<3>(), expected_force)
+                && Near(wrench.tool.tail<3>(), contact_tool.cross(expected_force))
+                && Near(rotated_chain.ContactPointRelativeTcpTool(contact_sensor),
+                        r_sensor_tool.transpose()*(contact_sensor-rotated.probe_tcp_sensor_m)),
+                "force, shifted torque and TCP-relative contact share probe axes");
+    std::string error;
+    const auto json_path = std::filesystem::temp_directory_path()
+        / ("uspilot-probe-rotation-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    ForceCalibration loaded;
+    ok &= Check(rotated.SaveJson(json_path.string(), &error)
+                && loaded.LoadJson(json_path.string(), &error)
+                && Near(loaded.rotation_sensor_from_probe, r_sensor_tool),
+                "schema v2 preserves independent probe rotation");
+    if (!std::filesystem::exists(json_path)) {
+        std::cerr << "Calibration save failed: " << error << '\n';
+        return 1;
+    }
+    nlohmann::json legacy;
+    { std::ifstream stream(json_path); stream >> legacy; }
+    legacy["schema_version"] = 1;
+    legacy.erase("probe_to_sensor");
+    { std::ofstream stream(json_path); stream << legacy; }
+    ok &= Check(loaded.LoadJson(json_path.string(), &error)
+                && Near(loaded.rotation_sensor_from_probe, Eigen::Matrix3d::Identity()),
+                "loading legacy v1 resets probe axes to identity");
+    legacy["schema_version"] = 2;
+    { std::ofstream stream(json_path); stream << legacy; }
+    ok &= Check(!loaded.LoadJson(json_path.string(), &error),
+                "v2 cannot silently omit independent probe rotation");
+    std::filesystem::remove(json_path);
+    rotated.rotation_sensor_from_probe(0,0) = 2;
+    ok &= Check(!rotated.Validate(&error), "invalid probe rotation is rejected");
 
     Eigen::Matrix<double, 7, 1> lhs =
         Eigen::Matrix<double, 7, 1>::Zero();

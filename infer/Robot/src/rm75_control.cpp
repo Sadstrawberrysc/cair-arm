@@ -905,7 +905,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         delta_roll, delta_pitch, delta_rz;
 
     // The controller pose is Base -> Arm_Tip, while all control deltas are
-    // expressed in the physical Tool/Sensor frame. Keep the fixed mount
+    // expressed in the physical probe Tool frame. Keep the fixed mount
     // rotation explicit so -Tool-X does not accidentally mean -ArmTip-X.
     const Eigen::Matrix3d rotation_base_from_pose =
         RotationFromEuler(input.current_pose.tail<3>());

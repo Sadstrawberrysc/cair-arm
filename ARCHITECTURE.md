@@ -1,66 +1,81 @@
-# 系统架构
+# USPilot Control 系统架构
 
-同机多进程，通过 Redis、设备 TCP 和串口通信；训练与实验目录独立于在线链路。
+超声扫描机器人的视觉—力觉闭环系统。同机进程通过 Redis、设备 TCP 和串口通信；训练实验独立于在线控制。
 
-## 主要链路
+## 在线链路
 
-- **超声闭环**：`intergrate_infer/main_redis_seg_newphase_recovery_mode.py` → Redis →
-  `infer/Robot/src/main_rm75.cpp` → RM75。Robot 融合机械臂状态与 KWR57 力数据（兼容 Haptron），
-  在 10 ms 周期内执行接触估计、控制计算、七轴 IK 与 ServoJ。
-- **全局初始定位**：`Camera_RT/cliff_demo.py` 保存左颈动脉相机坐标快照 →
-  `hand_eye_calibration-main/run_probe_target.py` 用 D455 外参转换首点、构造短轴姿态，
-  沿目标 Tool -Z 后退 50 mm → `arm_probe_pose` 换算 Probe TCP 并调用控制器 MoveJ_P。
-- **腕部跟随**：`Camera_wrist/click_follow.py` 发布 RGB-D 追踪观测和请求 → Redis →
-  Robot 按采集时刻转换坐标 → `WristFollowController` → 原 planner 与运动发送链。
-  默认模型模式由 `Camera_wrist/detector/` 子进程提供检测框中心，`--manual` 切换鼠标选点；
-  模型模式在 Robot 就绪后自动初始选点，通过有效观测和目标回传确认后请求跟随。Robot 回传相机位姿和请求确认；
-  `projection_preview.py` 另支持全局种子投影与追踪预览。
-- **超声设备/UI**：`py-xiaokai` → Redis → `SonoScape_api/redis_service.py` → 超声主机。
+| 链路 | 入口与数据流 |
+| --- | --- |
+| 超声闭环 | `intergrate_infer/main_redis_seg_newphase_recovery_mode.py` → Redis → `infer/Robot/src/main_rm75.cpp` → RM75 |
+| 全局初始定位 | `Camera_RT/cliff_demo.py` 保存相机快照 → `hand_eye_calibration-main/run_probe_target.py` 转换顶部首点并构造短轴姿态 → `arm_probe_pose` 执行单次 MoveJ_P |
+| 腕部跟随 | `Camera_wrist/click_follow.py` 发布 RGB-D 观测与请求 → Robot 按采集时刻变换坐标 → `WristFollowController` → 七轴 planner / ServoJ |
+| 超声设备与 UI | `py-xiaokai` → Redis → `SonoScape_api/redis_service.py` → 超声主机 |
 
-## 接口与计算
+Robot 在 10 ms 周期内融合机械臂状态和最新 SI 力快照，执行补偿、接触估计、控制与规划；
+设备 I/O、Redis 发布和日志由后台处理。默认力传感器为 KWR57 RS422，保留 Haptron / AA55 协议。
+
+## 项目通信与独立监控
+
+| 范围 | 数据流与职责 |
+| --- | --- |
+| 项目力觉与遥测 | KWR57 → Robot `ForceSensorReader` → 补偿 / 控制；Robot 通过 Redis `robot:sensor:v1` 发布遥测 |
+| SensorMonitor 独立检查 | 未检测到项目遥测时，KWR57 → SensorMonitor → 本地曲线 / CSV / 图片 |
+| 可选遥测查看 | 检测到项目遥测时，Robot → Redis → SensorMonitor，仅作只读显示 / 本地记录，无需指定参数 |
+
+SensorMonitor 默认自动识别输入来源；项目不依赖它启动或转发数据。监控窗口的清零、记录与退出只影响监控程序；
+项目的 tare、补偿、控制和日志由 Robot 管理。串口直连监控与 Robot 使用同一设备时互斥。
+
+## 全局相机碰撞检查
+
+[Collision 架构](infer/Collision/ARCHITECTURE.md)描述独立的 C++17 检查链路：
+展开后的 URDF／STL → 逐连杆 FK 与 FCL 实体几何；D455 点云与独立 RM75 七轴反馈 →
+Color→Base 变换、自身及半径邻域稀疏点过滤 → 单帧 OctoMap → 当前状态的环境／自碰撞、距离及未知空间检查 → JSON／3D 显示。
+人工静态场景已支持 OMPL RRTConnect 关节路径搜索、FCL 路径段约束、全路径复查、保存／校验重放和动画预览。
+监测窗口通过 `--goal` 按 P 或 `--plan-once` 已将同帧关节反馈和 OctoMap 快照接入该规划器，结果只读。
+`start_monitor.sh --coarse` 从新保存的颈动脉点文件生成后退 50 mm 的探头 TCP 目标，读取 Robot 工具标定，
+用同一 URDF 求多候选 IK，再经当前场景碰撞检查与规划；不调用上表既有 MoveJ_P 运动入口。
+旧 TXT 仅有保存时间而无曝光／受试者身份，当前以文件时效、相机标定身份和当前点云支持约束目标，仍需新鲜采集和实体核对。
+
+该链路当前不消费 Robot 生产状态缓存或 Redis 七轴反馈，也不向 Robot 发送运动或停止指令。
+它把所有非机器人观测作为障碍物，没有人体分类；遮挡、无效深度和 ROI 外保持未知，不能按“未见障碍”视为自由。
+相机和机械臂为独立诊断接入，与其他采集／控制进程的并行资源使用尚需验证。
+后续规划在控制周期外运行，Robot 保持唯一运动发送者；轨迹执行、停止确认及重规划尚未实现。
+当前编译与离线验证不代表真实设备联机、空间精度或运动保护已验收。
+
+## 公共接口与坐标
 
 | 接口 | 用途 |
 | --- | --- |
-| Redis `127.0.0.1:7777`，`robot:command:channel` | 超声命令 JSON v1；会话、递增序号与时效校验；y 为 m，rz 为度 |
-| 同实例，`robot:status:channel`、`robot:sensor:v1` | 状态和结构化力/接触遥测；`sensor_data` 兼容旧显示器 |
-| 同实例，`robot:wrist:*:v1` | seed、state、observation、command；详见腕部协议 |
-| Redis `127.0.0.1:6379` | SonoScape 命令 List 与带 TTL 的结果键；`device:arm:*` 无 RM75 消费者 |
+| Redis `127.0.0.1:7777`，`robot:command:channel` | 超声意图 JSON v1；session、递增 sequence 和接收时效校验；y 为 m，rz 为度 |
+| 同实例，`robot:status:channel` / `robot:sensor:v1` | 状态确认、结构化力与接触遥测；`sensor_data` 兼容旧显示器 |
+| 同实例，`robot:wrist:*:v1` | 腕部 seed、state、observation、command；详见腕部协议 |
+| Redis `127.0.0.1:6379` | SonoScape 命令 List 与结果键；`device:arm:*` 无当前 RM75 消费者 |
 
-Robot 的控制律和 planner 消费内存快照，设备通信、Redis 与日志由后台 I/O 处理。
-`RobotRuntimeConfig` 装配有效配置，`CalibratedFrameChain` 提供标定坐标变换。
-内部使用 m、rad、N、N·m；全局外参为 Camera→Base，腕部外参为 Camera→ArmTip。
-`--wrist-no-force` 在腕部模式禁用力采集及力控，遥测明确报告力数据无效。
+内部单位为 m、rad、N、N·m；`T_A_B` 将 B 坐标映射到 A。
+`RobotRuntimeConfig` 装配有效配置，`CalibratedFrameChain` 统一坐标链。
+全局外参为 Camera→Base，腕部外参为 Camera→ArmTip；Tool 工作轴与 Sensor 安装旋转分别保存。
+相机标定统一从 `calibrate_realsense.py` / `calibrate_gemini.py` 进入，默认采集 50 组后求解，不自动部署。
 
-## Runme 操作与进展
+## 运行边界
 
-本机启动操作、当前进展、实验记录和待办保存在随仓库维护的 `.runme/`：
+- 无参数 `main_rm75` 是真实 Execute 入口；默认读取可执行文件旁 `rm75_force_calibration.json`，身份要求 `KWR57`。
+- 全局定位使用本轮新快照的画面顶部首点，Tool +X 沿血管切向、+Z 朝内，沿 Tool -Z 后退 50 mm；默认速度 3。
+- 腕部相机默认模型模式：新鲜 Robot Hold 和完整 RGB-D → 自动选点 → 有效观测及目标回传 → 请求跟随；`--manual` 使用人工选点与开始。
+- 腕部 `start_robot.sh` 是持续运行的真实无力候选试验入口，关闭累计位移 / 转角及 TCP 位置跟踪误差门；保留关节、规划、通信与停止保护。
+- 相机 `q` 退出本轮，Robot 保持 Hold；Robot `Ctrl+C` 进入停止与静止确认。候选试验、用户确认或离线通过均不代表独立空间验收。
 
-- [Runme 索引](.runme/README.md)、[全系统入口](.runme/run/system-operations.md)
-- [Robot 操作](.runme/run/robot-operations.md)、[项目进展](.runme/Progress/project-progress.md)
-- [Camera_RT 操作](.runme/run/camera-rt-operations.md)、[Camera_RT 进展](.runme/Progress/camera-rt-progress.md)
-- [Camera_wrist 操作](.runme/run/camera-wrist-operations.md)、[Camera_wrist 进展](.runme/Progress/camera-wrist-progress.md)
-- [标定与单点定位](.runme/run/calibration-operations.md)
+## 文档入口
 
-这些 notebook 记录本机运行知识并纳入 Git；架构和公共接口仍以本文件及模块级
-`ARCHITECTURE.md` 为权威来源。含设备、常驻进程或机器人运动的单元必须逐个执行，
-禁止使用 `runme run --all`。
+| 内容 | 文档 |
+| --- | --- |
+| 本机操作与进展 | [Runme 索引](.runme/README.md)、[全系统入口](.runme/run/system-operations.md)、[项目进展](.runme/Progress/project-progress.md) |
+| Robot 控制、协议与构建 | [Robot 架构](infer/Robot/ARCHITECTURE.md)、[操作](.runme/run/robot-operations.md)、[学习路径](.runme/rm75_learning_path.md) |
+| 超声推理 | [推理架构](intergrate_infer/ARCHITECTURE.md) |
+| 全局相机与初始定位 | [Camera_RT 架构](infer/Camera_RT/ARCHITECTURE.md)、[操作](.runme/run/camera-rt-operations.md) |
+| 腕部跟随与模型 | [Camera_wrist 架构](infer/Camera_wrist/ARCHITECTURE.md)、[detector 架构](infer/Camera_wrist/detector/ARCHITECTURE.md)、[操作](.runme/run/camera-wrist-operations.md) |
+| 相机标定 | [标定说明](infer/hand_eye_calibration-main/README.md)、[操作](.runme/run/calibration-operations.md) |
+| 力传感器与末端替换 | [KWR57 接入](docs/kwr57_sensor_integration.md)、[采集分析](docs/sensor_drift_recording.md)、[SensorMonitor 架构](infer/SensorMonitor/ARCHITECTURE.md)、[替换计划](.runme/run/end-effector-replacement.md) |
+| 长期决策 | [DECISIONS.md](DECISIONS.md) |
+| 碰撞检测与避障规划 | [Collision 架构](infer/Collision/ARCHITECTURE.md)、[进展](infer/Collision/PROGRESS.md)、[监测操作](infer/Collision/MONITOR.md)、[规划操作](infer/Collision/PLANNING.md)；当前支持人工／相机场景 OMPL 规划与颈动脉目标 IK，生产反馈桥接和执行待完成 |
 
-## 详细架构文档
-
-- [KWR57 ROS 2 Jazzy 驱动](ros2_ws/src/kwr57_driver/README.md)：独立串口采集，直接发布原始 SI
-  `WrenchStamped`；默认 `/kwr57/wrench`，不依赖 Redis/GUI。
-
-- [腕部模型服务 detector](infer/Camera_wrist/detector/ARCHITECTURE.md)：Roboflow 模型加载、单帧检测、配置与私有协议；
-  [最简启动](.runme/run/carotid-begin-operations.md)与[模型进展及历史](.runme/Progress/carotid-begin-progress.md)。
-  原 `Carotid_begin` 已并入 `Camera_wrist`，历史记录保留原名称。
-
-- [Robot](infer/Robot/ARCHITECTURE.md)、[超声推理](intergrate_infer/ARCHITECTURE.md)、
-  [全局相机](infer/Camera_RT/ARCHITECTURE.md)、[传感器监视](infer/SensorMonitor/ARCHITECTURE.md)
-- [腕部架构与协议](infer/Camera_wrist/ARCHITECTURE.md)、[决策摘要](DECISIONS.md)
-
-2026-09-17 用户授权候选外参执行：--wrist-candidate-trial允许无力、限时30秒以内的候选实验；
-额外--wrist-unlimited-excursion取消实测/规划相对起点的累计位移和累计转角门，仅此模式可用。
-速度、关节/IK、通信、周期、Hold和急停不变，外参文件不改验证状态。summary control记录两个开关。
-
-2026-09-17：Camera_wrist/start_robot.sh为已授权腕部实验的专用无参数常驻入口。
-候选执行可设duration=0，由Ctrl+C/故障结束；相机q只结束本轮并保持Hold。普通main_rm75默认模式不变。
+`.runme/` Markdown 随仓库维护；路径和设备配置按本机调整。设备、常驻进程及运动单元逐个执行，禁止 `runme run --all`。

@@ -28,7 +28,7 @@ RobotRuntimeConfig MakeImplicitRm75ProductionConfig(
     config.sensor_protocol = ForceSensorProtocol::kKwr57Rs422;
     config.sensor_baud = 460800;
     config.calibration_path =
-        (directory / "kwr57_force_calibration.json").string();
+        (directory / "rm75_force_calibration.json").string();
     // User-assigned calibration identity; the protocol exposes no hardware ID.
     config.expected_sensor_id = "KWR57";
     config.probe_model_path =

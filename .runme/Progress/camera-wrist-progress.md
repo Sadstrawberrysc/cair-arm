@@ -3,32 +3,15 @@
 > 本文件是纳入 Git 的 Runme notebook；当前架构见
 > [Camera_wrist/ARCHITECTURE.md](../../infer/Camera_wrist/ARCHITECTURE.md)。
 
-更新日期：2026-10-02。09-17 起的记录保留当时日期、配置和验证范围；当前入口以本节为准。
+## 当前入口与待验收
 
-## 当前入口与验证（2026-10-02）
+- 默认相机模型模式，`--manual` 人工选点；始终连接 Redis。模型取得新鲜 Robot Hold 和完整 RGB-D 后自动选点，目标回传确认后请求跟随；`b` 重选并开始，`p` 取消自动意图，`q` 退出相机。
+- TCP / 姿态参考及每关节命令限速为 4 mm/s、4°/s、4°/s。Robot 专用脚本是无力候选试验，关闭累计位移 / 转角及 TCP 位置跟踪误差门，持续到 Ctrl+C 或故障。
+- 模型服务归入 `detector/`，camera / ultralytics 分进程，经私有 socketpair 通信；默认 ID、阈值、缓存和凭据见 [detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
+- 仍需真实扫描点真值、连续检测 / 恢复、独立外参、采集 / 反馈时序、TCP 间距和整段净空验收；历史约 24 mm 深度差及约 11.7 mm 间距差不能直接写成修正。
 
-`bash infer/Camera_wrist/start_camera.sh` 无参数默认模型模式；显式 `--manual` 使用左键
-选点跟踪，不加载模型。两种模式都连接 Redis 并订阅 Robot 状态，`--no-redis` 已移除。
-模型模式 `b` 新帧选点后请求开始、`d` 只选点；手动模式左键选点后按 `b/r` 请求跟随。
-启动、模型加载和收到 Robot 状态本身不自动开始运动。
-
-模型服务在 `detector/`，由相机启动 `infer.Camera_wrist.detector.worker`；
-`follow_session.py` 管理会话、单键开始和暂停回执后的自动恢复。
-配置见 [detector/config.py](../../infer/Camera_wrist/detector/config.py)：显式 `--model-id`
-优先于 `CAROTID_MODEL_ID`，再取 `DEFAULT_MODEL_ID`；默认选点阈值 0.4。
-缓存位于 `Camera_wrist/data/model_cache/`，可由 `MODEL_CACHE_DIR` 覆盖；相机 `camera`
-环境与模型 `ultralytics` 环境、私有 socketpair 保留。
-
-本次迁移 `camera` / `carotid` 环境各 79 项离线测试、`ultralytics` 模型相关 14 项通过，
-含真实 socketpair 和假模型 worker；未运行真实 GPU 推理、相机、Redis 回环或机械臂运动。
-当前离线入口是在仓库根目录运行
-`/home/cair-jacen/anaconda3/envs/camera/bin/python -m unittest discover -s infer/Camera_wrist/tests -v`；
-具体覆盖见 [迁移验证记录](#2026-10-02carotid_begin-合并到腕部模块)。
-
-日常操作见 [腕部操作 notebook](../run/camera-wrist-operations.md)与
-[模型最简启动](../run/carotid-begin-operations.md)；其他进展见
-[模型进展](carotid-begin-progress.md)、[项目进展](project-progress.md)和
-[早期方案历史](yolo-roboflow-visual-servo-plan.md)。
+操作见 [腕部手册](../run/camera-wrist-operations.md)。下方保留当时配置、日期和验证范围；
+旧入口、限速、人工首次开始及历史设备状态不代表当前配置。最新自动开始与 90 项测试记录见文末 2026-10-12 条目。
 
 ## 2026-10-12：腕部相机未枚举与启动诊断
 
@@ -60,18 +43,6 @@
 
 历史文件核查见下方；测试日志：/tmp/wrist_loopback_otnd84zy（754 周期）、
 /tmp/wrist_loopback_n5ichamd（757 周期），均无故障、ServoJ 发送数 0，后者验证 planner 接受过目标。
-
-## 当前待验收事项
-
-- 在真实目标上复核检测框中心与实际扫描点的对应关系，建立独立真值与定位误差记录。
-- 验证模型选点、同源帧融合与遮挡后的暂停确认、自动重选/恢复，保留两端日志及图像证据。
-- 复测静止、缓慢移动、遮挡、弱纹理、深度失效及重选恢复，分析追踪丢失图像。
-- 独立核验腕部外参、同一标记多姿态 Base 位置、曝光与机器人反馈时间对应。
-- 对照实测 Probe TCP 间距，核查约 24 mm 深度差及根目录记录的约 11.7 mm 间距差，分别记录来源。
-- 完成悬停间距和低速真实联动验证；带力模式另需完成力残差验收。
-
-当前实现与离线测试不能替代空间、时序或真实运动验证。以下日期条目为实现与试验历史，
-旧独立视觉模式、限速、累计运动门和启动命令不能替代上方当前入口与模块架构。
 
 ## 2026-09-16 标定文件核查
 
@@ -205,13 +176,6 @@ P95 0.717°、最大 1.154°；平面 RMS 中位 0.231 mm、最大 0.399 mm。
 瞬时法向与接受的目标 Tool-Z 可存在约 5° 偏差；此值不是实际姿态误差保证。
 回归检查调整为 4° 保持、6° 更新，并继续检查角速度上限。
 
-## 文档职责整理
-
-架构文档只维护当前模块职责、数据流、坐标链、接口和控制行为。
-变更历史、测试结果、运行问题及验收状态统一由本文件维护。
-当前验证状态：候选外参未独立验收，已有真实运行抖动、ROI 越界与误差超限记录；
-编译、离线测试和二维追踪通过不代表真实运动或空间精度已验收。
-
 ## 日志统一保存到 Camera_wrist/log
 
 机器人启动脚本、点击追踪和投影入口默认日志改为模块下 log/，使用绝对路径解析，不依赖启动目录。
@@ -307,28 +271,11 @@ Orbbec 官方推荐 USB 3.0，故该链路是间歇性零帧的可能因素，�
 
 ## 2026-10-02：Carotid_begin 合并到腕部模块
 
-模型服务归入 `Camera_wrist/detector/`，采用 config、credentials、gpu_model、detection、
-pipeline、protocol、worker 的职责拆分；模型入口改为
-`python -m infer.Camera_wrist.detector.worker`。相机与模型仍使用各自 Conda 环境和私有
-socketpair，不改变 Robot Redis 公共协议与控制。ClickSession、ModelStart 和 ModelRecovery
-统一放在 `follow_session.py`，相机入口保留采集、窗口、跟踪融合和 Redis I/O。
-
-无参数默认模型模式；默认 ID 由 `detector/config.py` 定义，`CAROTID_MODEL_ID` 可覆盖，
-显式 `--model-id` 优先。`--manual` 保留手动点击、光流和深度跟踪，且不启动模型进程。
-模型加载不自动开始运动，仍由人工 `b/r` 启用跟随意图。
-
-默认缓存迁到 `Camera_wrist/data/model_cache/`，原私有凭据路径继续兼容；原独立模型日志
-归档到 `Camera_wrist/log/carotid_begin/`。模型测试合并到 `Camera_wrist/tests/`；
-架构与操作入口同步更新。模型历史证据保留在
-[模型进展 notebook](carotid-begin-progress.md)，当前服务边界见
-[detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
-
-本次 `camera`（Python 3.8）与 `carotid` 环境各运行 79 项离线测试全部通过，
-包含本机真实 socketpair 和假模型 worker 子进程；`ultralytics`（Python 3.11）环境的
-模型相关 14 项全部通过。Python 源码语法、Bash 语法、相机和新 worker 的 `--help`
-检查通过，提取的三个会话类与迁移前 AST 一致。
-这些验证使用假模型及离线输入，未运行真实 GPU 推理、相机、Redis 回环或机械臂运动；
-真实目标连续跟踪、恢复和定位精度仍待验收。
+模型归入 `Camera_wrist/detector/`，会话类提取到 `follow_session.py`，缓存迁入模块 data，旧凭据路径兼容。
+相机默认模型、`--manual` 手动，Robot 公共协议不变；当时首次跟随仍由人工 b/r 启用，后被 10-12 自动开始替代。
+`camera` / `carotid` 各 79 项、`ultralytics` 模型相关 14 项离线通过，含真实 socketpair 与假 worker；
+语法、CLI help 和提取类 AST 对比通过。当轮无 GPU 推理、相机、Redis 回环或机械臂运动。
+模型沿革见 [模型进展](carotid-begin-progress.md)，接口见 [detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
 
 ## 2026-10-09：恢复原 RT 内核默认启动项
 

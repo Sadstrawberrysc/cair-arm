@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KWR57 acquisition, software zero and live six-axis display."""
+"""Standalone six-axis monitor; optionally read Robot Redis telemetry without controlling it."""
 
 import argparse
 from collections import deque
@@ -16,9 +16,11 @@ import time
 if __package__:
     from .kwr57 import Kwr57Parser
     from .recording import SessionRecorder
+    from .redis_source import RedisSource, decode_sample
 else:
     from kwr57 import Kwr57Parser
     from recording import SessionRecorder
+    from redis_source import RedisSource, decode_sample
 
 
 def open_sensor(device: str, baud: int) -> int:
@@ -54,23 +56,118 @@ def write_command(fd: int, command: bytes) -> None:
 
 
 class Acquisition(threading.Thread):
-    def __init__(self, device, baud, recorder):
-        super().__init__(name="kwr57-acquisition")
+    def __init__(self, device, baud, recorder, source="auto", redis_host="127.0.0.1", redis_port=7777):
+        super().__init__(name="sensor-acquisition")
         self.device, self.baud, self.recorder = device, baud, recorder
+        self.requested_source = source
+        self.source = "等待识别"
+        self.redis_host, self.redis_port = redis_host, redis_port
         self.stop_event = threading.Event()
-        self.samples = deque(maxlen=1000)  # Bounded display history; CSV retains every decoded frame.
+        self.samples = deque(maxlen=1000)
         self.lock = threading.Lock()
         self.error = ""
         self.status = "等待数据"
+        self._next_display = 0.0
+
+    def record(self, frames, now_ns):
+        elapsed, values, zero = self.recorder.record_batch(frames, now_ns)
+        self.status = f"{self.source} | {zero['status']} | 已记录 {self.recorder.rows_written} 帧"
+        if now_ns / 1e9 >= self._next_display:
+            with self.lock:
+                self.samples.append((elapsed, values if zero["valid"] else [float("nan")] * 6,
+                                     zero["revision"]))
+            self._next_display = now_ns / 1e9 + 0.02
+
+    def select_source(self):
+        if self.requested_source == "serial":
+            return None, None
+        self.status = "检查项目 Redis 遥测…"
+        try:
+            stream = RedisSource(self.redis_host, self.redis_port)
+        except ImportError as error:
+            raise RuntimeError("自动识别 / Redis 监控需要 redis-py；请安装 redis") from error
+        except Exception as error:
+            import redis
+            if (self.requested_source == "auto"
+                    and isinstance(error, (redis.ConnectionError, redis.TimeoutError))):
+                return None, None
+            raise
+        if self.requested_source == "redis":
+            return stream, None
+        try:
+            deadline = time.monotonic() + 1.0
+            while not self.stop_event.is_set() and time.monotonic() < deadline:
+                payload = stream.read()
+                if payload is not None:
+                    # Invalid/no-force telemetry still means Robot owns acquisition.
+                    return stream, payload
+        except Exception:
+            stream.close()
+            raise
+        stream.close()
+        return None, None
 
     def run(self):
-        fd = None
+        stream = None
         try:
-            fd = open_sensor(self.device, self.baud)
+            if self.stop_event.is_set():
+                return
+            stream, first = self.select_source()
+            if self.stop_event.is_set():
+                return
+            self.source = "Redis" if stream is not None else "串口"
+            print(f"独立监控，数据源：{self.source}", flush=True)
+            if stream is not None:
+                self.run_redis(stream, first)
+            else:
+                self.run_serial()
+        except Exception as error:
+            self.error = f"{self.source}：{error}"
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception as error:
+                    self.error = self.error or f"Redis 关闭失败：{error}"
+            try:
+                self.recorder.close()
+            except OSError as error:
+                self.error = self.error or f"保存失败：{error}"
+
+    def run_redis(self, stream, first=None):
+        last_valid = time.monotonic()
+        last_sequence = last_timestamp = None
+        pending = first
+        while not self.stop_event.is_set():
+            if time.monotonic() - last_valid > 1:
+                raise TimeoutError(f"超过 1 秒无新鲜有效力遥测，采集已停止（{self.status}）")
+            payload = pending if pending is not None else stream.read()
+            pending = None
+            if payload is None:
+                continue
+            try:
+                values, sequence, timestamp = decode_sample(payload)
+            except (ValueError, TypeError, OverflowError) as error:
+                self.status = f"Redis | {error}"
+                continue
+            if last_timestamp is not None:
+                if timestamp <= last_timestamp:
+                    continue
+                if sequence <= last_sequence:
+                    # New producer/reader stream: collect a new fixed zero.
+                    self.recorder.zeroing.reset("Robot 采样流已重置，重新清零")
+            last_sequence, last_timestamp = sequence, timestamp
+            now_ns = time.monotonic_ns()
+            last_valid = now_ns / 1e9
+            # Robot already publishes SI. Keep CSV and zeroing in Sensor frame.
+            self.record([values], now_ns)
+
+    def run_serial(self):
+        fd = open_sensor(self.device, self.baud)
+        try:
             parser = Kwr57Parser()
             write_command(fd, b"\x48\xaa\r\n")
             last_frame = time.monotonic()
-            next_display = 0.0
             while not self.stop_event.is_set():
                 if time.monotonic() - last_frame > 1:
                     raise TimeoutError("超过 1 秒未收到有效数据，采集已停止")
@@ -83,32 +180,17 @@ class Acquisition(threading.Thread):
                 if not data:
                     raise OSError("传感器连接已断开")
                 frames = parser.feed(data)
-                if not frames:
-                    continue
-                now_ns = time.monotonic_ns()
-                last_frame = now_ns / 1e9
-                elapsed, values, zero = self.recorder.record_batch(frames, now_ns)
-                self.status = f"{zero['status']} | 已记录 {self.recorder.rows_written} 帧"
-                if last_frame >= next_display:
-                    with self.lock:
-                        # Break curves during zero collection and between tare revisions.
-                        self.samples.append((elapsed, values if zero["valid"] else [float("nan")] * 6,
-                                             zero["revision"]))
-                    next_display = last_frame + 0.02
-        except Exception as error:
-            self.error = str(error)
+                if frames:
+                    now_ns = time.monotonic_ns()
+                    last_frame = now_ns / 1e9
+                    self.record(frames, now_ns)
         finally:
-            if fd is not None:
-                try:
-                    write_command(fd, b"\x43\xaa\r\n")
-                except (OSError, TimeoutError) as error:
-                    self.error = self.error or f"停流失败：{error}"
-                finally:
-                    os.close(fd)
             try:
-                self.recorder.close()
-            except OSError as error:
-                self.error = self.error or f"保存失败：{error}"
+                write_command(fd, b"\x43\xaa\r\n")
+            except (OSError, TimeoutError) as error:
+                self.error = self.error or f"停流失败：{error}"
+            finally:
+                os.close(fd)
 
 
 def run_gui(reader):
@@ -119,7 +201,7 @@ def run_gui(reader):
     class Window(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("KWR57 六轴力传感器")
+            self.setWindowTitle("SensorMonitor 独立六轴监控")
             self.resize(1100, 650)
             graphs = pg.GraphicsLayoutWidget()
             self.setCentralWidget(graphs)
@@ -157,6 +239,7 @@ def run_gui(reader):
                 values = np.array([s[1] for s in samples])
                 for index, curve in enumerate(self.curves):
                     curve.setData(times - times[-1], values[:, index], connect="finite")
+            self.setWindowTitle(f"SensorMonitor 独立监控 — {reader.source}")
             self.statusBar().showMessage(reader.error or reader.status)
 
         def stop(self):
@@ -212,12 +295,16 @@ def run_gui(reader):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", choices=("auto", "serial", "redis"), default="auto",
+                        help="默认自动识别项目 Redis 遥测，否则直连串口；也可手动指定来源")
+    parser.add_argument("--redis-host", default="127.0.0.1")
+    parser.add_argument("--redis-port", type=int, default=7777)
     parser.add_argument("--device", default="/dev/ttyUSB0")
     parser.add_argument("--baud", type=int, choices=(115200, 460800), default=460800)
     parser.add_argument("--headless", action="store_true", help="无界面记录，Ctrl+C 停止后出图")
     args = parser.parse_args(argv)
     recorder = SessionRecorder()
-    reader = Acquisition(args.device, args.baud, recorder)
+    reader = Acquisition(args.device, args.baud, recorder, args.source, args.redis_host, args.redis_port)
     print(f"记录目录：{recorder.directory}", flush=True)
     if not args.headless:
         try:

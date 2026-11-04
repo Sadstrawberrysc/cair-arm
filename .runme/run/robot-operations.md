@@ -5,10 +5,10 @@
 
 > 无参数运行 `./main_rm75` 是真机运动模式，执行前确认探头悬空、急停可用。
 
-2026-10-26：力传感器默认改为 KWR57 RS422，`/dev/ttyUSB0`、460800/8N1。
-无参数入口读取可执行文件旁的 `kwr57_force_calibration.json`，配置身份 `KWR57`；
-本次尚未生成新标定，缺失文件时启动会拒绝，不复用旧 Haptron 标定。
-单独查看原始六轴数据可运行下方 SensorMonitor，详细行为见
+力传感器默认使用 KWR57 RS422，`/dev/ttyUSB0`、460800/8N1。
+无参数入口读取可执行文件旁的 `rm75_force_calibration.json`，配置身份 `KWR57`；
+新装配标定仍待实际采集验收；文件缺失或身份不匹配会拒绝启动，旧 Haptron 标定不能作为新传感器标定。
+项目传感器采集和 Redis 遥测由 Robot 管理，SensorMonitor 是可选监控工具。详细行为见
 [KWR57 接入说明](../../docs/kwr57_sensor_integration.md)。
 
 ## 1. 构建 main_rm75
@@ -31,6 +31,7 @@ if [[ "$(redis-cli -h 127.0.0.1 -p 7777 ping 2>/dev/null)" != PONG ]]; then
 fi
 redis-cli -h 127.0.0.1 -p 7777 ping
 ```
+
 ## 3. 启动 main_rm75
 
 ```bash {"name":"start-main-rm75","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
@@ -52,22 +53,20 @@ python main_redis_seg_newphase_recovery_mode.py
 视觉窗口：先按 `b` 启动接近和 Tool-Y，再按 `m` 启动 Tool-X 扫描；视觉模型在
 phase=1 时才请求 RZ 对齐。按 `t` 结束本轮并回到 idle，按 `q` 发布 terminate 后退出。
 
-## 5. 启动传感器监视
+## 5. 可选：只读查看 Redis 遥测
 
-监视器自动选择数据源：单独运行时按 KWR57/460800 直连 `/dev/ttyUSB0`，显示 Sensor-frame 原始六轴
-wrench；在 `main_rm75` 已启动后运行时，自动读取 Redis，原始值用实线、Tool-frame 补偿值用虚线。
+项目运行不需要 SensorMonitor。确认 Robot 已发布遥测后运行下方单元，监控会自动识别并只读订阅 Redis。
+若无遥测则尝试串口直连；仅 Redis 进程存在不代表项目正在发布数据。
 
 ```bash {"name":"start-sensor-monitor","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
-source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh && conda activate carotid && LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python /home/cair-jacen/uspilot_ctrl-main/infer/SensorMonitor/main.py
+source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
+conda activate carotid
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python /home/cair-jacen/uspilot_ctrl-main/infer/SensorMonitor/main.py
 ```
 
-直连模式独占串口。如果之后要启动 `main_rm75`，先退出监视器，启动 `main_rm75`，再重新
-运行上述同一条监视命令。
-
-SensorMonitor 现在默认自动保存原始六轴数据，可在窗口点击“结束采集并分析”。
-固定姿态长期记录也可无参数运行 `python infer/SensorMonitor/record.py`（仓库根目录、carotid 环境），
-Ctrl+C 保存退出后运行 `python infer/SensorMonitor/analyze.py` 分析最新记录。数据位于
-`infer/SensorMonitor/records/`，不纳入 Git。详细边界见[长期记录说明](../../docs/sensor_drift_recording.md)。
+监控清零仅影响显示与本地记录，不改变 Robot tare / 控制；关闭监控不停止项目。
+无界面入口为 `python infer/SensorMonitor/record.py`，同样自动识别来源。
+CSV、出图与独立串口用法见[使用说明](../../docs/sensor_drift_recording.md)。
 
 ## 6. 停止顺序
 

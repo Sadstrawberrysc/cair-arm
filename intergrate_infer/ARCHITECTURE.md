@@ -22,11 +22,13 @@
 
 输入包括相机帧、键盘 `b/m/t/q`、本地权重和 Redis status。输出固定发布到
 `127.0.0.1:7777/robot:command:channel`，并订阅 `robot:status:channel` 获取 session/sequence
-确认。payload schema 见根级 [ARCHITECTURE.md](../ARCHITECTURE.md)。
+确认。payload schema 见 [Robot Redis 接口](../infer/Robot/ARCHITECTURE.md#redis-接口)。
 
 按键语义：`b` 切换 moving/idle，`m` 请求扫描阶段，`t` 结束本轮，`q` 发布 terminate
 后退出。Redis publish 成功不是机器人执行确认，必须以同 session 的 status
 `producer_sequence` 判断确认进度。
+
+运行步骤见 [Robot 操作](../.runme/run/robot-operations.md#4-启动视觉程序)。
 
 ## 依赖
 

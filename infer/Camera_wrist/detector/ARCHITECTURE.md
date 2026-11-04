@@ -1,6 +1,6 @@
 # 腕部模型服务 detector 架构
 
-本文依据 **2026-10-02 当前工作区源码**。原 `infer/Carotid_begin/` 模型代码已并入
+原 `infer/Carotid_begin/` 模型代码已并入
 `Camera_wrist/detector/`；本子包负责模型加载和单帧检测，以唯一合格检测框中心返回
 初始扫描点 P0 的二维候选。RGB-D 采集、光流、深度几何、融合和跟随会话由腕部主模块管理，
 整体流程及 Robot 协议见 [Camera_wrist 架构](../ARCHITECTURE.md)。
@@ -15,17 +15,6 @@
 `ModelSelector` 创建私有 `socketpair` 并启动模型 worker；没有独立 TCP 服务端口。
 相机后台线程交换请求，采集、赶帧、跟踪和窗口事件仍由相机主循环执行。
 模型进程加载一次模型，串行回复帧请求，同一时刻只有一个请求在途。
-
-```mermaid
-flowchart LR
-    CAM["click_follow + follow_session<br/>采集、窗口和会话"] --> SEL["ModelSelector<br/>后台请求与源帧缓存"]
-    SEL -->|"NPZ：BGR、对齐深度、源时间"| WORKER["detector.worker<br/>模型加载一次"]
-    WORKER --> PIPE["DetectionPipeline<br/>推理、框转换、唯一中心"]
-    PIPE -->|"JSON：源时间、候选或拒绝原因"| SEL
-    SEL --> TRACK["LocalTracker + DetectionCenterFusion<br/>赶帧、三维观测与融合"]
-    TRACK --> CAM
-    CAM -->|"既有 observation / command"| REDIS["Redis → Robot"]
-```
 
 | 文件 / 入口 | 职责 | 边界 |
 | --- | --- | --- |
@@ -92,20 +81,6 @@ Robot Redis 公共协议不随目录迁移改变。
 有效深度、局部表面和法向由相机端计算。`inference_ms` 仅计 `model.infer`，
 不含传输、后处理、赶帧或端到端延迟。
 
-```mermaid
-flowchart TD
-    CFG["CLI → ModelConfig 校验"] --> LOAD["凭据 → 缓存 → 加载模型 → 检查 CUDA"]
-    LOAD --> READY["发送 ready"]
-    READY --> RECV["接收并校验 NPZ / 源时间"]
-    RECV --> PIPE["DetectionPipeline：推理、框转换、唯一中心"]
-    PIPE -->|"成功或普通检测拒绝"| SEND["JSON 保留原 capture_monotonic_ns"]
-    SEND --> RECV
-    RECV -->|"消息边界上的 EOF"| END["正常结束"]
-    RECV -->|"截断或非法请求"| FAIL["异常结束"]
-    PIPE -->|"未捕获模型运行异常"| FAIL
-    SEND -->|"序列化、长度或 socket 错误"| FAIL
-```
-
 ## 故障与时效
 
 | 条件 | 模型服务 / 相机行为 |
@@ -143,7 +118,7 @@ ready 的 socket 操作 timeout 为 60 s，逐帧交换为 15 s；均不是观�
 ```
 
 这些检查不替代真实 CUDA 推理、相机运行或机械臂运动验收；历史通过数也不代表当前回归数。
-本次迁移的实际检查见 [腕部进展](../../../.runme/Progress/camera-wrist-progress.md)。
+实际检查按日期记录在 [腕部进展](../../../.runme/Progress/camera-wrist-progress.md)。
 模型诊断仍由相机写入 `Camera_wrist/log/wrist_click_*.jsonl`，原独立模型日志归档于
 `Camera_wrist/log/carotid_begin/`。按源单调时间和 `reason` 区分无目标、普通拒绝与进程故障；
 融合与 Robot 日志的关联方式见腕部架构及操作 notebook。

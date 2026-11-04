@@ -16,16 +16,8 @@ conda activate camera
 cd /home/cair-jacen/uspilot_ctrl-main/infer/Camera_RT
 ```
 
-若未来重建环境，CUDA 版 Torch/torchvision 使用 `requirements.txt` 中配置的 PyTorch
-索引；PyTorch3D 需要先按其 CUDA 11.7/PyTorch 1.13 兼容方式单独安装，例如：
-
-```bash
-conda install -c pytorch3d pytorch3d=0.7.5
-pip install -r requirements.txt
-```
-
-
-不要在当前已验证环境中为消除提示而批量重装。
+重建环境前核对 [requirements.txt](../requirements.txt) 和 [preflight.py](preflight.py) 的兼容基线；
+不要为消除提示批量重装已验证环境。历史依赖版本不代表全仓库版本锁。
 
 ## 预检
 
@@ -48,24 +40,9 @@ USBFS 与 systemd/udev bus。此时内核枚举会显示 `PASS`，SDK 访问仍�
 - `WARN`：不影响本项检查，但功能运行前仍需处理。
 - `BLOCKED`：当前层级不能继续，保留原始错误用于定位。
 
-当前机器的宿主检查顺序：
-
-```bash
-sudo nvidia-modprobe -c=0
-sudo nvidia-modprobe -u
-sudo nvidia-modprobe -m
-nvidia-smi
-source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
-conda activate camera
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-lsusb | grep -i realsense
-python tools/preflight.py --runtime
-```
-
-若 `nvidia-modprobe` 后设备节点仍未出现，应先重启机器；不要在实时内核上直接卸载正在使用的
-NVIDIA 模块。D455 已有 `/etc/udev/rules.d/99-realsense-libusb.rules`，产品 ID `0b5c` 已覆盖。
-若宿主终端仍无权限，再由管理员执行 `udevadm control --reload-rules`，重新插拔 D455，并将当前
-用户加入 `video` 组后重新登录。不要在 Codex 沙箱里执行这些系统级操作。
+宿主设备访问异常时先检查 `nvidia-smi`、USB 枚举和 SDK 错误，保留原始输出。
+驱动、udev 权限和用户组由管理员在宿主处理；沙箱不可见设备不能作为重装驱动的依据。
+设备与环境历史见 [Camera_RT 进展](../../../.runme/Progress/camera-rt-progress.md)。
 
 ## 路径格式测试
 

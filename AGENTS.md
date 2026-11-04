@@ -6,14 +6,17 @@
 相机定位与追踪、标定，以及模型训练实验。超声视觉主链路通过本机 Redis
 （`127.0.0.1:7777`）向机器人控制进程传递命令。
 
-按任务定位代码，无需先通读整个仓库：
+## 代码入口
+
+按任务定位代码：
 
 - `infer/Robot/`：机器人控制与通信；入口为 `src/main_rm75.cpp`。
 - `intergrate_infer/`：在线超声推理；主入口为 `main_redis_seg_newphase_recovery_mode.py`。
 - `infer/Camera_RT/`：全局相机与粗定位；`infer/Camera_wrist/`：腕部相机、模型/手动选点与追踪，
   `detector/` 子包负责模型服务。
 - `infer/hand_eye_calibration-main/`：手眼标定。
-- `infer/ContactPointShow/`、`infer/SensorMonitor/`：接触点与传感器辅助程序。
+- `infer/ContactPointShow/`、`infer/SensorMonitor/`：接触点显示与独立传感器监控，均非控制入口。
+- `infer/Collision/`：纯 C++17 几何审计、FCL 检查、只读相机监测及 OMPL 规划；监测窗口按 P／`--plan-once` 接通相机快照规划，`--coarse` 支持颈动脉点 → TCP → 多候选 IK；生产反馈桥接和执行待接入。架构见 ARCHITECTURE.md，进展见 PROGRESS.md，操作见 MONITOR.md、PLANNING.md。
 - `scan_pilot/`、`pose_pilot/`、`segmentation/`、`encoder_pretrain/`：训练与实验。
 - `SonoScape_api/`、`py-xiaokai/`：超声设备接口及语音/UI 辅助模块。
 
@@ -60,7 +63,7 @@ ctest --test-dir infer/Robot/build --output-on-failure
 - 确认当前进度、配置、待办或启动方式时，查本机 `.runme/README.md` 及对应 notebook；
   `.runme/` 中的 Markdown notebooks 纳入 Git，缺失时以 `ARCHITECTURE.md` 和当前源码为准重新建立。
 - 处理 Robot 构建与测试时，以 [CMakeLists.txt](infer/Robot/CMakeLists.txt) 为准。
-- 处理远程相机时，查 [远程相机监控](docs/remote_camera_monitoring.md)。
+- 处理相机时，查对应模块架构及 `.runme/run/camera-*-operations.md`；当前没有独立远程相机监控文档。
 - 追溯设计原因时，查 [DECISIONS.md](DECISIONS.md)。新的跨模块、公共 API 或长期维护
   决策在该文件追加日期、决策及原因，保留旧记录；普通小修无需新增决策条目。
 

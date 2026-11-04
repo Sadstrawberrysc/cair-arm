@@ -7,9 +7,8 @@
 #include <realman_command.hpp>
 
 // Immutable transforms loaded from one validated force-calibration file.
-// Controller poses are Base -> Arm_Tip. Tool and Sensor axes are coincident
-// on the current installation; their fixed mount rotation is expressed as
-// Arm_Tip <- Tool/Sensor.
+// Controller poses are Base -> Arm_Tip. Sensor mount and probe Tool axes
+// are independent: R_ArmTip_Tool = R_ArmTip_Sensor * R_Sensor_Tool.
 class CalibratedFrameChain {
 public:
     explicit CalibratedFrameChain(const ForceCalibration& calibration);
@@ -28,6 +27,10 @@ public:
     static bool InterpolateCamera(const std::deque<CameraSample>& history,
                                   std::int64_t time_ns, Eigen::Matrix4d& pose, double& span_ms);
 
+    Eigen::Matrix3d RotationBaseFromSensor(
+        const Eigen::Matrix<double, 6, 1>& pose) const;
+    Eigen::Vector3d SensorVectorInTool(const Eigen::Vector3d& vector) const;
+    Eigen::Vector3d ContactPointRelativeTcpTool(const Eigen::Vector3d& point) const;
     const Eigen::Matrix3d& RotationArmTipFromTool() const noexcept;
     const Eigen::Vector3d& TranslationSensorToToolM() const noexcept;
     const Eigen::Vector3d& ProbeTcpSensorM() const noexcept;
@@ -47,6 +50,8 @@ public:
         const Eigen::Matrix<double, 6, 1>& reference_pose) const;
 
 private:
+    Eigen::Matrix3d rotation_arm_tip_from_sensor_ = Eigen::Matrix3d::Identity();
+    Eigen::Matrix3d rotation_sensor_from_probe_ = Eigen::Matrix3d::Identity();
     Eigen::Matrix3d rotation_arm_tip_from_tool_ = Eigen::Matrix3d::Identity();
     Eigen::Vector3d translation_sensor_to_tool_m_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d probe_tcp_sensor_m_ = Eigen::Vector3d::Zero();

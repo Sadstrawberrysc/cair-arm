@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!-- Synthetic seven-revolute-joint planning example, NOT an RM75 model. Each link has
+     explicit spherical geometry; these shapes do not represent physical arms. -->
+<robot name="planning_fixture">
+  <link name="base_link"><collision><origin xyz="-1.5 -1.5 -1.5"/><geometry><sphere radius="0.05"/></geometry></collision></link>
+  <link name="link1"><collision><origin xyz="0 0 -1"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="link2"><collision><origin xyz="0 0 -0.5"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="link3"><collision><origin xyz="0 0 0.25"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="link4"><collision><origin xyz="0 0 0.45"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="link5"><collision><origin xyz="0 0 0.65"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="link6"><collision><origin xyz="0 0 0.85"/><geometry><sphere radius="0.008"/></geometry></collision></link>
+  <link name="tip"><collision><geometry><sphere radius="0.06"/></geometry></collision></link>
+  <joint name="joint1" type="revolute"><parent link="base_link"/><child link="link1"/><axis xyz="0 0 1"/><limit lower="-1.2" upper="1.2" velocity="1"/></joint>
+  <joint name="joint2" type="revolute"><parent link="link1"/><child link="link2"/><axis xyz="0 1 0"/><limit lower="-1" upper="1" velocity="1"/></joint>
+  <joint name="joint3" type="revolute"><parent link="link2"/><child link="link3"/><origin xyz="1 0 0"/><axis xyz="1 0 0"/><limit lower="-1" upper="1" velocity="1"/></joint>
+  <joint name="joint4" type="revolute"><parent link="link3"/><child link="link4"/><axis xyz="0 1 0"/><limit lower="-1" upper="1" velocity="1"/></joint>
+  <joint name="joint5" type="revolute"><parent link="link4"/><child link="link5"/><axis xyz="0 0 1"/><limit lower="-1" upper="1" velocity="1"/></joint>
+  <joint name="joint6" type="revolute"><parent link="link5"/><child link="link6"/><axis xyz="1 0 0"/><limit lower="-1" upper="1" velocity="1"/></joint>
+  <joint name="joint7" type="revolute"><parent link="link6"/><child link="tip"/><axis xyz="0 0 1"/><limit lower="-1" upper="1" velocity="1"/></joint>
+</robot>

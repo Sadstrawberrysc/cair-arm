@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record KWR57 without a GUI; Ctrl+C saves and plots the session."""
+"""Record Redis or standalone KWR57 data without a GUI; Ctrl+C saves and plots."""
 
 import sys
 

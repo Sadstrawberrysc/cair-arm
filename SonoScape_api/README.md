@@ -1,191 +1,71 @@
-# Ultrasound Client API 文档
+# SonoScape 超声设备接口
 
-本文档详细说明了 `UltrasoundClient` 类中每个公共方法的用途、参数和返回值。
+[UltrasoundClient](sonoscape_client/client.py) 通过 TCP 控制超声主机；
+[redis_service.py](redis_service.py) 将 UI 的 Redis 请求转为设备调用。
+该接口独立于 RM75 的 `robot:command:channel` 运动闭环。
 
-## 通用行为
+## 入口与连接
 
--   所有“设置”或“控制”型方法在成功时返回 `True`。
--   如果设备响应表示命令失败（例如，通过返回 `0xFF` 状态字节），所有方法都会引发 `UltrasoundCommandError` 异常。
--   如果在通信过程中发生协议错误（如校验和不匹配、帧格式错误），方法会引发 `UltrasoundProtocolError`。
--   如果在网络层面发生问题（如连接超时、无法连接），方法会引发 `UltrasoundConnectionError`。
+| 文件 / 接口 | 用途 |
+| --- | --- |
+| `sonoscape_client/` | 真实设备客户端、协议常量与异常 |
+| `sonoscape_fake/`、`main_fake.py` | 本地模拟 / 演示 |
+| `redis_service.py` | Redis List `sonoscape:cmd` → 设备调用 → 结果键 |
+| `redis_client_demo.py` | Redis 请求示例 |
+| `main.py`、`read_status.py` | 设备演示 / 状态读取；运行前核对脚本地址与实际调用 |
 
----
+客户端构造为 `UltrasoundClient(host, port=6061, timeout=5)`，显式 `connect()` / `disconnect()`，
+或使用 `with UltrasoundClient(...) as client` 自动连接和关闭。服务脚本当前配置
+`192.168.1.100:6061`，Redis 默认 `localhost:6379`，运行前按实际设备调整。
 
-### `get_status()`
+## Redis 请求
 
-获取设备的完整实时状态。
+生产者向 `sonoscape:cmd` List 推入 JSON，例如：
 
--   **参数**: 无
--   **成功返回值**: 一个包含设备状态的字典。
-    ```python
-    {
-        "scan_mode": "谐波",
-        "probe_active": "激活",
-        "is_b_mode": "是",
-        "is_frozen": "解冻",
-        "is_new_patient_ui": "否",
-        "fps": "30.12",
-        "d_g": "D=300, G=6",
-        "gain_gn": 128,
-        "i_p": "I=1, P=2",
-        "power_pwr": 100,
-        "frequency_frq": "第 1 档",
-        "depth_d_mm": 35,
-        "micro_imaging_us": 0,
-        "image_start_x_percent": 12.54,
-        "image_start_y_percent": 12.54,
-        "image_width_px": 720,
-        "image_height_px": 540,
-    }
-    ```
+```json
+{"id":"example-request","command":"set_scan_depth(depth_mm=35)"}
+```
 
-### `control_s_marker(show: bool)`
+服务按 id 写 `sonoscape:result:<id>`；成功结果包含 `status=success` 和 data，成功路径 TTL 为 60 秒，
+异常返回 `status=error` / error，当前异常路径未设置 TTL。UI 客户端等待结果后删除键。
+服务启动会清空旧命令队列；它执行设备操作，不是只读监视器。
 
-控制屏幕左上角“S”标记的显示或隐藏。
+## 查询方法
 
--   **参数**:
-    -   `show` (`bool`): `True` 表示显示，`False` 表示隐藏。
--   **成功返回值**: `True`
+| 方法 | 返回 / 单位 |
+| --- | --- |
+| `get_status()` | 状态字典：模式、探头、冻结 / B 模式、fps、增益、功率、频率、深度和图像位置 / 尺寸 |
+| `get_disk_space()` | 剩余空间整数，GB |
+| `get_patient_name()` / `get_patient_id()` | 姓名 / ID 字符串，无值为空字符串 |
+| `get_patient_scan_time()` | 扫描时间，`datetime` |
+| `get_dicom_send_status(patient_id)` | `exists`、成功 / 失败计数；存在时含 `id_returned`，ID 长度最多 22 字节 |
+| `get_zoom_factor()` | 浮点放大倍数 |
 
-### `control_ruler(show: bool)`
+`get_status()` 的键包括 `scan_mode`、`probe_active`、`is_b_mode`、`is_frozen`、`is_new_patient_ui`、
+`fps`、`d_g`、`gain_gn`、`i_p`、`power_pwr`、`frequency_frq`、`depth_d_mm`、`micro_imaging_us`、
+`image_start_x_percent`、`image_start_y_percent`、`image_width_px`、`image_height_px`。
 
-控制图像标尺（刻度线）的显示或隐藏。
+## 控制方法
 
--   **参数**:
-    -   `show` (`bool`): `True` 表示显示，`False` 表示隐藏。
--   **成功返回值**: `True`
+通常成功返回 `True`，另有明确返回值的方法见表。
 
-### `get_disk_space()`
+| 方法 | 参数 / 行为 |
+| --- | --- |
+| `control_s_marker(show)` / `control_ruler(show)` | bool，显示 / 隐藏标记或标尺 |
+| `set_scan_mode(mode)` | `ScanMode.FUNDAMENTAL` / `HARMONIC` |
+| `set_scan_depth(depth_mm)` | 毫米，例如 35；内部转整数，旧 `depth_cm` 参数已不适用 |
+| `set_image_type(image_type)` | `ImageType.POST_PROCESSED` / `PRE_PROCESSED` |
+| `start_image_acquisition(params)` | 协议采集参数，如 LT、RT、LH、RH |
+| `abort_image_acquisition()` | 丢弃当前采集 |
+| `end_image_acquisition()` | 结束采集并冻结 |
+| `control_freeze(freeze)` | True 冻结，False 解冻 |
+| `save_and_send_image()` | 保存 / DICOM 发送，返回 `success` 与 `dicom_servers` |
+| `new_patient()` | 打开新患者界面 |
+| `set_b_gain(gain)` | 整数 0～999 |
+| `robot_start(bodypart)` | 向 Redis 7777 的旧 `robot_control` 发布请求；当前 RM75 主链路不消费此通道，返回成功不代表运动 |
 
-获取超声主机用于存储图像的硬盘剩余容量。
+## 错误与验证边界
 
--   **参数**: 无
--   **成功返回值**: 一个整数，表示剩余容量（单位：GB）。例如：`512`。
-
-### `set_scan_mode(mode: ScanMode)`
-
-设置扫描模式（基波或谐波）。
-
--   **参数**:
-    -   `mode` (`ScanMode`): 使用 `ScanMode.FUNDAMENTAL`（基波）或 `ScanMode.HARMONIC`（谐波）。
--   **成功返回值**: `True`
-
-### `get_patient_name()`
-
-获取当前扫描患者的姓名。
-
--   **参数**: 无
--   **成功返回值**: 一个字符串，表示患者姓名。如果不存在，则返回空字符串 `""`。例如：`"ZhangSan"`。
-
-### `get_patient_id()`
-
-获取当前扫描患者的ID。
-
--   **参数**: 无
--   **成功返回值**: 一个字符串，表示患者ID。如果不存在，则返回空字符串 `""`。例如：`"PID12345"`。
-
-### `get_patient_scan_time()`
-
-获取当前患者的扫描时间。
-
--   **参数**: 无
--   **成功返回值**: 一个 Python 的 `datetime` 对象。例如：`datetime.datetime(2025, 11, 6, 10, 30, 0)`。
-
-### `set_scan_depth(depth_cm: float)`
-
-设置B模式下的扫描深度。
-
--   **参数**:
-    -   `depth_cm` (`float`): 扫描深度，单位为厘米（cm）。例如：`3.5`。
--   **成功返回值**: `True`
-
-### `set_image_type(image_type: ImageType)`
-
-设置超声显示器显示的图像类型（处理前或处理后）。
-
--   **参数**:
-    -   `image_type` (`ImageType`): 使用 `ImageType.POST_PROCESSED` (后处理) 或 `ImageType.PRE_PROCESSED` (处理前)。
--   **成功返回值**: `True`
-
-### `start_image_acquisition(params: str)`
-
-命令超声主机开始采集图像。
-
--   **参数**:
-    -   `params` (`str`): 根据协议定义的参数，例如 `'LT'`, `'RT'`, `'LH'`, `'RH'`。
--   **成功返回值**: `True`
-
-### `abort_image_acquisition()`
-
-命令超声主机中止（丢弃）当前正在进行的图像采集。
-
--   **参数**: 无
--   **成功返回值**: `True`
-
-### `end_image_acquisition()`
-
-命令超声主机结束图像采集，此时图像将被冻结。
-
--   **参数**: 无
--   **成功返回值**: `True`
-
-### `control_freeze(freeze: bool)`
-
-控制图像的冻结或解冻。
-
--   **参数**:
-    -   `freeze` (`bool`): `True` 表示冻结，`False` 表示解冻。
--   **成功返回值**: `True`
-
-### `save_and_send_image()`
-
-命令超声主机保存当前图像并通过DICOM发送。
-
--   **参数**: 无
--   **成功返回值**: 一个字典，包含成功状态和配置的DICOM服务器数量。
-    ```python
-    {"success": True, "dicom_servers": 1}
-    ```
-
-### `new_patient()`
-
-命令超声主机跳转到新建患者界面。
-
--   **参数**: 无
--   **成功返回值**: `True`
-
-### `get_dicom_send_status(patient_id: str)`
-
-根据患者ID查询其关联图像的DICOM发送成功和失败的计数。
-
--   **参数**:
-    -   `patient_id` (`str`): 要查询的患者ID。
--   **成功返回值**: 一个包含查询结果的字典。
-    -   如果ID存在:
-        ```python
-        {
-            "exists": True,
-            "success_count": 15,
-            "fail_count": 2,
-            "id_returned": "PID12345"
-        }
-        ```
-    -   如果ID不存在:
-        ```python
-        {"exists": False, "success_count": 0, "fail_count": 0}
-        ```
-
-### `get_zoom_factor()`
-
-获取当前图像的放大倍数。
-
--   **参数**: 无
--   **成功返回值**: 一个浮点数，表示放大倍数。例如：`1.5`。
-
-### `set_b_gain(gain: int)`
-
-设置B模式的扫查增益值。
-
--   **参数**:
-    -   `gain` (`int`): 增益值，范围为 0 到 999。
--   **成功返回值**: `True`
+设备拒绝返回 `UltrasoundCommandError`，帧头 / 尾 / checksum 等失败返回 `UltrasoundProtocolError`，
+建连 / 握手失败返回 `UltrasoundConnectionError`；参数校验可抛 `ValueError`，收发仍可能抛原始 socket 异常。
+实际帧实现见 [protocol.py](sonoscape_client/protocol.py)。本说明核对源码，不代表本次已连接设备验收。

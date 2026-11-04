@@ -46,8 +46,9 @@ try:
  force=json.loads((ROOT/'infer/Robot/build/rm75_force_calibration.json').read_text())
  arm_camera=np.array(cal['T_armtip_camera']);base_camera=np.array(state['T_base_camera']);base_arm=base_camera@np.linalg.inv(arm_camera)
  mount=np.array(force['sensor_to_tool']['rotation_row_major']).reshape(3,3)
- tool_rotation=base_arm[:3,:3]@mount
- tcp=base_arm[:3,3]+base_arm[:3,:3]@mount@np.array(force['probe_tcp_sensor_m'])
+ probe=np.array(force.get('probe_to_sensor',{}).get('rotation_row_major',np.eye(3).ravel())).reshape(3,3)
+ tool_rotation=base_arm[:3,:3]@mount@probe
+ tcp=base_arm[:3,3]+base_arm[:3,:3]@mount@(np.array(force['probe_tcp_sensor_m'])-np.array(force['sensor_to_tool']['translation_sensor_to_tool_m']))
  normal=-tool_rotation[:,2];skin=tcp+np.array([.008 if (args.unlimited_excursion or args.unlimited_translation) else .001,0,0])-.05*normal
  seq=0;events=[];capture=0;history=[state];capture_state=state
  def envelope(target):

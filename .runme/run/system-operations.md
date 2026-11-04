@@ -51,7 +51,12 @@ python -c 'import pyvista' || { echo 'ContactPointShow 需要在 carotid 环境�
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python main.py
 ```
 
-## SensorMonitor
+## 独立工具：SensorMonitor
+
+以下单元只启动独立监控工具，不是项目启动的必要步骤。
+直接运行即可自动识别：有项目遥测时只读订阅 Redis，否则直连串口。
+选定来源后不切换，直连与 Robot 使用同一设备时互斥；清零只影响本地监控。
+采集与图片说明见[使用说明](../../docs/sensor_drift_recording.md)。
 
 ```bash {"name":"start-sensor-monitor","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
 source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh

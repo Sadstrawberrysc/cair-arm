@@ -60,11 +60,28 @@ Eigen::Matrix4d CalibratedFrameChain::CameraPoseBase(
 
 CalibratedFrameChain::CalibratedFrameChain(
     const ForceCalibration& calibration)
-    : rotation_arm_tip_from_tool_(calibration.rotation_tool_from_sensor),
+    : rotation_arm_tip_from_sensor_(calibration.rotation_tool_from_sensor),
+      rotation_sensor_from_probe_(calibration.rotation_sensor_from_probe),
+      rotation_arm_tip_from_tool_(rotation_arm_tip_from_sensor_ * rotation_sensor_from_probe_),
       translation_sensor_to_tool_m_(calibration.translation_sensor_to_tool_m),
       probe_tcp_sensor_m_(calibration.probe_tcp_sensor_m),
-      probe_tcp_tool_m_(probe_tcp_sensor_m_ - translation_sensor_to_tool_m_),
-      probe_tcp_arm_tip_m_(rotation_arm_tip_from_tool_ * probe_tcp_tool_m_) {}
+      probe_tcp_tool_m_(rotation_sensor_from_probe_.transpose()
+                        * (probe_tcp_sensor_m_ - translation_sensor_to_tool_m_)),
+      probe_tcp_arm_tip_m_(rotation_arm_tip_from_sensor_
+                          * (probe_tcp_sensor_m_ - translation_sensor_to_tool_m_)) {}
+
+Eigen::Matrix3d CalibratedFrameChain::RotationBaseFromSensor(
+    const Eigen::Matrix<double, 6, 1>& pose) const {
+    return RotationBaseFromArmTip(pose) * rotation_arm_tip_from_sensor_;
+}
+
+Eigen::Vector3d CalibratedFrameChain::SensorVectorInTool(const Eigen::Vector3d& vector) const {
+    return rotation_sensor_from_probe_.transpose() * vector;
+}
+
+Eigen::Vector3d CalibratedFrameChain::ContactPointRelativeTcpTool(const Eigen::Vector3d& point) const {
+    return SensorVectorInTool(point - probe_tcp_sensor_m_);
+}
 
 const Eigen::Matrix3d& CalibratedFrameChain::RotationArmTipFromTool()
     const noexcept {
