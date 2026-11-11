@@ -32,6 +32,37 @@ constexpr double kIkOrientationToleranceDeg = 0.1;
 constexpr double kArteryStandoffM = 0.050;
 constexpr int kMaximumIkIterations = 10000;
 
+// Necessary reach condition only: no IK, joint-limit or collision guarantee.
+// With spherical shoulder/wrist joints the wrist center must lie within the
+// sum of the two arm lengths, independent of the chosen redundant joint pose.
+bool CheckWristReachBound(const Eigen::Matrix<double, 6, 1>& armtip_pose) {
+    RMKinematics model;
+    const Eigen::Matrix<double, 7, 1> straight =
+        Eigen::Matrix<double, 7, 1>::Zero();
+    const auto links = model.GetLinkKinematics(straight);
+    const Eigen::Vector3d shoulder = links[0].block<3, 1>(0, 3);
+    const Eigen::Vector3d straight_wrist = links[5].block<3, 1>(0, 3);
+    const double maximum_radius = (straight_wrist - shoulder).norm();
+    const double wrist_to_armtip =
+        (links[6].block<3, 1>(0, 3) - straight_wrist).norm();
+    const Eigen::Vector3d wrist = armtip_pose.head<3>()
+        - wrist_to_armtip
+            * RotationBaseFromControllerEuler(armtip_pose.tail<3>()).col(2);
+    const double radius = (wrist - shoulder).norm();
+    std::cout << "target_wrist_radius_mm: " << radius * 1000.0 << '\n'
+              << "maximum_wrist_radius_mm: " << maximum_radius * 1000.0 << '\n';
+    // Allow 1 mm for feedback/command quantization and model rounding.
+    if (radius > maximum_radius + 0.001) {
+        std::cerr << "Target is geometrically unreachable: wrist center exceeds "
+                  << "the RM75 arm-length bound by "
+                  << (radius - maximum_radius) * 1000.0
+                  << " mm. MoveJ was not sent. Reduce standoff or change the "
+                     "robot/target placement; the target is not clipped.\n";
+        return false;
+    }
+    return true;
+}
+
 struct Options {
     std::string ip = "192.168.50.254";
     int port = 8080;
@@ -689,6 +720,11 @@ int main(int argc, char** argv) {
     std::cout << "tool_chain_verified: "
               << (calibration.tool_chain_verified ? "true" : "false") << "\n";
 
+    if (!preserve_startup_orientation
+        && !CheckWristReachBound(target_controller_armtip_pose)) {
+        return 4;
+    }
+
     if (options.inspect_transform_only) {
         if (preserve_startup_orientation) {
             std::cout << "target_orientation_available: false\n";
@@ -750,6 +786,7 @@ int main(int argc, char** argv) {
             ArmTipPoseForProbeTarget(target_probe_pose, frame_chain);
         PrintPose("target_probe_tcp", target_probe_pose);
         PrintPose("target_controller_armtip", target_controller_armtip_pose);
+        if (!CheckWristReachBound(target_controller_armtip_pose)) return 4;
     }
 
     Eigen::Matrix<double, 7, 1> target_joints;
@@ -892,7 +929,14 @@ int main(int argc, char** argv) {
     const double final_joint_error_deg =
         options.controller_movej_p ? 0.0
         : MaximumWrappedJointDeltaDeg(final_joints, target_joints);
+    PrintJoints("final_joints7", final_joints);
+    PrintPose("final_controller_armtip", final_pose);
+    PrintVector("final_controller_position_error_base_mm",
+                1000.0 * (final_pose.head<3>()
+                          - target_controller_armtip_pose.head<3>()));
     PrintVector("final_probe_tcp_base_m", final_probe_position);
+    PrintVector("final_probe_tcp_position_error_base_mm",
+                1000.0 * (final_probe_position - target_probe_pose.head<3>()));
     std::cout << "final_probe_tcp_position_error_mm: "
               << final_position_error_mm << "\n";
     std::cout << "final_probe_tcp_orientation_error_deg: "

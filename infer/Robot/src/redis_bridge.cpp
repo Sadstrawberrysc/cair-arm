@@ -530,6 +530,7 @@ std::string RedisBridge::BuildSensorV1Json(const RedisSensorMessage& message) {
     output["published_unix_ms"] = UnixNowMs();
     output["units"] = {{"force", "N"}, {"torque", "N*m"}, {"length", "m"}};
     output["valid"] = message.wrench_valid;
+    output["runtime_tare_applied"] = message.runtime_tare_applied;
     output["sensor"] = {
         {"checksum_valid", message.checksum_valid},
         {"checksum_available", message.checksum_available},
@@ -910,8 +911,8 @@ bool RedisBridge::ParseWristPacket(const std::string& payload, bool observation,
             const auto& q=j.at("quality");
             const double rms=q.at("plane_rms_m").get<double>();
             const double ratio=q.at("plane_inlier_ratio").get<double>();
-            if (!std::isfinite(rms) || rms<0 || rms>.002 || !std::isfinite(ratio) || ratio<.7 || ratio>1.
-                || q.at("surface_points").get<int>()<50 || q.at("feature_inliers").get<int>()<12)
+            if (!std::isfinite(rms) || rms<0 || !std::isfinite(ratio) || ratio<.5 || ratio>1.
+                || q.at("surface_points").get<int>()<10 || q.at("feature_inliers").get<int>()<6)
                 throw std::runtime_error("wrist quality rejected");
         } else {
             out.action=j.at("action").get<std::string>();

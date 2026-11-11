@@ -69,7 +69,7 @@ class HandoffTests(unittest.TestCase):
         np.testing.assert_allclose(seed["surface_point_base_m"],[.1,.2,1])
         self.assertEqual(calls[1][3],60)
         pose=np.fromstring(commands[1][commands[1].index("--target-pose-m-rad")+1],sep=",")
-        np.testing.assert_allclose(pose[:3],[.1,.2,.95])
+        np.testing.assert_allclose(pose[:3],[.1,.2,.9])
         # +X now follows the vessel: this fixture must send zero Euler angles
         # rather than the former pi yaw, and publish the same corrected frame.
         np.testing.assert_allclose(pose[3:], [0., 0., 0.], atol=1e-9)
@@ -113,7 +113,7 @@ class ShortAxisRotationTests(unittest.TestCase):
         self.assertAlmostEqual(np.linalg.det(rotation), 1.)
         surface = np.array([.2, -.3, .6])
         np.testing.assert_allclose(surface + launcher.INITIAL_TOOL_Z_OFFSET_M * rotation[:, 2],
-                                   surface - .05 * z, atol=1e-12)
+                                   surface - .10 * z, atol=1e-12)
 
     def test_controller_euler_preserves_corrected_oblique_frame(self):
         rotation = launcher.short_axis_rotation(np.array([1., 2., 3.]),

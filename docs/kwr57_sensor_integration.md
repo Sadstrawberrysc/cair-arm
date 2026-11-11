@@ -1,5 +1,13 @@
 # KWR57 RS422 接入
 
+2026-11-09 超声主控接入更新：默认 main_rm75 使用新标定执行补偿与力闭环，关闭默认
+provisional；按用户后续要求启用 3 秒启动悬空 tare，保留原有无接触预检、原始量程与反馈失效门。
+tare 仅在全部门通过后消除本次运行的固定偏置，不放宽稳定性门，也不回写标定 JSON。
+新源码配置为 `infer/Robot/config/force_calibration.kwr57.json`，仅为空构建目录初始化部署文件，
+不覆盖既有重新标定结果。`main_rm75 --check-force-calibration` 只读校验本地标定/探头文件，零设备连接。
+启动和运行 summary 记录实际标定文件 SHA-256，便于确认采用的补偿参数。
+本轮构建、离线检查及模拟补偿不代表真实力闭环运行或独立精度验收。
+
 核对日期：2026-10-30。协议依据用户提供的 KWR57 系列 RS422 手册第 6～8 页。
 用户已确认单次读取和 500 Hz 连续输出正常；下方软件验证记录不包含真实传感器或机械臂验收。
 
@@ -67,6 +75,11 @@ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python infer/SensorMonitor/m
 维护工具 `force_sensor_calibration_capture` 支持 `--sensor-protocol`，默认 KWR57/460800；
 采集 CSV 已包含 SI 单位，`force_sensor_calibrate` 直接拟合，不再次乘 9.80665。
 构建维护工具时配置 `-DBUILD_MAINTENANCE_TOOLS=ON`。
+
+自动静态标定入口为 `infer/Robot/tools/calibrate_force_static.py`，以当前关节为起点，
+末端 J5/J6/J7 多轴旋转完成 1000 个静态姿态，再调用既有拟合器写回项目配置。
+采集器 `--automatic` 会发送 MoveJ/Stop；`--plan-only` 只导出路径，不运动或打开传感器；
+省略这两个参数时保留原手动换姿态的只读采集。详见 [标定运行命令](../.runme/run/calibration_force.md)。
 
 旧 Haptron 驱动保留：主程序和采集工具支持 `--sensor-protocol haptron-modbus`，
 未显式给波特率时使用 115200；旧 AA55 流使用 `legacy-aa55`。

@@ -3,6 +3,10 @@
 本目录保存本机操作、进展与验证历史，Markdown 随 Git 维护。当前接口以
 [系统架构](../ARCHITECTURE.md)及模块架构为准；跨机器使用时调整设备、环境和绝对路径。
 
+2026-11-11 已按用户要求清理历史运行日志、录像和非标定采样，各类保留最近一轮；
+最新超声录像尚无收尾元数据，同时保留上一轮完整录像。当前标定、原始标定数据和模型权重保留。
+进展文档中的旧输出路径保留作历史出处，部分原始记录已删除。
+
 ## 操作手册
 
 | Notebook | 内容 |
@@ -10,15 +14,14 @@
 | [全系统入口](run/system-operations.md) | 常用入口与状态检查 |
 | [Robot](run/robot-operations.md) | 构建、Redis、超声闭环与停止 |
 | [全局相机](run/camera-rt-operations.md) | 相机快照到初始位姿 |
-| [腕部跟随](run/camera-wrist-operations.md) | 模型 / 手动模式、开始、暂停、诊断与离线检查 |
-| [模型最简启动](run/carotid-begin-operations.md) | 腕部 Redis → 相机 → Robot；保留原文件名 |
-| [相机标定](run/calibration-operations.md) | RealSense / Gemini 采集到求解 |
-| [末端替换](run/end-effector-replacement.md) | 装配测量、力标定与分阶段验收 |
+| [腕部跟随](run/camera-wrist-operations.md) | Redis、相机、机械臂最简启动 |
+| [相机标定](run/calibration_camera.md) | RealSense / Gemini 采集到求解 |
+| [力传感器标定](run/calibration_force.md) | 1000 姿态自动静态采集、拟合与部署 |
 | [RM75 学习路径](rm75_learning_path.md) | 源码、协议、控制和日志阅读顺序 |
 
 腕部日常启动使用独立终端，依次执行 `start-redis-7777` → `start-wrist-camera` →
-`start-wrist-robot`。模型模式在 Robot 就绪后自动选点并请求跟随；手动模式用
-`start-wrist-camera-manual` 替代相机单元。原 `Carotid_begin` 已并入 `Camera_wrist/detector/`。
+`start-wrist-robot`。模型模式在 Robot 就绪后自动选点并请求跟随。
+原 `Carotid_begin` 已并入 `Camera_wrist/detector/`。
 
 ## 独立工具与规划
 
@@ -33,7 +36,8 @@
 
 | Notebook | 内容 |
 | --- | --- |
-| [项目进展](Progress/project-progress.md) | 当前配置、验证状态与跨模块待办 |
+| [项目进展](Progress/project-progress.md) | 当前配置、待办、跨模块末端替换计划与验收记录 |
+| [力传感器进展](Progress/force-sensor-progress.md) | 力标定、启动预检及末端工具几何变更记录 |
 | [全局相机进展](Progress/camera-rt-progress.md) | 设备、定位、外参与历史证据 |
 | [腕部进展](Progress/camera-wrist-progress.md) | 跟随、启动诊断、时序与验证 |
 | [模型进展](Progress/carotid-begin-progress.md) | detector 及原 Carotid_begin 试验历史 |

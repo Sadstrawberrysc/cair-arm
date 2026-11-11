@@ -37,7 +37,7 @@ RobotRuntimeConfig MakeImplicitRm75ProductionConfig(
     config.tare_no_contact_s = 3;
     config.manual_phase = -1;
     config.manual_action = false;
-    config.allow_provisional_force_control = true;
+    config.allow_provisional_force_control = false;
     config.implicit_commissioning_profile = true;
     config.safety.maximum_no_contact_approach_distance_m = 0.250;
     config.safety.maximum_orientation_excursion_deg = 0.0;

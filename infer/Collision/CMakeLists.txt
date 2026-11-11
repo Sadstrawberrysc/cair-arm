@@ -46,7 +46,7 @@ if(BUILD_COLLISION_CHECKING)
     target_compile_options(collision_checking PRIVATE -Wall -Wextra -Wpedantic)
     add_executable(collision_check apps/collision_check.cpp)
     target_include_directories(collision_check PRIVATE ../Robot/include)
-    target_link_libraries(collision_check PRIVATE collision_checking fcl)
+    target_link_libraries(collision_check PRIVATE collision_checking fcl OpenSSL::Crypto)
     target_compile_options(collision_check PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 

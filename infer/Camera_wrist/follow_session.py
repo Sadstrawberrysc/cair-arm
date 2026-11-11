@@ -177,6 +177,7 @@ class ModelRecovery:
     """Keep operator follow intent across visual loss, with an acknowledged pause."""
     VISUAL_HOLDS = {'operator_pause', 'operator_paused', 'invalid wrist observation',
                     'wrist_pose_time_unmatched', 'wrist_observation_missing_stale_or_mismatched'}
+    TIMING_HOLDS = {'wrist_pose_time_unmatched', 'wrist_observation_missing_stale_or_mismatched'}
 
     def __init__(self):
         self.cancel()
@@ -203,7 +204,7 @@ class ModelRecovery:
                 and session.runtime == previous_runtime == self.runtime
                 and session.state is state and state['sequence'] > previous_sequence
                 and state.get('follow_state') == 'hold'
-                and state.get('follow_reason') == 'wrist_pose_time_unmatched'
+                and state.get('follow_reason') in self.TIMING_HOLDS
                 and str(state.get('control_state', '')).lower() != 'fault'
                 and state.get('target_id') == old_target
                 and state.get('request_producer_id') == session.producer

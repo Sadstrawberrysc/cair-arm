@@ -32,7 +32,7 @@
 | `render_mesh` | 平移后绕 Z 旋转 180°、渲染及选定血管顶点投影 | `cliff_demo.py`；渲染焦距来自图像尺寸估计 |
 | `kpt_2d_to_3d` | 按对齐深度与实际彩色内参反投影 | `cliff_demo.py`；与渲染使用的估计焦距分开 |
 | `tools` | 环境 / 资产预检、历史格式与像素排序离线测试 | [tools/README.md](tools/README.md) |
-| `data/`、`lib/` | 本机模型资产 / 旧 YOLOv3 实现 | `data/` 不进入 Git；`lib/` 不在当前活动链路 |
+| `data/` | 本机模型资产 | 不进入 Git |
 
 `get_one_box` 从 0.9 开始，以 0.1 递减分数阈值，选择该轮达标框中的最大面积框；
 不是固定阈值、唯一人体或目标身份跟踪。虽然用途是人体估计，当前检测输出中的类别标签
@@ -81,7 +81,7 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 | 采集快照 | `run_probe_target` 记录旧文件签名，运行相机，成功退出后要求新快照且读取期间未变 | [run_probe_target.py](../hand_eye_calibration-main/run_probe_target.py)；签名含 device / inode / size / mtime / ctime，mtime 不是曝光时间 |
 | 提取首点 / 方向 | 一行非零法向 + 至少两点；取首点与第一个间距 >1 μm 的后续点，单位化法向与切向 | 同上；所有行必须三列有限值；单位切向在切平面的投影范数 <0.001 时拒绝短轴姿态 |
 | 相机 → Base | `p_base=R×p_camera+t`；方向只乘 R | [transform_point.py](../hand_eye_calibration-main/transform_point.py) |
-| 构造短轴姿态 | Tool +Z 朝内，+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转 180°）；沿 Tool -Z 后退 50 mm | `run_probe_target`；50 mm 是计算偏置，不是实际净空 |
+| 构造短轴姿态 | Tool +Z 朝内，+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转 180°）；沿 Tool -Z 后退 100 mm | `run_probe_target`；100 mm 是计算偏置，不是实际净空 |
 | 单点调用 | 传 `--target-pose-m-rad --controller-movej-p` 给 `arm_probe_pose` | [Robot 维护工具](../Robot/tests/tools/arm_probe_pose.cpp)；默认编排可执行运动，非只读相机功能 |
 | 可选投影 seed | `--wrist-handoff` 起始先删除旧 seed；非 dry-run、定位子进程成功退出且两份外参摘要未变才写入 TTL 60 秒 seed | `scope=projection_preview_only`；不授权腕部自动运动；dry-run 也会删除旧 seed，但不发布新 seed |
 
@@ -91,7 +91,7 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 
 当前 `load_transform` 校验方向、米制、`user_confirmed` 和刚体矩阵，**不以独立残差验收作为代码门**；
 它与历史 Base 路径工具要求的 `accepted` 外参 / sidecar 是不同接口。
-`--dry-run` 只预览并不发送 MoveJ_P，也不做本地 IK / 可达性检查。
+`--dry-run` 只预览并不发送 MoveJ_P，仅检查目标腕心的几何臂展上界，不做完整 IK / 可达性检查。
 具体运动权限和后端差异见 [Robot 架构](../Robot/ARCHITECTURE.md#颈动脉单点维护流程)。
 
 ## 依赖、验证与规划

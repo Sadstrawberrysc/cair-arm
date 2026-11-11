@@ -24,6 +24,7 @@ inline const char* ModeName(ControllerMode mode) noexcept {
 struct RobotRuntimeConfig {
     ControllerMode mode = ControllerMode::kObserve;
     bool simulate = false;
+    bool check_force_calibration = false;
     bool wrist_no_force = false;
     bool wrist_candidate_trial = false;
     bool wrist_unlimited_excursion = false;
@@ -61,6 +62,8 @@ struct RobotRuntimeConfig {
     bool manual_action = false;
     bool manual_terminate = false;
     bool allow_provisional_force_control = false;
+    // Historical name: identifies the implicit production profile, including
+    // verified operation without the provisional commissioning override.
     bool implicit_commissioning_profile = false;
 
     // Wrist capture interpolation allows at most 50 ms between feedback samples.

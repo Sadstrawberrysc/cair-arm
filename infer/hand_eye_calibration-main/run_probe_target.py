@@ -15,7 +15,7 @@ from transform_point import DEFAULT_CALIBRATION, load_transform, transform_point
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "infer/Camera_wrist"))
 from wrist_projection import calibration, make_seed, SEED_KEY
-INITIAL_TOOL_Z_OFFSET_M = -0.050
+INITIAL_TOOL_Z_OFFSET_M = -0.100
 
 def signature(path):
     try:
@@ -104,7 +104,7 @@ def run(args, root=ROOT, runner=subprocess.run):
     if not tool.is_file():
         raise ValueError("缺少 Robot/build/rm75_force_calibration.json")
     previous = signature(snapshot)
-    print("模式：初始位姿预览，不检查控制器逆解或可达性" if args.dry_run else
+    print("模式：初始位姿预览，检查几何臂展上界，不验证完整控制器逆解或可达性" if args.dry_run else
           "模式：初始位姿 MoveJ_P，速度 {}；保存并退出数字人后自动执行。".format(args.velocity),
           flush=True)
     print("数字人窗口：按 s 保存本次采样点，按 q 退出后继续。", flush=True)
@@ -136,7 +136,7 @@ def run(args, root=ROOT, runner=subprocess.run):
     print("target_inward_normal_base:", normal, flush=True)
     print("target_tool_y_base:", rotation[:, 1].tolist(), flush=True)
     print("target_imaging_view: short_axis", flush=True)
-    print("Tool-YZ 为短轴成像平面；+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转180°），Tool +Z 朝内；目标 Tool -Z 后退50 mm；位置转换使用所选相机外参。", flush=True)
+    print("Tool-YZ 为短轴成像平面；+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转180°），Tool +Z 朝内；目标 Tool -Z 后退100 mm；位置转换使用所选相机外参。", flush=True)
     pose = ",".join("{:.9f}".format(v) for v in
                     np.concatenate((base_point, controller_euler(rotation))))
     print("target_probe_tcp_m_rad:", pose, flush=True)

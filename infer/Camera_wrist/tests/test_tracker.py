@@ -1,10 +1,11 @@
 import sys
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import cv2
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from local_tracker import DisplayPointSmoother, LocalTracker, surface
+from local_tracker import DisplayPointSmoother, LocalTracker, STANDARD, surface
 
 class TrackerTests(unittest.TestCase):
     def setUp(self):
@@ -51,6 +52,96 @@ class TrackerTests(unittest.TestCase):
         np.testing.assert_allclose(point,[0,0,.2],atol=1e-6)
         np.testing.assert_allclose(normal,[0,0,-1],atol=1e-6)
         self.assertGreaterEqual(q['surface_points'],50)
+        self.assertEqual(q['failed_checks'], [])
+        self.assertIsNone(q['plane_rms_limit_m'])
+        self.assertIsNone(q['target_plane_distance_limit_m'])
+        self.assertLess(q['target_plane_distance_m'], 1e-6)
+
+    def test_six_texture_features_are_accepted_but_five_rejected(self):
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        features = np.array([[[150+x*5, 115+y*5]]
+                             for y in range(2) for x in range(3)], np.float32)
+        for relaxed in (False, True):
+            tracker = LocalTracker(relaxed=relaxed)
+            with patch('local_tracker.cv2.goodFeaturesToTrack', return_value=features):
+                self.assertEqual(len(tracker._features(gray, [160, 120])), 6)
+            with patch('local_tracker.cv2.goodFeaturesToTrack', return_value=features[:5]):
+                with self.assertRaisesRegex(ValueError, 'fewer than 6 texture features'):
+                    tracker._features(gray, [160, 120])
+
+    def test_ten_surface_points_within_ten_mm_are_accepted(self):
+        # Ten points with enough two-dimensional support, including two-neighbor corners.
+        depth = np.zeros_like(self.depth)
+        depth[119:122, 158:162] = .2
+        depth[119, 158] = depth[121, 161] = 0
+        k = self.k.copy()
+        k[0, 0] = k[1, 1] = 60.
+        for relaxed in (False, True):
+            _, _, quality = surface(depth, [160, 120], k, self.d, relaxed=relaxed)
+            self.assertEqual(quality['surface_points'], 10)
+        depth[119, 159] = 0
+        with self.assertRaisesRegex(ValueError, 'too few surface points'):
+            surface(depth, [160, 120], k, self.d)
+
+    def test_surface_support_outside_ten_mm_is_excluded(self):
+        # All remaining pixels are valid, but the nearby support is absent.
+        depth = self.depth.copy()
+        yy, xx = np.indices(depth.shape)
+        depth[(xx-160)**2 + (yy-120)**2 <= 22**2] = 0
+        depth[119:122, 159:162] = .2
+        with self.assertRaisesRegex(ValueError, 'too few surface points'):
+            surface(depth, [160, 120], self.k, self.d)
+
+    def test_surface_residuals_are_diagnostic_even_above_previous_limits(self):
+        rng = np.random.default_rng(18)
+        noisy = self.depth + rng.normal(0, .0003, self.depth.shape)
+        for expected, offset, rms_reference in (
+                (['plane_rms'], 0, .00001),
+                (['target_plane_distance'], .0036, .002),
+                (['plane_rms', 'target_plane_distance'], .0036, .00001)):
+            with self.subTest(expected=expected):
+                depth = noisy.copy()
+                depth[117:124, 157:164] = .2 + offset
+                with patch.dict(STANDARD, rms=rms_reference):
+                    _, _, metrics = surface(depth, [160, 120], self.k, self.d)
+                self.assertEqual(metrics['reference_exceeded'], expected)
+                self.assertEqual(metrics['failed_checks'], [])
+                self.assertFalse(metrics['residual_gates_enabled'])
+                self.assertIsNone(metrics['plane_rms_limit_m'])
+                self.assertIsNone(metrics['target_plane_distance_limit_m'])
+                self.assertEqual(metrics['plane_rms_reference_m'], rms_reference)
+                self.assertEqual(metrics['target_plane_distance_reference_m'], .003)
+
+    def test_residual_exceedance_does_not_interrupt_initialization_or_tracking(self):
+        depth = self.depth.copy()
+        depth[117:124, 157:164] = .2036
+        tracker = LocalTracker()
+        initial = tracker.initialize(self.image, depth, [160, 120], self.k, self.d, 1)
+        self.assertTrue(initial['valid'], initial)
+        self.assertIn('target_plane_distance', initial['quality']['reference_exceeded'])
+        self.assertTrue(tracker.initialize(self.image, self.depth, [160, 120],
+                                           self.k, self.d, 1)['valid'])
+        result = tracker.update(self.image, depth, self.k, self.d, 33_000_001)
+        self.assertTrue(result['valid'], result)
+        self.assertIn('target_plane_distance', result['quality']['reference_exceeded'])
+        self.assertTrue(tracker.active)
+
+    def test_large_3d_jump_is_allowed_in_tracking_and_detection_correction(self):
+        for relaxed in (False, True):
+            tracker = LocalTracker(relaxed=relaxed)
+            self.assertTrue(tracker.initialize(self.image, self.depth, [160, 120],
+                                               self.k, self.d, 1)['valid'])
+            depth = np.full_like(self.depth, .225)
+            result = tracker.update(self.image, depth, self.k, self.d, 33_000_001)
+            self.assertTrue(result['valid'], result)
+            self.assertGreater(result['quality']['position_jump_m'], .02)
+            self.assertFalse(result['quality']['position_jump_gate_enabled'])
+            # A model correction must not reintroduce the removed jump gate.
+            result, reason = tracker.correct_from_detection(
+                [162, 120], self.depth, self.k, self.d, 33_000_001)
+            self.assertIsNone(reason)
+            self.assertTrue(result['valid'], result)
+            self.assertGreater(result['quality']['position_jump_m'], .02)
 
     def test_translation_tracks_selected_point_not_feature_mean(self):
         tracker=LocalTracker()
@@ -114,23 +205,24 @@ class TrackerTests(unittest.TestCase):
         tracker.initialize(self.image,self.depth,[160,120],self.k,self.d,1)
         self.assertFalse(tracker.update(self.image,self.depth,self.k,self.d,1)['valid'])
 
-    def test_relaxed_depth_step_keeps_invalid_depth_rejected(self):
+    def test_both_profiles_accept_six_mm_step_but_reject_invalid_depth(self):
         depth = self.depth.copy()
         depth[120, 161] = .206
         standard = LocalTracker().initialize(self.image, depth, [160, 120],
                                              self.k, self.d, 1)
         relaxed = LocalTracker(relaxed=True).initialize(self.image, depth, [160, 120],
                                                         self.k, self.d, 1)
-        self.assertFalse(standard['valid'])
+        self.assertTrue(standard['valid'], standard)
         self.assertTrue(relaxed['valid'], relaxed)
         depth[120, 160] = 0
         invalid = LocalTracker(relaxed=True).initialize(self.image, depth, [160, 120],
                                                         self.k, self.d, 1)
         self.assertFalse(invalid['valid'])
 
-    def test_depth_edge_rejected(self):
+    def test_depth_step_with_three_consistent_neighbors_is_accepted(self):
         self.depth[:,160:]=.25
-        with self.assertRaises(ValueError): surface(self.depth,[160,120],self.k,self.d)
+        point, _, _ = surface(self.depth,[160,120],self.k,self.d)
+        self.assertAlmostEqual(point[2], .25)
 
     def test_occlusion_latches(self):
         tracker=LocalTracker()

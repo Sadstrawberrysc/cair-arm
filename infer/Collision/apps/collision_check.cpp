@@ -2,14 +2,17 @@
 #include "unknown_space_json.hpp"
 #include <json.hpp>
 #include <fcl/config.h>
+#include <openssl/sha.h>
 
 #include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <sstream>
 
 namespace c = uspilot::collision;
 using Json = nlohmann::json;
@@ -65,7 +68,7 @@ double Milliseconds(Clock::time_point start) { return std::chrono::duration<doub
 
 int main(int argc, char** argv) {
     try {
-        std::filesystem::path urdf, request_path;
+        std::filesystem::path urdf, request_path, calibration_path;
         c::MeshDirectories directories;
         c::MeshLoadOptions mesh_options;
         for (int i = 1; i < argc; ++i) {
@@ -73,15 +76,17 @@ int main(int argc, char** argv) {
             if (arg == "--help") {
                 std::cout << "Offline FCL solid collision audit. No robot/network/device access.\n"
                     "collision_check --urdf FILE --request JSON [--mesh-dir DIR] [--drop-zero-area-triangles]\n"
+                    "  --calibration-path JSON  check remaining targets and return leg against the same scene\n"
                     "Exit 0: requested offline checks valid; 2: rejected; 1: invalid input/loading failure.\n"
                     "Scene timestamps and now_ns must share the caller's clock domain.\n";
                 return 0;
             }
             if (arg == "--drop-zero-area-triangles") { mesh_options.discard_zero_area_triangles = true; continue; }
-            if (arg != "--urdf" && arg != "--request" && arg != "--mesh-dir") throw std::invalid_argument("Unknown option: " + arg);
+            if (arg != "--urdf" && arg != "--request" && arg != "--mesh-dir" && arg != "--calibration-path") throw std::invalid_argument("Unknown option: " + arg);
             if (++i >= argc) throw std::invalid_argument("Missing option value");
             if (arg == "--urdf") { if (!urdf.empty()) throw std::invalid_argument("Repeated --urdf"); urdf = argv[i]; }
             else if (arg == "--request") { if (!request_path.empty()) throw std::invalid_argument("Repeated --request"); request_path = argv[i]; }
+            else if (arg == "--calibration-path") { if (!calibration_path.empty()) throw std::invalid_argument("Repeated --calibration-path"); calibration_path = argv[i]; }
             else if (!directories.emplace("package://rm_description/meshes/rm_75_arm/", std::filesystem::canonical(argv[i])).second)
                 throw std::invalid_argument("Repeated --mesh-dir");
         }
@@ -182,6 +187,56 @@ int main(int argc, char** argv) {
                 {"failure", s.Valid() || s.failure.model_id.empty() ? Json(nullptr) : State(s.failure)},
                 {"check_ms", Milliseconds(segment_start)}};
             valid = valid && s.Valid();
+        }
+        if (!calibration_path.empty()) {
+            if (std::filesystem::file_size(calibration_path) > 16 * 1024 * 1024)
+                throw std::invalid_argument("Calibration path exceeds 16 MiB");
+            std::ifstream input(calibration_path);
+            const std::string bytes((std::istreambuf_iterator<char>(input)), {});
+            const auto plan = Json::parse(bytes);
+            if (plan.at("schema_version") != 1 || plan.at("joint_unit") != "deg"
+                || !plan.at("points").is_array() || plan.at("points").size() > 8000)
+                throw std::invalid_argument("Invalid calibration path schema");
+            auto named = [&](const Json& values) {
+                if (!values.is_array() || values.size() != 7) throw std::invalid_argument("Expected 7 calibration joints");
+                c::JointPositions result;
+                for (int i = 0; i < 7; ++i) result["joint" + std::to_string(i + 1)] = Number(values[i]) * std::acos(-1.0) / 180.0;
+                return result;
+            };
+            const auto skip = plan.contains("preserved_prefix_count") ? Count(plan["preserved_prefix_count"]) : 0;
+            if (static_cast<std::size_t>(skip) > plan["points"].size()) throw std::invalid_argument("Invalid preserved prefix count");
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), digest);
+            std::ostringstream sha;
+            for (const auto value : digest) sha << std::hex << std::setw(2) << std::setfill('0') << unsigned(value);
+            Json audit = {{"path_sha256", sha.str()}, {"preserved_prefix_count", skip},
+                          {"valid", valid}, {"checked_segments", 0}, {"ready_for_execution", false}};
+            auto previous = q;
+            std::size_t checked = 0;
+            auto segment = [&](const c::JointPositions& goal, std::size_t index, const char* kind) {
+                if (!valid) return;
+                const auto result = checker.CheckSegment(previous, goal, scene, now, options);
+                ++checked;
+                valid = result.Valid();
+                if (!valid) audit["failure"] = {{"point_index", index}, {"kind", kind},
+                    {"status", c::CheckStatusName(result.status)}, {"detail", result.detail},
+                    {"failure_fraction", result.failure_fraction ? Json(*result.failure_fraction) : Json(nullptr)},
+                    {"state", result.failure.model_id.empty() ? Json(nullptr) : State(result.failure)}};
+                previous = goal;
+            };
+            for (std::size_t i = static_cast<std::size_t>(skip); i < plan["points"].size() && valid; ++i) {
+                const auto& point = plan["points"][i];
+                if (Count(point.at("index")) != i + 1)
+                    throw std::invalid_argument("Non-consecutive calibration point index");
+                if (point.value("via_center", false))
+                    segment(named(plan.at("center_joints_deg")), i + 1, "via_center");
+                segment(named(point.at("joints_deg")), i + 1, "sample");
+            }
+            if (plan.value("return_to_center", false) && valid)
+                segment(named(plan.at("center_joints_deg")), 0, "return_to_center");
+            audit["valid"] = valid;
+            audit["checked_segments"] = checked;
+            output["calibration_path"] = std::move(audit);
         }
         std::cout << output.dump(2) << '\n';
         return valid ? 0 : 2;

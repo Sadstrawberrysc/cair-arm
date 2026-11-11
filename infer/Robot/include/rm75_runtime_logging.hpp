@@ -222,6 +222,8 @@ struct RuntimeSummaryData {
     std::string configuration_profile;
 
     ForceCalibration calibration;
+    std::string calibration_path;
+    std::string calibration_sha256;
     std::string selected_probe_sha256;
     Eigen::Vector3d probe_tcp_arm_tip_m = Eigen::Vector3d::Zero();
     RuntimeControlSummary control;

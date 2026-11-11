@@ -9,7 +9,11 @@ import time
 import cv2
 import numpy as np
 from gemini_config import WIDTH, HEIGHT, configure_close_range, stream_profiles
-from local_tracker import LocalTracker
+from local_tracker import ImagePointTracker, LocalTracker
+from live_frames import LatestFrameReader
+from tracking_display import point_display
+from depth_diagnostics import failure_details
+from sdk_depth import SdkDepthProcessor
 from model_selection import (DEFAULT_DETECTOR_PYTHON, DetectionCenterFusion,
                              ModelSelector, fuse_model_observation, replay_selection,
                              observation_is_fresh)
@@ -124,6 +128,7 @@ def main():
     color_profile, depth_profile = stream_profiles(pipeline, ob)
     config.enable_stream(color_profile); config.enable_stream(depth_profile)
     intr, dist = color_profile.get_intrinsic(), color_profile.get_distortion()
+    depth_processor = SdkDepthProcessor(ob)
     if dist.model not in (ob.OBCameraDistortionModel.NONE, ob.OBCameraDistortionModel.BROWN_CONRADY,
                            ob.OBCameraDistortionModel.BROWN_CONRADY_K6):
         raise ValueError('unsupported distortion model')
@@ -132,6 +137,8 @@ def main():
     if dist.model == ob.OBCameraDistortionModel.NONE: d[:] = 0
     align = ob.AlignFilter(align_to_stream=ob.OBStreamType.COLOR_STREAM)
     tracker, session, clock = LocalTracker(), ClickSession(digest), CaptureClock()
+    visual = ImagePointTracker()
+    frame_reader = None
     selector = ModelSelector(args.detector_python, args.model_id, args.model_class,
                              model_confidence, 0,
                              inference_confidence=.4) if args.model_id else None
@@ -161,6 +168,9 @@ def main():
     last_model_confirmed_ns = None
     last_state_error = ""
     last_published_capture = {}
+    frame_timing = {}
+    last_timing_log_ns = 0
+    last_marker_state = None
     with args.log.open('x') as log:
         def record(item):
             log.write(json.dumps(item, allow_nan=False)+'\n'); log.flush()
@@ -176,11 +186,25 @@ def main():
                     startup.cancel()
                     record(dict(type='redis_error', reason=str(error)))
         def publish_observation(result):
-            if not session.runtime or not session.target:
-                return
+            nonlocal last_timing_log_ns
             capture = result.get('capture_monotonic_ns', 0)
+            now = time.monotonic_ns()
+            enabled = bool(session.runtime and session.target)
+            if frame_timing and now-last_timing_log_ns >= 1_000_000_000:
+                record(dict(type='frame_timing', **frame_timing,
+                            observation_enabled=enabled,
+                            publish_monotonic_ns=now if enabled else None,
+                            observation_capture_monotonic_ns=capture,
+                            capture_to_processing_ms=(now-frame_timing['capture_monotonic_ns'])/1e6
+                                if 'capture_monotonic_ns' in frame_timing else None,
+                            capture_to_publish_ms=(now-capture)/1e6 if enabled and capture else None))
+                last_timing_log_ns = now
+            if not enabled:
+                return
             if result.get('valid') and last_published_capture.get(session.target) == capture:
                 return
+            if result.get('valid') and not observation_is_fresh(result, time.monotonic_ns()):
+                result = dict(result, valid=False, reason='observation expired before publication')
             packet = session.envelope()
             packet.update(result)
             packet.setdefault('capture_monotonic_ns', 0)
@@ -189,6 +213,7 @@ def main():
                 last_published_capture.clear()
                 last_published_capture[session.target] = capture
         record(camera_settings)
+        record(depth_processor.configuration)
         diagnostics = TrackingDiagnostics(args.log, record)
         record(dict(type='configuration', mode='click_follow', serial=args.serial, calibration_sha256=digest,
                     intrinsic=k.tolist(), distortion=d.tolist(), sdk=str(ob.__version__), independent_validation=False,
@@ -198,13 +223,17 @@ def main():
                     model_confidence=model_confidence))
         try:
             pipeline.start(config); started = True; pipeline.enable_frame_sync()
+            frame_reader = LatestFrameReader(pipeline)
+            frame_reader.start()
             # Allow the first synchronized frames to arrive after SDK/USB startup.
             last_complete = time.monotonic()
             first_complete = False
             while True:
                 if subscriber is not None:
-                    try:
-                        for _ in range(100):
+                    # Reject a stale message without abandoning newer queued states.
+                    for _ in range(100):
+                        msg = None
+                        try:
                             msg = subscriber.get_message(timeout=0)
                             if msg is None: break
                             if msg['type'] != 'message': continue
@@ -220,30 +249,54 @@ def main():
                                 selection_requested = selection_pending = model_catching_up = False
                                 next_recovery_at = time.monotonic()+.75
                                 record(dict(type='model_recovery_wait',
-                                            reason='wrist_pose_time_unmatched', source='robot'))
+                                            reason=session.state.get('follow_reason'), source='robot'))
                                 user_notice = 'Robot timing Hold; waiting for pause acknowledgement and new model center'
-                            if changed:
+                            if changed and session.runtime != previous_runtime:
                                 tracker.lose('Robot held/restarted: '+str(session.state.get('follow_reason') or 'session changed')+'; select again', force=True)
-                    except Exception as error:
-                        if session.following:
-                            tracker.lose('Robot state rejected/disconnected')
-                            session.following = False
-                            session.target = ''
-                        recovery.cancel()
-                        model_start.cancel()
-                        if startup.runtime:
-                            startup.cancel()
-                        last_state_error = str(error)
-                        record(dict(type='state_rejected', reason=last_state_error))
+                                visual.lose('Robot session changed', force=True)
+                        except Exception as error:
+                            if session.following:
+                                session.following = False
+                                session.target = ''
+                            recovery.cancel()
+                            model_start.cancel()
+                            if startup.runtime:
+                                startup.cancel()
+                            last_state_error = str(error)
+                            record(dict(type='state_rejected', reason=last_state_error))
+                            if msg is None:
+                                break
                 if session.following and (session.state is None or time.monotonic_ns()-session.state['timestamp_monotonic_ns'] > 200_000_000):
-                    tracker.lose('Robot state timeout'); session.following = False; session.target = ''
+                    session.following = False; session.target = ''
+                    recovery.cancel(); model_start.cancel(); startup.cancel()
                 recovery.check_state(session, time.monotonic_ns())
-                color, depth, missing = aligned_rgbd(pipeline.wait_for_frames(100), align)
+                raw_frames, received_ns, dropped_frames = frame_reader.take()
+                dequeued_ns = time.monotonic_ns()
+                color, depth, missing = aligned_rgbd(raw_frames, align)
+                aligned_ns = time.monotonic_ns()
+                frame_timing = dict(received_monotonic_ns=received_ns,
+                                    dequeued_monotonic_ns=dequeued_ns,
+                                    dropped_frames_total=dropped_frames,
+                                    receive_to_dequeue_ms=(dequeued_ns-received_ns)/1e6 if received_ns else None,
+                                    alignment_ms=(aligned_ns-dequeued_ns)/1e6)
                 frame = None
+                processed_depth = None
+                visual_frame = None
                 result = dict(valid=False, reason=missing or tracker.reason)
                 image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
                 if missing:
                     tracker.lose(missing)
+                    # A missing depth frame does not invalidate current color-only flow.
+                    raw_color = raw_frames.get_color_frame() if raw_frames is not None else None
+                    if raw_color is not None:
+                        try:
+                            image = color_bgr(raw_color, ob)
+                            timestamp = clock.convert(raw_color.get_global_timestamp_us())
+                            frame_timing['capture_monotonic_ns'] = timestamp
+                            visual_frame = (image.copy(), timestamp)
+                            frame_timing['capture_to_receive_ms'] = (received_ns-timestamp)/1e6
+                        except ValueError:
+                            visual_frame = None
                     startup_limit = 10 if not first_complete else 5
                     if time.monotonic()-last_complete > startup_limit:
                         message = 'no complete RGB-D for %d seconds: %s' % (startup_limit, missing)
@@ -254,20 +307,34 @@ def main():
                     first_complete = True
                     last_complete = time.monotonic()
                     image = color_bgr(color, ob)
+                    decoded_ns = time.monotonic_ns()
+                    tracking_started_ns = decoded_ns
+                    frame_timing['decode_ms'] = (decoded_ns-aligned_ns)/1e6
                     try:
                         timestamp = clock.convert(color.get_global_timestamp_us())
+                        frame_timing['capture_monotonic_ns'] = timestamp
+                        frame_timing['capture_to_receive_ms'] = (received_ns-timestamp)/1e6
                         if abs(color.get_global_timestamp_us()-depth.get_global_timestamp_us()) > 20_000:
                             raise ValueError('RGB-depth capture skew')
-                        z = np.frombuffer(depth.get_data(), np.uint16).reshape(depth.get_height(), depth.get_width()).astype(float)*depth.get_depth_scale()/1000
+                        visual_frame = (image.copy(), timestamp)
+                        processed_depth = depth_processor.process(depth)
+                        frame_timing.update(processed_depth.stats)
+                        z = processed_depth.filtered_m
                         if z.shape != image.shape[:2]: raise ValueError('alignment shape mismatch')
                         frame = (image.copy(), z, timestamp)
+                        visual_frame = (frame[0], timestamp)
+                        tracking_started_ns = time.monotonic_ns()
                         result = tracker.update(image, z, k, d, timestamp)
                         if model_catching_up:
                             if not result.get('valid') or time.monotonic_ns()-model_catchup_started > 2_000_000_000:
+                                tracking_reason = result.get('reason')
+                                depth_details = ({'depth_neighborhood': result['depth_neighborhood']}
+                                                 if 'depth_neighborhood' in result else {})
                                 model_catching_up = False
                                 tracker.lose('model catch-up failed or timed out', force=True)
-                                result = dict(valid=False, reason='model catch-up failed or timed out')
-                                record(dict(type='model_selection_rejected', reason=result['reason']))
+                                result = dict(valid=False, reason='model catch-up failed or timed out', **depth_details)
+                                record(dict(type='model_selection_rejected', reason=result['reason'],
+                                            tracking_reason=tracking_reason, **depth_details))
                             elif observation_is_fresh(result, time.monotonic_ns()):
                                 session.select()
                                 last_model_confirmed_ns = time.monotonic_ns()
@@ -316,9 +383,10 @@ def main():
                                     except (ValueError, TypeError, KeyError) as error:
                                         model_catching_up = False
                                         tracker.lose(error, force=True)
-                                        result = dict(valid=False, reason=str(error))
+                                        result = dict(valid=False, reason=str(error), **failure_details(error))
                                         user_notice = str(error)
-                                        record(dict(type='model_selection_rejected', reason=str(error)))
+                                        record(dict(type='model_selection_rejected', reason=str(error),
+                                                    **failure_details(error)))
                                         if recovery.waiting:
                                             next_recovery_at = time.monotonic()+.75
                                 else:
@@ -391,6 +459,18 @@ def main():
                             result = dict(valid=False, reason='tracking computation exceeded observation age')
                     except ValueError as error:
                         tracker.lose(error); result = dict(valid=False, reason=str(error))
+                    frame_timing['tracking_and_model_ms'] = (time.monotonic_ns()-tracking_started_ns)/1e6
+                visual_started_ns = time.monotonic_ns()
+                if visual_frame is not None:
+                    # The independent 2D copy survives RGB-D rejection and Robot Hold.
+                    adopted = visual.adopt(tracker, result)
+                    if not adopted or visual.timestamp != visual_frame[1]:
+                        visual.update(visual_frame[0], visual_frame[1])
+                else:
+                    visual.lose(missing or result.get('reason', 'no current image'), force=True)
+                frame_timing['display_flow_ms'] = (time.monotonic_ns()-visual_started_ns)/1e6
+                if processed_depth is not None:
+                    result = processed_depth.annotate(result, timestamp, tracker.limits['depth_jump'])
                 if fusion is not None:
                     if not tracker.active or not session.target:
                         fusion.reset()
@@ -433,14 +513,23 @@ def main():
                     status = 'boxes: %d' % len(latest_detection.get('detections', [])) if shown else 'boxes: waiting'
                     cv2.putText(image, status, (10, 175), 0, .45, (0, 165, 255), 1)
                 if result.get('valid'):
-                    display_pixel, display_position = result['pixel'], result['point_camera_m']
-                    cv2.circle(image, tuple(np.floor(display_pixel).astype(int)), 6, (0,255,0), 2)
+                    display_position = result['point_camera_m']
                     cv2.putText(image, 'p(m): '+str(np.round(display_position,3)), (10,75), 0,.5,(0,255,255),1)
                     cv2.putText(image, 'n: '+str(np.round(result['normal_out_camera'],3)), (10,100),0,.5,(0,255,255),1)
                     quality = result['quality']
                     cv2.putText(image, 'features: %d | plane RMS: %.2f mm | points: %d' % (
                         quality['feature_inliers'], quality['plane_rms_m']*1000, quality['surface_points']),
                         (10,125),0,.45,(0,255,255),1)
+                marker = point_display(visual.result_2d(), result, session, time.monotonic_ns())
+                marker_state = marker['state'] if marker is not None else 'hidden'
+                if marker_state != last_marker_state:
+                    record(dict(type='tracking_display', state=marker_state,
+                                reason=result.get('reason') if marker is not None else visual.reason))
+                    last_marker_state = marker_state
+                if marker is not None:
+                    pixel = tuple(np.floor(marker['pixel']).astype(int))
+                    cv2.circle(image, pixel, 6, marker['color'], 2)
+                    cv2.putText(image, marker['state'], (10, 200), 0, .45, marker['color'], 1)
                 if session.state is None:
                     robot_text = 'offline: ' + (last_state_error or 'waiting for Robot state')
                 elif time.monotonic_ns()-session.state['timestamp_monotonic_ns'] > 200_000_000:
@@ -484,6 +573,7 @@ def main():
                         user_notice = 'model selection queued for next fresh frame'
                 if clicked:
                     pixel = clicked[-1]; clicked.clear()
+                    visual.lose('new operator selection', force=True)
                     try:
                         if frame is None: raise ValueError('no valid fresh RGB-D frame')
                         session.select()
@@ -522,6 +612,8 @@ def main():
         finally:
             if session.runtime and session.following:
                 publish(COMMAND,session.request('end',False))
+            if frame_reader is not None:
+                frame_reader.stop()
             if started: pipeline.stop()
             if subscriber is not None: subscriber.close()
             if client is not None: client.close()

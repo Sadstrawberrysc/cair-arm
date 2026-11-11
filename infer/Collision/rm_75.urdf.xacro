@@ -584,11 +584,11 @@
        Geometry only: no invented mass/inertia, no TCP or camera optical calibration. -->
   <!-- Override these mounting parameters for preview after physical measurement. -->
   <xacro:arg name="camera_mount_xyz" default="0 0 0" />
-  <!-- Direction corrected by user: camera -60 deg, Lprobe -30 deg about Link7 +Z. -->
-  <xacro:arg name="camera_mount_rpy" default="0 0 -1.0471975511965976" />
+  <!-- 2026-11-09: camera front/back corrected +180 deg about Link7 Z: -60 -> +120 deg; Lprobe unchanged. -->
+  <xacro:arg name="camera_mount_rpy" default="0 0 2.0943951023931953" />
   <xacro:arg name="connector_mount_xyz" default="0 0 0.010" />
   <!-- Compensate camera yaw to retain connector and sensor orientation. -->
-  <xacro:arg name="connector_mount_rpy" default="0 0 1.0471975511965976" />
+  <xacro:arg name="connector_mount_rpy" default="0 0 -2.0943951023931953" />
   <xacro:arg name="force_sensor_mount_xyz" default="0 0 0.010" />
   <xacro:arg name="force_sensor_mount_rpy" default="0 0 0" />
   <xacro:arg name="Lprobe_mount_xyz" default="0 0 0.030" />

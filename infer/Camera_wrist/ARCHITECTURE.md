@@ -35,7 +35,7 @@ Orbbec Gemini 305 提供腕部同步 RGB-D，
 同一时刻只有一个模型请求在途。默认模型 ID 由 [detector/config.py](detector/config.py)
 的 `DEFAULT_MODEL_ID` 统一定义；`CAROTID_MODEL_ID` 环境变量覆盖默认值，显式
 `--model-id` 优先级最高。模型服务职责与协议见 [detector 架构](detector/ARCHITECTURE.md)。
-标定采集与求解见本机 [标定操作 notebook](../../.runme/run/calibration-operations.md)。
+标定采集与求解见本机 [标定操作 notebook](../../.runme/run/calibration_camera.md)。
 [腕部外参](gemini305_to_rm75_armtip.json) 定义 Camera→ArmTip 变换；标定与验收状态见本机
 [Camera_wrist 进展 notebook](../../.runme/Progress/camera-wrist-progress.md)。环境与操作见本机
 [Camera_wrist 操作 notebook](../../.runme/run/camera-wrist-operations.md)。
@@ -67,7 +67,7 @@ Robot 主动 `wrist_pose_time_unmatched` Hold 也可恢复：
 新的暂停请求，收到回执后重选，确认新目标后请求 resume。时间匹配仍失败
 则保持 Hold 并再次走完整流程，其他主动 Hold 不自动进入该路径。
 显示点与 Redis 观测均使用融合结果。操作命令见
-[模型模式最简启动](../../.runme/run/carotid-begin-operations.md)和
+[模型模式最简启动](../../.runme/run/camera-wrist-operations.md)和
 [进展记录](../../.runme/Progress/carotid-begin-progress.md)。
 
 | 操作 / 检查 | 当前模型模式行为 |
@@ -75,9 +75,26 @@ Robot 主动 `wrist_pose_time_unmatched` Hold 也可恢复：
 | `b` | 需要新鲜 Robot Hold、无 Fault、未跟随；清除旧点，完成新选点和目标回传后首次 begin，有开始历史则 resume；重复不排队 |
 | `d` | 取消待启动；接受新的只选点操作时取消恢复意图；跟随期间不能直接换目标 |
 | `r` | 对已经选好的有效新鲜目标 resume，需要已有开始历史，不执行新的模型选点 |
-| `p/q` | pause / end，取消待启动和恢复，清除目标 / 跟踪；q 退出相机 |
+| `p/q` | pause / end，取消待启动和恢复，清除控制目标 / RGB-D 跟踪；p 后仍可显示黄色二维点，q 退出相机 |
 | 目标回传 | 只确认观测身份进入 Robot 状态，不能视作规划或实体运动成功 |
 | 模型确认 | 校正成功或 already aligned 才刷新；失败保留光流，超过 1 秒无确认则丢失 |
+
+显示使用独立的 `ImagePointTracker`，与 Robot 的 RGB-D 观测分开：
+绿色仅表示新鲜三维观测、同帧二维跟踪及匹配的 Robot following 回执同时有效；
+黄色表示二维光流仍有效，但深度校验失败、观测过期或 Robot 已 Hold / 暂停。
+二维显示结果只有 `image_valid`、像素和采集时间，不包含 `valid=true` 或三维目标，
+不能用于 begin / resume 或 Robot 观测。二维光流失败、图像缺失或采集年龄超过 200 ms 时隐藏。
+同一 Robot 会话的 Hold 不再直接清空视觉跟踪；机器人重启仍清空跟踪。
+
+Robot 的 `wrist_pose_time_unmatched` 和 `wrist_observation_missing_stale_or_mismatched`
+均可进入模型恢复，但必须属于原会话、原目标、本进程已确认的跟随请求且无 Fault。
+恢复继续要求新的暂停回执、新 target_id、新鲜三维观测和目标回传；二维点不能恢复运动。
+
+采集由 `live_frames.py` 的单线程持续读取 SDK，槽位只保留最新帧；主循环处理最新帧并统计覆盖数，
+不改变 SDK 采集时间，不使用取帧时间代替采集时间。正常处理与 SDK 校时检查仍保留 200 ms 门。
+JSONL 的 `frame_timing` 每秒记录一次：采集到接收、接收到取帧、对齐、解码、
+追踪 / 模型、二维显示计算耗时、采集到处理及采集到发布前的年龄（ms），以及累计丢弃旧帧数。
+无控制目标时仍记录处理耗时，发布字段为 null。`tracking_display` 记录绿 / 黄 / 隐藏状态的切换。
 
 默认模型出框阈值和选点阈值均为 0.4，可用 `--model-confidence` 修改选点阈值。
 融合最多保存 60 帧历史，按源时间精确匹配；模型 / 光流距离本身没有 15 px 拒绝门，
@@ -120,7 +137,29 @@ Robot 主动 `wrist_pose_time_unmatched` Hold 也可恢复：
 
 启动配置集中在 [gemini_config.py](gemini_config.py)，两个相机入口共用。
 预设、视差读回不符或视频流组合不支持时退出，不自动降低帧率。
-约 80 mm 是预期相机工作距离；源码未提供最小测距或精度验收保证，也不是机器人 TCP 目标距离。
+预期相机到颈部距离约 300 mm，采用 Close Range Default（兼容 Close-Range）、
+128 视差、RGB MJPG / 深度 Y16，均为 640×480 @ 30 FPS。
+2026-11-10 16:38 现场连接为 USB 2 / 480 Mbps，此次双路枚举最高为 30 FPS；
+固定请求该档位，不自动回退。若要恢复 60 FPS，需先恢复 USB 3 并重新核查实际支持的档位。
+切换分辨率后从所选彩色流读取内参 / 畸变，深度继续对齐到该彩色流；不复用旧分辨率像素坐标。
+保留本机已使用的 Default 预设和 128 视差模式。工作距离不是机器人 TCP 目标距离，
+源码未增加绝对深度裁剪，也未提供该配置在皮肤表面的精度或处理延迟验收保证。
+
+腕部跟随入口在 RGB-D 对齐后使用 [sdk_depth.py](sdk_depth.py)：
+`SpatialAdvancedFilter` → `HoleFillingFilter`，不启用时域滤波。
+空间滤波固定 magnitude=1、alpha=0.5、radius=1，保留 SDK 默认 disp_diff（本机读回为 160）；
+补洞采用 FURTHEST 模式。按用户最新要求不限制空洞面积，小孔和大块缺失均交给 SDK 处理，
+SDK 输出仍为 0 时继续按无效深度处理，不填入旧帧值，不改动原采集时间。
+滤波器在打开指定设备后通过 `FilterFactory.create_filter` 创建；本机 SDK 在未激活滤波库时
+直接调用专用构造器可能原生崩溃，public factory 会返回可诊断错误。
+每个阶段核对尺寸、格式、深度尺度和 global 采集时间不变，异常不绕过滤波继续发布。
+
+`depth_filter_configuration` 记录完整配置；`frame_timing` 增加空间 / 补洞耗时、
+原始与处理后无效像素数、补齐像素数。追踪和模型重放使用处理后深度。
+同帧结果的 `depth_processing` 记录 raw / filtered 目标深度和 depth_source，
+原始目标无效且处理后有效时标记 `sdk_filled`；原始为空洞或当前观测失败时再保存原始 / 处理后的四邻接诊断。
+这些值表示 SDK 估计，不能当作原始直接测量。原始深度在调用 SDK 前复制，未覆盖设备帧或校准文件。
+相机当前帧与异步模型结果时间不一致时，不附加错误帧的原始对照；本次不修改只读投影入口。
 
 点击位置先检查深度和纹理；跟踪采用 Shi–Tomasi 特征、金字塔 LK 前后向检查、
 RANSAC 局部仿射，使用仿射更新原目标像素，不以特征均值替换目标。
@@ -128,14 +167,34 @@ RANSAC 局部仿射，使用仿射更新原目标像素，不以特征均值替�
 
 | 检查 | 当前门限 |
 | --- | --- |
-| 纹理区域 | 最多 80×80 像素；到图像边缘时裁切，仍需至少 12 个特征 |
-| 光流一致特征 | 至少 12 个；前后向误差 ≤1 px |
+| 纹理区域 | 最多 80×80 像素；到图像边缘时裁切，仍需至少 6 个特征 |
+| 光流一致特征 | 至少 6 个；前后向误差 ≤1 px |
 | 仿射内点比例 | ≥0.6；轴向尺度 0.9～1.1，行列式 0.81～1.21；RANSAC 重投影门限 1 px |
-| 像素 / 三维跳变 | ≤15 px/帧；≤10 mm/帧 |
-| 深度连续性 | 与邻接有效深度差 <5 mm |
-| 法向点云 | 15 mm 邻域，至少 50 点；平面内点带宽 3 mm，比例 ≥0.7 |
-| 平面误差 / 退化 | RMS ≤2 mm；目标到平面 ≤3 mm；第二主轴散布 ≥2 mm |
+| 像素 / 三维跳变 | 像素 ≤15 px/帧；三维帧间位移仅记录，不拒绝 |
+| 深度连续性 | 目标深度有效；四邻接至少 2 个有效且与目标深度差 <30 mm |
+| 法向点云 | 半径 10 mm 邻域，至少 10 点；平面内点带宽 3 mm，比例 ≥0.5（标准 / 宽松一致） |
+| 平面误差 / 退化 | RMS、目标到平面距离仅记录，不拒绝；第二主轴散布 ≥2 mm |
 | 帧间采集时间 | 递增且间隔 ≤200 ms |
+
+平面 RMS、目标到平面的距离和三维帧间位移均保留为诊断量，不再作为拒绝条件。
+`quality` 记录 `plane_rms_m`、`target_plane_distance_m`，原有两个 `*_limit_m` 为 null，
+`residual_gates_enabled=false`、`failed_checks=[]`；原 2 mm / 3 mm 参考值放在
+`plane_rms_reference_m`、`target_plane_distance_reference_m`，超出项放在 `reference_exceeded`。
+跟踪更新与模型校正均记录 `position_jump_m`、`position_jump_gate_enabled=false` 和历史参考位移。
+这些参考值仅帮助分析日志，不影响观测 valid。深度有效性 / 连续性、表面点数、
+RANSAC 平面内点与退化检查、二维光流及时间有效性仍保留；Robot 不再以 RMS 上限拒绝观测。
+
+目标处理后深度无效或连续性检查失败时，结果与失败证据记录 `depth_neighborhood`（当前实际用于追踪的深度）：
+目标浮点像素、实际 floor 后像素、对应 SDK 采集时间、目标及上下左右四邻接的深度（m），
+各邻点相对目标的带符号差 / 绝对差、深度差门限（标准 / 宽松均为 30 mm）及通过状态。
+`valid_neighbor_count` 记录有效邻点数，`continuous_neighbor_count` 记录同时通过深度差检查的邻点数，
+`minimum_continuous_neighbors=2`。`neighbor_issues` 列出无效 / 深度差超限的方向，
+只有目标无效或通过邻点不足 2 个时才产生 `failure_causes`：`target_invalid_depth` 或
+`insufficient_continuous_neighbors` 及对应方向问题。图像边界单独用 `target_on_image_border` 标记，
+不直接拒绝；越界邻点不计数，平面支撑点筛选使用相同的至少 2 邻点规则，不使用数组循环回绕。
+无效值区分 zero / negative / nonfinite / out_of_bounds；非有限及越界深度写 null，保留类型，
+不填补深度或替换判定值。追踪失败 JSONL、`failure_diagnostics` / `details.json` 和模型选点拒绝事件均保留该结构；
+模型追帧失败另记录原始 tracking_reason。旧日志仅含 RGB 证据图，不能反推出未保存的原始深度。
 
 P0 只需落在原图内，不要求距四边 40 px。靠边时纹理区域裁切，
 光流使用较浅金字塔并保留原有前后向、仿射和跳变门限；
@@ -235,7 +294,10 @@ pause/end 可为空目标，其余请求不可为空。
 ```
 
 点必须有限且 z>0；法向单位化并朝相机，normal·point<0。
-Robot 质量检查为 feature_inliers>=12、surface_points>=50、plane_rms_m<=0.002、plane_inlier_ratio>=0.7。
+Robot 质量检查为 feature_inliers>=6、surface_points>=10、plane_inlier_ratio>=0.5；plane_rms_m 仅要求有限且非负，不设残差上限。
+相机侧特征及表面点门限为 6 / 10，宽松模式也使用 6 / 10 及 10 mm 半径；
+绿点表示新鲜三维观测及匹配 Robot 跟随回执同时有效；只有二维追踪或 Robot 暂停时为黄点。
+Robot 仍独立检查质量、时序与状态后决定是否接受观测和执行跟随，颜色不是物理运动验收。
 valid=false 带 reason，停止使用坐标并锁存 Hold。
 
 命令附加 action=begin/resume/pause/end/heartbeat。跟随或恢复等待中约每 100 ms 发心跳，500 ms 超时 Hold。

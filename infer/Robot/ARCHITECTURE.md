@@ -2,7 +2,7 @@
 
 本文说明当前入口、线程边界、数据协议与停止路径；运行与验证历史见[项目进展](../../.runme/Progress/project-progress.md)。
 Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估计、Redis 视觉意图、控制律、规划和日志；
-唯一生产可执行文件为 `main_rm75`。历史六轴源码不在当前 CMake 构建链中。
+唯一生产可执行文件为 `main_rm75`。离线测试位于 `tests/offline/`，维护工具位于 `tests/tools/`。
 
 ## 运行模式与实现边界
 
@@ -15,7 +15,7 @@ Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估
 | 显式 `--observe` | 采集真实反馈、补偿 / 接触估计、发布和记录；不生成执行运动 | 仍连接所配置设备，除非使用模拟 |
 | `--dry-run-control` | 真实反馈下运行控制与规划，记录目标；不发送 ServoJ | 规划有效不代表实体运动验证完成 |
 | `--simulate` | 模拟反馈；设置 DryRun 并关闭 Redis | 后置 `--redis-enabled` 可重新启用真实 Redis，参数按顺序解析 |
-| 无参数生产 profile | Execute、Redis 闭环、连续运行；接收有效新鲜命令后按 `action_state` 控制 | 视觉端首发 idle 是生产端约定，Robot 无独立“先 idle 后 moving”强制门；包含 provisional 力控配置 |
+| 无参数生产 profile | Execute、Redis 闭环、连续运行；接收有效新鲜命令后按 `action_state` 控制 | 使用通过质量检查的新 KWR57 标定及 3 秒启动 tare；不默认启用 provisional |
 | 腕部 `--wrist-follow FILE` | 相机观测转换、50 mm 悬停、目标 / 请求回执、专用参考与 planner | Execute 需对应执行 / 确认参数；候选试验允许未独立验收外参 |
 | 腕部投影预览 | Observe、全局与腕部外参、seed 与相机位姿发布 | `projection_preview_only`，不进行腕部跟随 |
 | 离线 parser / 控制 / 规划 / schema 检查 | 已实现，见 [构建与验证](#构建与验证) | 不能代替力准确度、动态定位、实体净空与停止验收 |
@@ -24,8 +24,14 @@ Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估
 无参数 profile 当前固定 RM75 `192.168.50.254:8080`、KWR57 RS422 串口
 `/dev/ttyUSB0`（460800 baud）、本机 Redis `127.0.0.1:7777`；标定文件从可执行文件目录
 读取 `rm75_force_calibration.json`，标定身份为用户赋予的 `KWR57`（不是设备读回的序列号），
-Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。新标定文件尚需实际采集生成，不复用旧传感器标定。
-控制周期 10 ms、执行预热 2 s、无接触 tare 3 s、duration=0。
+Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。2026-11-09 已接入本次稳健拟合的新标定，
+源码配置为 `config/force_calibration.kwr57.json`；首次配置空 build 时复制到默认部署位置，已有部署文件不覆盖。
+控制周期 10 ms、启动悬空 tare 3 s（涵盖无接触预检）、duration=0。
+正式标定模式在 tare 前检查最大合力/合力矩 4 N / 0.1 N·m（按用户要求调整）、
+最大偏离窗口均值 1 N / 0.02 N·m（力门按用户要求调整）及原静止/健康门；通过后仅扣除本次运行的固定偏置。
+新标定在 641 条已有数据中保留 254 点，剔除比例 60.4%，保留点残差不是独立实机精度验收。
+启动前校验传感器身份、残差状态、R/t/TCP 与探头摘要；记录标定路径、SHA-256、时间和拟合参数。
+`main_rm75 --check-force-calibration` 仅检查这些本地文件，在设备、Redis 和日志线程启动前退出。
 Redis `terminate` 结束一轮扫描并返回 Armed idle，进程继续等待下一轮；正在执行的目标力卸载先完成卸载 / 制动。
 退出由停止信号、故障或配置时限触发。
 
@@ -96,7 +102,7 @@ v1 文件读取时按 `R_S_T = I` 升级；v2 必须提供新字段，写出统�
 力与力矩保持原 Tool 参考原点（不改为 TCP），接触偏移则相对 TCP 后转入探头工作轴。
 
 生产反馈为 ArmTip，控制目标涉及 Probe TCP，二者通过标定链转换，不能混用。
-`RMKinematics` 只提供七轴 FK / Jacobian 与限位读取，不能用历史六轴接口绕过 planner。
+`RMKinematics` 只提供七轴 FK / Jacobian 与限位读取，关节规划统一经过当前 planner。
 
 ## 线程、周期与数据流
 
@@ -187,12 +193,19 @@ Y 仍受接触力、跟踪暂停和步长门限制；达到距离上限只停止
 | 重连与内部序号 | Bridge 把 `intent.sequence` 替换为本地接收序号，同时保留 `producer_sequence`；断线 / 新订阅连接使旧快照失效，恢复后需新收到的有效命令 |
 
 生产端约定见 [在线超声入口](../../intergrate_infer/main_redis_seg_newphase_recovery_mode.py)：
+当前视觉生产入口从有效分割 / 检测血管中心计算 Tool-Y 误差，0.5 mm 死区、两帧换向确认，
+普通输入限幅 4 mm；按默认增益 1/s 对应未缩放 4 mm/s。视觉端以未限幅图像误差 ≤0.8 mm
+放行 X/RZ，未居中或目标不可用时 phase=-1；已启用且有新鲜视觉的显式 recovery 搜索保留。
+心跳只保持通信，不更新图像采集时刻；图像超过 300 ms 时 Y/RZ 归零、phase=-1，保留 Z 力控。
 新进程首发 `action_state=false` 的 idle，`b` 放行接近 / 力控 / Y 居中，`m` 再放行
 X 扫描 / Trigger / RZ；尚未启用扫描时发送 phase=-1、rz=0、recovery=false。
 Robot 的 `SubscriberLoop()` / `EvaluateCommandForControl()` 实际检查连接、字段、序号与接收时效，
 **没有强制验证新 session 必须先发送 idle**；启动 Usage 和注释中的握手说明不能当作已实现接收门。
 补接收端握手状态机属于后续工作，本次未改动控制逻辑。
 
+sensor v1 增加 `runtime_tare_applied` 布尔字段，标记本次运行固定偏置是否已应用；
+`compensated_wrench_tool` 是标定重力/质心补偿、已启用运行 tare 后表达于 Tool 的六维值。
+超声配对录像据此拒绝将未 tare 的值标为 tare 后数据，不改变原始 wrench 或控制逻辑。
 sensor v1 使用 N / N·m / m，接触 frame 为 `probe_tcp_tool`（TCP 相对位置、探头工作轴）；
 项目通过 Redis 发布此遥测，不依赖 SensorMonitor；该独立工具启动后可自动识别并只读订阅，见 [SensorMonitor 架构](../SensorMonitor/ARCHITECTURE.md)。
 腕部协议除 envelope 年龄 / 序号外，还检查 runtime session、boot、标定原始字节 SHA-256、
@@ -241,7 +254,7 @@ Stop 回执成功不等于实体已静止；超时 / 不健康反馈产生失败
 ## 颈动脉单点维护流程
 
 当前粗定位串联入口是 [run_probe_target.py](../hand_eye_calibration-main/run_probe_target.py)：
-读取全局相机本次快照，外参转换首点 / 法向 / 切向，生成短轴姿态，沿 Tool -Z 后退 50 mm，
+读取全局相机本次快照，外参转换首点 / 法向 / 切向，生成短轴姿态，沿 Tool -Z 后退 100 mm，
 再调用 `arm_probe_pose --target-pose-m-rad ... --controller-movej-p`。
 默认脚本会传执行参数，`--dry-run` 只预览；成功且启用 handoff 的真实定位才发布投影 seed。
 seed 的表面点不含后退偏置，不能拿定位 TCP 点当表面点。
@@ -252,14 +265,18 @@ seed 的表面点不含后退偏置，不能拿定位 TCP 点当表面点。
 | `--target-position-base-m` | 精确 Base 位置；默认保持启动 TCP 姿态，也可指定内法向 | 不添加 50 mm；姿态可能需读取一次 Robot 状态 |
 | `--artery-path-base` | 历史 accepted Base 路径、sidecar、外参摘要校验；首点 +50 mm 外法向 | 格式校验仍实现；当前 `infer/Calibration` 目录不存在，不是当前快照串联入口 |
 | 默认本地 planner 后端 | 反馈 / 模型一致性、IK、关节变化与 201 点 MoveJ 路径采样 | 默认最大关节变化 60°；残差 ≤0.6 mm / ≤0.2°；限位 / 奇异拒绝 |
-| `--controller-movej-p` | 由控制器完成 IK，调用 `TryMoveJP`；粗定位脚本使用此后端 | 跳过本地 IK、模型一致性、限位裕量、奇异和关节路径预检查；目标关节未知，关节变化门不适用 |
-| `--inspect-transform-only` | 只读文件 / 标定检查，零 Robot 连接 | 需要启动姿态的输入不能离线补全姿态 |
-| 默认 dry-run（无 execute） | 连接读状态但零运动命令 | 控制器后端只预览目标，没有 IK / 可达性检查 |
+| `--controller-movej-p` | 先检查腕心到肩部的几何臂展上界，再由控制器完成 IK，调用 `TryMoveJP`；粗定位脚本使用此后端 | 跳过本地 IK、模型一致性、限位裕量、奇异和关节路径预检查；目标关节未知，关节变化门不适用 |
+| `--inspect-transform-only` | 只读文件 / 标定及已知姿态的臂展上界检查，零 Robot 连接 | 需要启动姿态的输入不能离线补全姿态 |
+| 默认 dry-run（无 execute） | 连接读状态但零运动命令 | 控制器后端检查几何臂展上界，但不验证完整 IK / 可达性 |
 | `--execute --confirm-single-movej` | 速度 1～5，最多一次 `TryMoveJ` 或 `TryMoveJP` | 两后端均无环境碰撞模型；不能把本地预检查套用于控制器后端 |
 
 三种目标输入互斥。本地维护 planner 中 `arm_preset_pose` 颈动脉模式预警裕量为 5°，
 `arm_probe_pose` 为 3°；生产 planner 默认预警 10°、硬停止 3°。
 IK 和关节路径采样检查属于本地后端，`--controller-movej-p` 不执行它们。
+已知完整姿态的目标在连接 Robot 前检查腕心距肩部不超过两段臂长之和（466 mm，容差 1 mm）；
+腕心由 ArmTip 目标沿 ArmTip -Z 回退 144 mm 得到，几何参数取当前 RM75 MDH。
+依赖启动姿态的输入在读状态补全姿态后检查。超界返回 4，不发送 MoveJ，也不裁剪目标。
+此必要条件通过不证明 IK、限位、奇异或碰撞可行；最终到位门仍保留。
 Tool 几何验收和 Camera 外参验收是不同事项；工具执行参数与候选试验不会自动完成空间验证。
 
 ## 构建与验证
@@ -303,3 +320,34 @@ CSV v2 列保持不变，KWR57 的 checksum 列为 false；summary 的 control �
 
 `--sensor-protocol haptron-modbus` / `legacy-aa55` 保留旧协议，未指定波特率时自动使用 115200。
 标定采集工具同步支持 `--sensor-protocol`，输出 CSV 已经是 N、N·m，拟合时不应再次换算。
+
+
+## 自动静态力标定
+
+`tools/calibrate_force_static.py` 串联维护工具的自动采集与既有静态重力拟合。
+`force_sensor_calibration_capture --automatic` 默认按模型全关节范围做工作空间覆盖：
+Halton 七维候选经 FK 计算 TCP 和重力方向，再用最远点选样兼顾位置及方向。
+关节邻近排序降低访问距离，J7 选择最近有效等价转角；实际 MoveJ 段仍细分至 10°。
+`--path-mode local` 保留原七轴局部扫描。TCP 位置使用项目配置的 ArmTip 偏移。
+候选集覆盖距离是有限采样指标；输出声明 `collision_checked=false`，没有认证连续路径或避障。
+每段依次停止状态读取线程、MoveJ、重启状态读取、读取新鲜反馈、直接采集平均窗口，
+采样时允许关节、位置和姿态变化。MoveJ 的可选取消指针支持信号中断并等待 Stop 回执。
+CSV 仍为实际 Base→Sensor 旋转及 SI wrench 的 15 列，完整采集标记与既有拟合器兼容。
+`--plan-only` 支持读当前位置或显式七轴起点离线生成路径；正常采集完成后返回起点。
+安装几何沿用当前配置，新的 KWR57 重力、零偏与质心替换旧拟合参数。
+操作见 [力标定](../../.runme/run/calibration_force.md)。
+
+按用户最新要求，已移除到位后的静置、关节/位置/姿态静止门和滚动停稳等待。
+`--resume` 保留已接受平均样本和原路径，从下一姿态继续；变化跨度仅作为诊断信息记录。
+采集窗口仍要求足量有效帧及配对时间，不再因姿态变化拒绝窗口。
+
+`--resume-workspace` 以已接受点的原关节目标作为固定覆盖种子，只选择剩余数量的新目标，
+已接受 CSV 文本原文保留。补充路径另存 `.workspace.path.json`，原 CSV 和路径快照不修改。
+
+
+2026-11-09 用户明确要求恢复后，workspace 自动运动入口重新开放。
+`--workspace-config` 提供 Base 下允许采样区域和禁入 box/sphere，生成器仅筛选新目标，保留历史样本。
+配置 `exit_direction_base=[0,0,1]` 时，启动位置若在禁球内，先保持朝向 MoveL 到球顶以上 5 cm。
+workspace 完成后保留最后姿态，不再返回旧起点；MoveL 和 MoveJ 均支持 Ctrl+C 取消并请求确认停止。
+目标 TCP 区域筛选不能代替整臂和过渡路径检查。Collision 的 `collision_check --calibration-path`
+提供首段、剩余各段及可选返回段的只读 FCL 检查；当前直接采集入口没有接通该检查，现场整段碰撞未验证。

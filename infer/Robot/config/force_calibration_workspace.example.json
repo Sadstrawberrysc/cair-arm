@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "frame": "rm75_base",
+  "allowed_regions": [],
+  "forbidden_boxes": [],
+  "forbidden_spheres": [],
+  "note": "填写允许采样区域或禁采样区，所有坐标和半径均为米。allowed_regions 为空时从模型可达空间选点，仍排除禁区；三类约束全部为空时不生成路径。TCP 点筛选不等于整臂和运动段碰撞检查。"
+}

@@ -6,6 +6,7 @@
 
 | 链路 | 入口与数据流 |
 | --- | --- |
+| 串联运行 | `scripts/run_scan_workflow.py` → 全局采样/MoveJ_P → 腕部跟随 → 超声扫描；保留窗口按键，以相机退出和 Robot 正常停止衔接阶段，操作见 [系统运行](.runme/run/system-operations.md) |
 | 超声闭环 | `intergrate_infer/main_redis_seg_newphase_recovery_mode.py` → Redis → `infer/Robot/src/main_rm75.cpp` → RM75 |
 | 全局初始定位 | `Camera_RT/cliff_demo.py` 保存相机快照 → `hand_eye_calibration-main/run_probe_target.py` 转换顶部首点并构造短轴姿态 → `arm_probe_pose` 执行单次 MoveJ_P |
 | 腕部跟随 | `Camera_wrist/click_follow.py` 发布 RGB-D 观测与请求 → Robot 按采集时刻变换坐标 → `WristFollowController` → 七轴 planner / ServoJ |
@@ -73,8 +74,8 @@ Color→Base 变换、自身及半径邻域稀疏点过滤 → 单帧 OctoMap �
 | 超声推理 | [推理架构](intergrate_infer/ARCHITECTURE.md) |
 | 全局相机与初始定位 | [Camera_RT 架构](infer/Camera_RT/ARCHITECTURE.md)、[操作](.runme/run/camera-rt-operations.md) |
 | 腕部跟随与模型 | [Camera_wrist 架构](infer/Camera_wrist/ARCHITECTURE.md)、[detector 架构](infer/Camera_wrist/detector/ARCHITECTURE.md)、[操作](.runme/run/camera-wrist-operations.md) |
-| 相机标定 | [标定说明](infer/hand_eye_calibration-main/README.md)、[操作](.runme/run/calibration-operations.md) |
-| 力传感器与末端替换 | [KWR57 接入](docs/kwr57_sensor_integration.md)、[采集分析](docs/sensor_drift_recording.md)、[SensorMonitor 架构](infer/SensorMonitor/ARCHITECTURE.md)、[替换计划](.runme/run/end-effector-replacement.md) |
+| 相机标定 | [标定说明](infer/hand_eye_calibration-main/README.md)、[操作](.runme/run/calibration_camera.md) |
+| 力传感器与末端替换 | [KWR57 接入](docs/kwr57_sensor_integration.md)、[采集分析](docs/sensor_drift_recording.md)、[SensorMonitor 架构](infer/SensorMonitor/ARCHITECTURE.md)、[替换计划](.runme/Progress/project-progress.md#末端替换计划与验收记录历史) |
 | 长期决策 | [DECISIONS.md](DECISIONS.md) |
 | 碰撞检测与避障规划 | [Collision 架构](infer/Collision/ARCHITECTURE.md)、[进展](infer/Collision/PROGRESS.md)、[监测操作](infer/Collision/MONITOR.md)、[规划操作](infer/Collision/PLANNING.md)；当前支持人工／相机场景 OMPL 规划与颈动脉目标 IK，生产反馈桥接和执行待完成 |
 

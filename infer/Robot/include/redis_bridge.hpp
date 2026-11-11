@@ -96,6 +96,7 @@ struct RedisSensorMessage {
     double contact_point_error_m = 0.0;
     std::string contact_error;
     bool wrench_valid = false;
+    bool runtime_tare_applied = false;
     bool contact_valid = false;
     bool checksum_valid = false;
     bool checksum_available = true;

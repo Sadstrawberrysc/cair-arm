@@ -30,7 +30,7 @@
 
 ## 配置与启动
 
-日常相机启动见 [最简启动 notebook](../../../.runme/run/carotid-begin-operations.md)。
+日常相机启动见 [最简启动 notebook](../../../.runme/run/camera-wrist-operations.md)。
 `bash infer/Camera_wrist/start_camera.sh` 和 `camera` 环境内直接运行
 `python infer/Camera_wrist/click_follow.py` 均默认模型模式；无需传入参数。
 

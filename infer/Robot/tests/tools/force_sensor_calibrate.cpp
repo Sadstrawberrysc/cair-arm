@@ -34,6 +34,7 @@ struct Options {
     double max_force_rms_n = 0.6;
     double max_torque_rms_nm = 0.1;
     bool allow_high_residual = false;
+    bool allow_incomplete = false;
 };
 
 struct CaptureCsvMetadata {
@@ -67,6 +68,7 @@ void Usage(const char* program) {
         << "  --max-force-residual-n N       vector maximum, default/maximum 0.6\n"
         << "  --max-torque-residual-nm NM    vector maximum, default/maximum 0.1\n"
         << "  --allow-high-residual     write result despite failed residual gate\n";
+    std::cout << "  --allow-incomplete        fit accepted rows from an interrupted capture\n";
 }
 
 bool ParseDouble(const std::string& text, double& output) {
@@ -154,6 +156,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             if (item == nullptr || !ParseDouble(item, options.max_torque_rms_nm)) return false;
         } else if (argument == "--allow-high-residual") {
             options.allow_high_residual = true;
+        } else if (argument == "--allow-incomplete") {
+            options.allow_incomplete = true;
         } else {
             std::cerr << "Unknown option: " << argument << '\n';
             return false;
@@ -183,7 +187,8 @@ std::vector<std::string> Split(const std::string& line) {
 bool ReadSamples(const std::string& path,
                  std::vector<ForceCalibrationSample>& samples,
                  CaptureCsvMetadata& metadata,
-                 std::string& error) {
+                 std::string& error,
+                 bool allow_incomplete) {
     std::ifstream stream(path);
     if (!stream) {
         error = "cannot open calibration samples: " + path;
@@ -262,11 +267,11 @@ bool ReadSamples(const std::string& path,
     if (metadata.generated_by_capture) {
         const std::string filename =
             std::filesystem::path(path).filename().string();
-        if (filename.find(".partial") != std::string::npos) {
+        if (!allow_incomplete && filename.find(".partial") != std::string::npos) {
             error = "generated capture .partial files cannot be calibrated";
             return false;
         }
-        if (!metadata.capture_complete) {
+        if (!allow_incomplete && !metadata.capture_complete) {
             error = "generated capture CSV is not marked capture_complete=true";
             return false;
         }
@@ -299,7 +304,7 @@ int main(int argc, char** argv) {
     std::vector<ForceCalibrationSample> samples;
     CaptureCsvMetadata capture_metadata;
     std::string error;
-    if (!ReadSamples(options.input_csv, samples, capture_metadata, error)) {
+    if (!ReadSamples(options.input_csv, samples, capture_metadata, error, options.allow_incomplete)) {
         std::cerr << error << '\n';
         return 3;
     }

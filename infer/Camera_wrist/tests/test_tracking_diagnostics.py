@@ -4,12 +4,40 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import cv2
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_tracker import LocalTracker
 from tracking_diagnostics import TrackingDiagnostics
 
 class DiagnosticTests(unittest.TestCase):
+    def test_residual_measurements_are_logged_without_triggering_loss(self):
+        rng = np.random.default_rng(7)
+        gray = cv2.GaussianBlur(rng.integers(0, 256, (240, 320), dtype=np.uint8), (3, 3), 0)
+        image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        depth = np.full((240, 320), .2)
+        k = np.array([[400., 0, 160], [0, 400., 120], [0, 0, 1.]])
+        tracker = LocalTracker()
+        initial = tracker.initialize(image, depth, [160, 120], k, np.zeros(5), 1)
+        self.assertTrue(initial['valid'])
+        depth[117:124, 157:164] = .2036
+        with tempfile.TemporaryDirectory() as directory:
+            rows = []
+            writer = TrackingDiagnostics(Path(directory)/'run.jsonl', rows.append)
+            writer.emit(initial, tracker)
+            result = tracker.update(image, depth, k, np.zeros(5), 33_000_001)
+            writer.emit(result, tracker)
+            self.assertEqual(rows[-1]['event'], 'sample')
+            metrics = rows[-1]['quality']
+            self.assertEqual(metrics['reference_exceeded'], ['target_plane_distance'])
+            self.assertEqual(metrics['failed_checks'], [])
+            self.assertFalse(metrics['residual_gates_enabled'])
+            self.assertIsNone(metrics['plane_rms_limit_m'])
+            self.assertIsNone(metrics['target_plane_distance_limit_m'])
+            self.assertGreater(metrics['target_plane_distance_m'], .003)
+            self.assertFalse(writer.directory.exists())
+            json.dumps(rows, allow_nan=False)
+
     def test_first_failure_cause_latched(self):
         tracker = LocalTracker()
         tracker.active = True

@@ -28,7 +28,6 @@ RealSense RGB-D
 - `models/`、`common/`：CLIFF、HRNet 和图像/渲染辅助代码。
 - `data/`：本机模型资产，已被 Git 忽略。
 - `tools/`：预检、摘要清单和纯离线路径格式测试。
-- `lib/`：旧 YOLOv3 实现，不属于当前入口活动链路。
 
 详细边界见 `ARCHITECTURE.md`，当前状态与操作见本机
 `../../.runme/Progress/camera-rt-progress.md` 和 `../../.runme/run/camera-rt-operations.md`，长期决定见

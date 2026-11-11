@@ -77,6 +77,7 @@ int main() {
     sensor.timestamp_ns = 10;
     sensor.source_timestamp_unix_ns = 11;
     sensor.wrench_valid = true;
+    sensor.runtime_tare_applied = true;
     sensor.contact_valid = true;
     sensor.checksum_valid = true;
     sensor.sensor_io_status = "streaming";
@@ -97,9 +98,15 @@ int main() {
         "compensated_wrench_tool", "contact", "control_state", "fault",
         "published_unix_ms", "raw_wrench_sensor", "sensor", "sequence",
         "source_timestamp_unix_ns", "timestamp_monotonic_ns", "units",
-        "valid", "version"};
+        "valid", "version", "runtime_tare_applied"};
     ok &= Check(Keys(sensor_v1) == expected_sensor_keys,
                 "robot:sensor:v1 top-level schema");
+    ok &= Check(sensor_v1.at("runtime_tare_applied").get<bool>(),
+                "sensor telemetry identifies runtime tare application");
+    sensor.runtime_tare_applied = false;
+    ok &= Check(!nlohmann::json::parse(RedisBridge::BuildSensorV1Json(sensor))
+                     .at("runtime_tare_applied").get<bool>(),
+                "sensor telemetry preserves untared state");
 
     RedisStatusContext context;
     context.session_id = "offline-session";
@@ -123,6 +130,14 @@ int main() {
     WristPacket packet; std::string wrist_error;
     auto parse_wrist=[&](){return RedisBridge::ParseWristPacket(wp.dump(),true,"run","hash","boot",1000000000LL,packet,wrist_error);};
     ok &= Check(parse_wrist(), "wrist valid optical observation accepted");
+    wp["quality"]["surface_points"]=10; wp["quality"]["feature_inliers"]=6;
+    wp["quality"]["plane_inlier_ratio"]=.5;
+    ok &= Check(parse_wrist(), "wrist accepts 6 features, 10 surface points and 50 percent consensus");
+    wp["quality"]["feature_inliers"]=5;
+    ok &= Check(!parse_wrist(), "wrist rejects fewer than 6 features");
+    wp["quality"]["feature_inliers"]=6; wp["quality"]["surface_points"]=9;
+    ok &= Check(!parse_wrist(), "wrist rejects fewer than 10 surface points");
+    wp["quality"]["surface_points"]=10;
     wp["capture_monotonic_ns"]=700000000LL;
     ok &= Check(!parse_wrist(), "wrist old capture not refreshed by new message time");
     wp["capture_monotonic_ns"]=950000000LL; wp["runtime_session_id"]="old";
@@ -130,6 +145,11 @@ int main() {
     wp["runtime_session_id"]="run"; wp["normal_out_camera"]={0,0,1};
     ok &= Check(!parse_wrist(), "wrist normal must face camera");
     wp["normal_out_camera"]={0,0,-1}; wp["quality"]["plane_rms_m"]=.003;
-    ok &= Check(!parse_wrist(), "wrist plane quality gate enforced by consumer");
+    ok &= Check(parse_wrist(), "wrist residual magnitude is diagnostic only");
+    wp["quality"]["plane_rms_m"]=-.001;
+    ok &= Check(!parse_wrist(), "wrist negative residual is invalid");
+    wp["quality"]["plane_rms_m"]=.003;
+    wp["quality"]["plane_inlier_ratio"]=.499;
+    ok &= Check(!parse_wrist(), "wrist consensus gate remains enforced");
     return ok ? 0 : 1;
 }

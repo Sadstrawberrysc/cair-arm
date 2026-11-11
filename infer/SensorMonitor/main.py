@@ -209,6 +209,8 @@ def run_gui(reader):
             for row, (title, unit, prefix) in enumerate((("清零后力", "N", "F"),
                                                        ("清零后力矩", "N·m", "M"))):
                 plot = graphs.addPlot(row=row, col=0, title=title)
+                # Keep tick values in SI units even for small zeroed readings.
+                plot.getAxis("left").enableAutoSIPrefix(False)
                 plot.setLabel("left", unit)
                 plot.setLabel("bottom", "Time", units="s")
                 plot.showGrid(x=True, y=True, alpha=0.25)

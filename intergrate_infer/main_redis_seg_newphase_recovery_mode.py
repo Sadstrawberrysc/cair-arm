@@ -16,6 +16,8 @@ import torchvision.transforms as T
 import torch.backends.cudnn as cudnn
 from torch.backends.cuda import sdp_kernel
 from collections import deque
+from scan_recording import ScanRecording
+from visual_y_alignment import VisualYAlignment, gate_alignment_command, fresh_visual_command
 
 from utils import rot6d_to_matrix
 from models import (
@@ -42,6 +44,7 @@ command_publisher = None
 camera = None
 inference_running = True
 trigger_inference = False  # Flag to trigger inference manually
+scan_recording = None
 
 # Phase Label Map
 PHASE_LABELS = {0: 'Scan', 1: 'Trigger', 2: 'Action'}
@@ -135,62 +138,6 @@ def normal_termination_frame_ready(
     )
 
 
-class VisualYConditioner:
-    """将逐帧视觉横向误差变成稳定的 Tool-Y 命令输入。"""
-
-    def __init__(self, deadband_m, lowpass_alpha, confirmation_frames):
-        if deadband_m < 0.0:
-            raise ValueError("visual Y deadband must be non-negative")
-        if not 0.0 < lowpass_alpha <= 1.0:
-            raise ValueError("visual Y low-pass alpha must be in (0, 1]")
-        if confirmation_frames < 1:
-            raise ValueError("visual Y confirmation frames must be positive")
-        self.deadband_m = float(deadband_m)
-        self.lowpass_alpha = float(lowpass_alpha)
-        self.confirmation_frames = int(confirmation_frames)
-        self.reset()
-
-    def reset(self):
-        self._filtered_y_m = 0.0
-        self._confirmed_sign = 0
-        self._candidate_sign = 0
-        self._candidate_count = 0
-
-    def update(self, raw_y_m):
-        """死区清零；换向时先连续确认，再对同向误差做 EMA 低通。"""
-        raw_y_m = float(raw_y_m)
-        if not np.isfinite(raw_y_m) or abs(raw_y_m) <= self.deadband_m:
-            self.reset()
-            return 0.0
-
-        sign = 1 if raw_y_m > 0.0 else -1
-        if sign != self._confirmed_sign:
-            if sign == self._candidate_sign:
-                self._candidate_count += 1
-            else:
-                self._candidate_sign = sign
-                self._candidate_count = 1
-
-            # 尚未确认方向时发布零，防止单帧噪声让机械臂反向。
-            if self._candidate_count < self.confirmation_frames:
-                self._filtered_y_m = 0.0
-                return 0.0
-
-            self._confirmed_sign = sign
-            self._candidate_sign = sign
-            self._candidate_count = self.confirmation_frames
-            self._filtered_y_m = raw_y_m
-        else:
-            self._candidate_sign = sign
-            self._candidate_count = self.confirmation_frames
-            self._filtered_y_m = (
-                self.lowpass_alpha * raw_y_m
-                + (1.0 - self.lowpass_alpha) * self._filtered_y_m
-            )
-
-        return (self._filtered_y_m
-                if abs(self._filtered_y_m) > self.deadband_m else 0.0)
-
 
 def colorize_mask(mask, color_map):
     color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
@@ -206,10 +153,11 @@ class VisionCommandPublisher:
         self.channel = channel
         self.session_id = session_id or str(uuid.uuid4())
         self.sequence = 0
-        # RM75 的 command_stale_ms 为 500 ms。推理、画面冻结或按键等待
-        # 期间仍需重发最后一条命令，不能让机器人因没有新 Redis 消息进入 Hold。
+        # Heartbeats maintain Redis/session liveness. Image freshness is checked
+        # independently so old frames cannot keep Y/X/RZ moving indefinitely.
         self._lock = threading.Lock()
         self._last_command = None
+        self._last_observation_monotonic_ns = 0
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = None
         self._heartbeat_period_s = 0.2
@@ -225,6 +173,7 @@ class VisionCommandPublisher:
         robot_action_state="idle",
         mask_lr_majority=0,
         heartbeat=False,
+        observation_monotonic_ns=None,
     ):
         with self._lock:
             self.sequence += 1
@@ -250,6 +199,10 @@ class VisionCommandPublisher:
                 print(f"[Python] Redis publish error: {error}")
                 return None
             self._last_command = command_data
+            if not heartbeat:
+                self._last_observation_monotonic_ns = (
+                    observation_monotonic_ns if observation_monotonic_ns is not None
+                    else time.monotonic_ns())
         if not heartbeat:
             print(
                 "[Python] Published v1 command - "
@@ -273,8 +226,10 @@ class VisionCommandPublisher:
             while not self._heartbeat_stop.wait(self._heartbeat_period_s):
                 with self._lock:
                     command = dict(self._last_command) if self._last_command else None
+                    observed_ns = self._last_observation_monotonic_ns
                 if command is None:
                     continue
+                command = fresh_visual_command(command, observed_ns, time.monotonic_ns())
                 self.publish(
                     command["parameters"]["y"],
                     command["parameters"]["rz"],
@@ -607,7 +562,8 @@ def init_camera(camera_id, width, height, fps):
     print(f"Camera initialized: {actual_width}x{actual_height} @ {actual_fps}fps")
     return cap
 
-def run_yolo_on_frame(frame_bgr, yolo_model, conf_thres=0.5, target_class_id=0, debug=False):
+def run_yolo_on_frame(frame_bgr, yolo_model, conf_thres=0.5, target_class_id=0, debug=False,
+                      valid_center_y_min=0, valid_center_y_max=None):
     """
     Online YOLO inference on one frame.
     Returns:
@@ -616,8 +572,8 @@ def run_yolo_on_frame(frame_bgr, yolo_model, conf_thres=0.5, target_class_id=0, 
     """
     best_det = None
     target_count = 0
-    valid_center_y_min = 200
-    valid_center_y_max = 350
+    if valid_center_y_max is None:
+        valid_center_y_max = frame_bgr.shape[0] - 1
     try:
         results = yolo_model.predict(
             source=frame_bgr,
@@ -1036,13 +992,17 @@ def _open_pdf_file(pdf_path):
     except Exception as e:
         print(f"[AutoReport] Failed to open PDF: {e}")
 
-def main():
+def _run_main():
     global redis_client, redis_pubsub, command_publisher
     global camera, inference_running, trigger_inference
+    global scan_recording
     
     # ====================== Configuration Settings ======================
     # Camera settings
-    camera_id = 2
+    camera_id = os.environ.get(
+        'USPILOT_ULTRASOUND_CAMERA',
+        '/dev/v4l/by-id/usb-MACROSILICON_USB3.0_UHD_20210623-video-index0',
+    )
     camera_width = 1920
     camera_height = 1080
     camera_fps = 30
@@ -1116,17 +1076,6 @@ def main():
     auto_terminate_latched = False
     terminate_command_sequence = 0
 
-    # Tool-Y 视觉误差调理：0.01 mm 居中死区，方向当帧确认；
-    # alpha=0.7：当前帧占 70%，上一次滤波结果占 30%。
-    visual_y_deadband_m = 0.00001
-    visual_y_lowpass_alpha = 0.7
-    visual_y_confirmation_frames = 1
-    visual_y_conditioner = VisualYConditioner(
-        visual_y_deadband_m,
-        visual_y_lowpass_alpha,
-        visual_y_confirmation_frames,
-    )
-
     # recovery mode settings
     recovery_mode = False
     lost_vessel_count = 0
@@ -1162,6 +1111,8 @@ def main():
     # Auto capture & report settings
     auto_capture_enabled = True
     image_total_height_mm = 37.0
+    # Image-space centering shares the ultrasound measurement scale.
+    visual_y_alignment = VisualYAlignment(image_total_height_mm)
 
     report_deterministic_only = False
     report_no_think = True
@@ -1195,14 +1146,8 @@ def main():
         os.makedirs(output_dir)
     
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    video_filename = os.path.join(output_dir, f"{timestamp}.avi")
     auto_capture_dir = os.path.join(output_dir, f"auto_capture_{timestamp}")
     os.makedirs(auto_capture_dir, exist_ok=True)
-    frame_width_out = ULTRASOUND_FRAME_WIDTH
-    frame_height_out = ULTRASOUND_FRAME_HEIGHT
-    # fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    # video_writer = cv2.VideoWriter(video_filename, fourcc, float(camera_fps), (frame_width_out, frame_height_out))
-    print(f"Recording video to {video_filename}")
 
     # Load normalization stats
     inv_dT1e = build_inv_normalizer_from_dataset(
@@ -1255,7 +1200,7 @@ def main():
             seg_model.load_state_dict(torch.load(seg_model_path, map_location='cpu'))
             print("[Python] Segmentation model loaded.")
         else:
-            print(f"[Python] Segmentation model not found at {seg_model_path}, using random init.")
+            raise FileNotFoundError(f"Segmentation model not found: {seg_model_path}")
         seg_model.eval()
     except Exception as e:
         print(f"[Python] Failed to load segmentation model: {e}")
@@ -1323,6 +1268,11 @@ def main():
         f"{command_publisher.session_id}"
     )
     command_publisher.start_heartbeat()
+    scan_recording = ScanRecording(
+        redis_client, output_dir,
+        (ULTRASOUND_FRAME_WIDTH, ULTRASOUND_FRAME_HEIGHT), fps=camera_fps,
+    )
+    print(f"[Recording] Ultrasound + post-tare wrench: {scan_recording.directory}", flush=True)
     
     # ====================== Main Inference Loop ======================
     # try:
@@ -1448,6 +1398,7 @@ def main():
 
         begin_time = time.time()
         ret, frame = camera.read()
+        frame_received_ns = time.monotonic_ns()
         if not ret:
             print("[Python] Failed to capture frame")
             continue
@@ -1457,7 +1408,7 @@ def main():
         except (ValueError, RuntimeError) as error:
             print(f"[Python] Invalid camera frame: {error}")
             continue
-        # video_writer.write(frame)
+        scan_recording.submit(frame, frame_received_ns)
         # --- YOLO Inference ---
         yolo_det = None
         yolo_count = 0
@@ -1469,7 +1420,9 @@ def main():
                 yolo_model=yolo_model,
                 conf_thres=yolo_conf_thres,
                 target_class_id=yolo_target_class_id,
-                debug=True
+                debug=False,
+                valid_center_y_min=valid_center_y_min,
+                valid_center_y_max=valid_center_y_max,
             )
         # --- Segmentation Inference ---
         vessel_found_this_frame = False
@@ -1624,7 +1577,7 @@ def main():
             pre_rotation_vessel_pixels_locked = False
             auto_terminate_latched = False
             terminate_command_sequence = 0
-            visual_y_conditioner.reset()
+            visual_y_alignment.reset()
             current_phase_idx = 0
             phase_candidate_idx = 0
             phase_candidate_count = 0
@@ -1765,7 +1718,10 @@ def main():
                         
                         # Extract Values
                         raw_y_value = float(pred_xy_real[0, 0].cpu().numpy())
-                        y_value = visual_y_conditioner.update(raw_y_value)
+                        processed_ns = time.monotonic_ns()
+                        alignment = visual_y_alignment.update(
+                            frame.shape, seg_regions, yolo_det, frame_received_ns, processed_ns)
+                        y_value = alignment['command_m']
                         rz_value = float(angle[0, 0].cpu().numpy())
 
                         # Before the first rotation phase of this m/scan run,
@@ -1788,7 +1744,9 @@ def main():
                                     "pixel baseline locked: "
                                     f"{pre_rotation_vessel_pixels}"
                                 )
-                        termination_frame_ready = normal_termination_frame_ready(
+                        termination_frame_ready = (alignment['valid']
+                            and abs(alignment['error_m']) <= .0008
+                            and normal_termination_frame_ready(
                             latest_phase_idx=latest_phase_idx,
                             rz_value=rz_value,
                             yolo_valid=yolo_valid,
@@ -1802,7 +1760,7 @@ def main():
                                 termination_vessel_pixel_growth_ratio
                             ),
                             rz_tolerance_deg=termination_rz_tolerance_deg,
-                        )
+                        ))
                         if scan_enabled:
                             termination_stable_count = (
                                 termination_stable_count + 1
@@ -1904,6 +1862,8 @@ def main():
                         # [Updated Print] Include Phase
                         print(
                             f"[Infer] y_raw: {raw_y_value:.4f}, "
+                            f"y_image: {alignment['error_m']:.4f}, "
+                            f"y_source: {alignment['source']}, "
                             f"y_command: {y_value:.4f}, rz: {rz_value:.4f}, "
                             f"phase_raw: {latest_phase_idx}, phase: {phase_idx}, "
                             f"confidence: {phase_confidence:.3f}, "
@@ -1929,7 +1889,11 @@ def main():
                             scan_enabled,
                         )
 
-                        # b 只允许 Z；m 开启后才发布 X/Y/RZ 所需的视觉量。
+                        (command_y, command_rz, command_phase_idx, command_phase_confidence,
+                         command_recovery_mode, command_mask_lr_majority) = gate_alignment_command(
+                            (command_y, command_rz, command_phase_idx, command_phase_confidence,
+                             command_recovery_mode, command_mask_lr_majority), alignment)
+                        # b enables Y/Z; m additionally enables X/RZ.
                         published_command = command_publisher.publish(
                             command_y,
                             command_rz,
@@ -1939,6 +1903,7 @@ def main():
                             phase_confidence=command_phase_confidence,
                             robot_action_state=robot_action_state,
                             mask_lr_majority=command_mask_lr_majority,
+                            observation_monotonic_ns=frame_received_ns,
                         )
                         if (
                             auto_terminate_latched
@@ -2060,9 +2025,21 @@ def main():
         redis_pubsub.close()
 
     if camera is not None: camera.release()
-    # if video_writer is not None: video_writer.release()
     cv2.destroyAllWindows()
     print("[Python] Stopped")
+
+def main():
+    try:
+        _run_main()
+    finally:
+        # Flush AVI indexes/CSVs on q, exceptions and workflow SIGINT alike.
+        # Stop the heartbeat even if inference or a video writer failed.
+        if command_publisher is not None:
+            command_publisher.stop_heartbeat()
+        if camera is not None:
+            camera.release()
+        if scan_recording is not None:
+            scan_recording.close()
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--check-command-protocol"]:

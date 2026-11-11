@@ -52,11 +52,19 @@ Eigen::Matrix4d RMKinematics::GetModifiedDhTransform(double alpha,
 
 void RMKinematics::GetKinematics(Eigen::Matrix4d& kinematics,
                                  Eigen::Matrix<double,7,1>& joints){
-    kinematics.setIdentity();
+    kinematics = GetLinkKinematics(joints).back();
+}
+
+std::array<Eigen::Matrix4d, RMKinematics::kJointCount> RMKinematics::GetLinkKinematics(
+    const Eigen::Matrix<double,7,1>& joints) const {
+    std::array<Eigen::Matrix4d, kJointCount> links;
+    Eigen::Matrix4d kinematics = Eigen::Matrix4d::Identity();
     for (int i = 0; i < kJointCount; ++i) {
         kinematics = kinematics
             * GetModifiedDhTransform(mdh_alpha[i], mdh_d[i], joints[i]);
+        links[i] = kinematics;
     }
+    return links;
 }
 
 void RMKinematics::GetJacobian(Eigen::Matrix<double,6,7>& jacobian,

@@ -52,6 +52,9 @@ constexpr double kRuntimeTareMaximumJointSpanDeg = 0.02;
 constexpr double kRuntimeTareMaximumTcpSpanMm = 0.35;
 // RM75 静止反馈存在约 0.08° 的正常微抖；使用 0.10° 仍远小于真实姿态运动。
 constexpr double kRuntimeTareMaximumOrientationSpanDeg = 0.10;
+constexpr double kRuntimeTareMaximumForceDeviationN = 1.0;
+constexpr double kVerifiedWarmupMaximumForceNormN = 4.0;
+constexpr double kVerifiedWarmupMaximumTorqueNormNm = 0.1;
 constexpr double kProvisionalTareMaximumForceNormN = 5.0;
 constexpr double kProvisionalTareMaximumTorqueNormNm = 0.5;
 // Provisional commissioning remains gated by the no-contact tare, old
@@ -103,7 +106,7 @@ std::filesystem::path ExecutableDirectory(const char* argv0) {
 
 // “./main_rm75”唯一使用的本机默认配置。带其他参数的调用仍走
 // ParseOptions 的显式配置和校验，因此不会静默继承这套真机参数。
-void ApplyImplicitCommissioningProfile(const char* argv0,
+void ApplyImplicitProductionProfile(const char* argv0,
                                        RobotRuntimeConfig& options) {
     const std::filesystem::path executable_directory = ExecutableDirectory(argv0);
     options = MakeImplicitRm75ProductionConfig(
@@ -123,6 +126,7 @@ void Usage(const char* program) {
         << "    envelope applies only before contact, not to the Tool-X scan.\n\n"
         << "Safe modes (default is observe):\n"
         << "  --observe             acquire/publish only; never plan or send motion\n"
+        << "  --check-force-calibration  verify production calibration/STL offline; no device connections\n"
         << "  --wrist-unlimited-translation  candidate trial only: disable TCP displacement gate\n"
         << "  --wrist-unlimited-excursion  candidate trial only: disable total displacement/rotation gates\n"
         << "  --wrist-unlimited-position-tracking-error  candidate trial only: disable actual TCP position tracking error gate\n"
@@ -200,6 +204,8 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
         if (argument == "--help" || argument == "-h") {
             Usage(argv[0]);
             std::exit(0);
+        } else if (argument == "--check-force-calibration") {
+            options.check_force_calibration = true;
         } else if (argument == "--observe") {
             options.mode = ControllerMode::kObserve;
         } else if (argument == "--wrist-unlimited-translation") {
@@ -490,13 +496,14 @@ RuntimeTareResult CollectRuntimeTare(
         result.error = message.str();
         return result;
     }
-    if (result.maximum_force_deviation_n > 0.25
+    if (result.maximum_force_deviation_n > kRuntimeTareMaximumForceDeviationN
         || result.maximum_torque_deviation_nm > 0.02) {
         std::ostringstream message;
         message << "runtime tare residual wrench is not stable"
                 << " (force_deviation_n="
                 << result.maximum_force_deviation_n
-                << ", limit=0.25; torque_deviation_nm="
+                << ", limit=" << kRuntimeTareMaximumForceDeviationN
+                << "; torque_deviation_nm="
                 << result.maximum_torque_deviation_nm
                 << ", limit=0.02)";
         result.error = message.str();
@@ -536,8 +543,11 @@ int main(int argc, char** argv) {
     // 4.1 选择配置来源并执行真机运行前的参数约束。
     // 无参数调用使用固定的 Redis 视觉闭环配置；其他形式必须完整显式传参。
     RobotRuntimeConfig options;
-    if (argc == 1) {
-        ApplyImplicitCommissioningProfile(argv[0], options);
+    const bool calibration_check_requested = std::any_of(argv+1,argv+argc,[](const char* arg) {
+        return std::string(arg)=="--check-force-calibration";
+    });
+    if (argc == 1 || calibration_check_requested) {
+        ApplyImplicitProductionProfile(argv[0], options);
     }
     if (!ParseOptions(argc, argv, options)) {
         Usage(argv[0]);
@@ -568,9 +578,9 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (options.mode == ControllerMode::kExecute
-        && !provisional_execute && options.tare_no_contact_s > 0) {
-        std::cerr << "Runtime tare in execute requires the explicit provisional "
-                     "commissioning override\n";
+        && options.tare_no_contact_s > 0
+        && options.tare_no_contact_s < options.execute_warmup_s) {
+        std::cerr << "Execute tare must be at least as long as the mandatory force warm-up\n";
         return 3;
     }
     if (provisional_execute) {
@@ -680,6 +690,11 @@ int main(int argc, char** argv) {
     // 除设备 ID 外，还校验 STL 的 SHA-256，防止使用错误探头模型进行接触估计。
     ForceCalibration calibration;
     std::string error;
+    std::string calibration_sha256;
+    if (!ComputeFileSha256(options.calibration_path, calibration_sha256, &error)) {
+        std::cerr << "Calibration digest failed: " << error << '\n';
+        return 3;
+    }
     if (!calibration.LoadJson(options.calibration_path, &error)) {
         std::cerr << "Calibration rejected: " << error << '\n';
         return 3;
@@ -708,15 +723,16 @@ int main(int argc, char** argv) {
         std::cerr << "Calibration probe_model_sha256 does not match selected STL\n";
         return 3;
     }
-    if (options.mode == ControllerMode::kExecute) {
-        if (!options.wrist_no_force && options.expected_sensor_id.empty()) {
+    if (options.mode == ControllerMode::kExecute || options.check_force_calibration) {
+        const bool require_force_calibration = !options.wrist_no_force || options.check_force_calibration;
+        if (require_force_calibration && options.expected_sensor_id.empty()) {
             std::cerr << "Execute rejected: --expected-sensor-id is required\n";
             return 3;
         }
         if (!calibration.tool_chain_verified
-            || (!options.wrist_no_force && !calibration.calibration_residuals_verified)
+            || (require_force_calibration && !calibration.calibration_residuals_verified)
             || calibration_probe_sha256.empty()) {
-            if (!provisional_execute || calibration_probe_sha256.empty()) {
+            if (!provisional_execute || options.check_force_calibration || calibration_probe_sha256.empty()) {
                 std::cerr << "Execute rejected: verified residuals, R/t/TCP and "
                              "probe SHA-256 are required\n";
                 return 3;
@@ -744,6 +760,25 @@ int main(int argc, char** argv) {
     if (!contact_locator.LoadSTL(options.probe_model_path)) {
         std::cerr << "Probe model rejected: " << contact_locator.lastError() << '\n';
         return 3;
+    }
+
+    std::string confirmed_calibration_sha256;
+    if (!ComputeFileSha256(options.calibration_path,confirmed_calibration_sha256,&error)
+        || confirmed_calibration_sha256!=calibration_sha256) {
+        std::cerr << "Calibration changed during startup; restart with a stable calibration file\n";
+        return 3;
+    }
+    std::cout << "force_calibration_path: " << options.calibration_path
+              << "\nforce_calibration_sha256: " << calibration_sha256
+              << "\nforce_calibration_created_at: " << calibration.created_at
+              << "\nforce_calibration_sensor_id: " << calibration.sensor_id
+              << "\nforce_calibration_residuals_verified: " << (calibration.calibration_residuals_verified?"yes":"no")
+              << "\nforce_calibration_max_residual: " << calibration.force_residual_max_n
+              << " N / " << calibration.torque_residual_max_nm << " N*m\n"
+              << "startup_tare_seconds: " << options.tare_no_contact_s << '\n';
+    if (options.check_force_calibration) {
+        std::cout << "Force calibration check passed; no device connections or motion commands.\n";
+        return 0;
     }
 
     // 4.3 组装控制律、七轴规划器、Redis 和日志模块。
@@ -908,7 +943,7 @@ int main(int argc, char** argv) {
             return 130;
         }
         if (!options.wrist_no_force) {
-        const int warmup_seconds = provisional_execute
+        const int warmup_seconds = options.tare_no_contact_s > 0
             ? options.tare_no_contact_s
             : options.execute_warmup_s;
         std::cout << "Running mandatory no-contact force warm-up for "
@@ -957,16 +992,22 @@ int main(int argc, char** argv) {
                 return 5;
             }
             runtime_tare_applied = true;
-        } else if (runtime_tare.maximum_force_norm_n > 0.5
-                   || runtime_tare.maximum_torque_norm_nm > 0.05) {
+        } else if (runtime_tare.maximum_force_norm_n > kVerifiedWarmupMaximumForceNormN
+                   || runtime_tare.maximum_torque_norm_nm > kVerifiedWarmupMaximumTorqueNormNm) {
             std::cerr << "Execute warm-up failed: samples="
                       << runtime_tare.samples
                       << " force_max_n=" << runtime_tare.maximum_force_norm_n
                       << " torque_max_nm="
                       << runtime_tare.maximum_torque_norm_nm
-                      << " (required <= 0.5 N / 0.05 N*m)\n";
+                      << " (required <= " << kVerifiedWarmupMaximumForceNormN
+                      << " N / " << kVerifiedWarmupMaximumTorqueNormNm << " N*m)\n";
             return 5;
         }
+        // Verified calibration still owns gravity/CoM compensation. An
+        // explicitly enabled startup tare only removes this run's small,
+        // stable residual mean after all existing no-contact gates pass.
+        if (!provisional_execute && options.tare_no_contact_s > 0)
+            runtime_tare_applied = true;
         } // Force warmup is absent only in explicit wrist-no-force mode.
         robot_state = state_reader->Latest();
     } else if (options.tare_no_contact_s > 0) {
@@ -2253,6 +2294,7 @@ int main(int argc, char** argv) {
                 : SystemNs(force_sample.timestamp);
             message.raw_wrench_sensor = raw_wrench;
             message.compensated_wrench_tool = compensated.tool;
+            message.runtime_tare_applied = runtime_tare_applied;
             message.legacy_contact_point_sensor_m = contact.point;
             if (contact.valid) {
                 message.contact_point_probe_m =
@@ -2542,6 +2584,8 @@ int main(int argc, char** argv) {
     summary_data.configuration_profile = options.implicit_commissioning_profile
         ? kImplicitRm75ProfileName : "explicit_cli";
     summary_data.calibration = calibration;
+    summary_data.calibration_path = options.calibration_path;
+    summary_data.calibration_sha256 = calibration_sha256;
     summary_data.selected_probe_sha256 = selected_probe_sha256;
     summary_data.probe_tcp_arm_tip_m = frame_chain.ProbeTcpArmTipM();
 

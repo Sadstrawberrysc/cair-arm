@@ -21,19 +21,14 @@ struct ForceCalibrationCaptureObservation {
     WrenchSample wrench;
 };
 
-// All motion limits are maximum spans over any two observations in the
-// window. SI units are used throughout.
+// Pairing and averaging-window requirements; motion spans are diagnostic only.
 struct ForceCalibrationCaptureLimits {
     std::size_t minimum_samples = 2;
     std::chrono::milliseconds maximum_pair_time_delta{20};
     // A capture must span real time as well as contain distinct sequence
     // numbers. This rejects response bursts/backlogs that would otherwise
-    // masquerade as a stationary averaging window.
+    // masquerade as a real averaging interval.
     std::chrono::milliseconds minimum_window_duration{500};
-    double maximum_joint_span_rad = 0.02 * 3.14159265358979323846 / 180.0;
-    double maximum_position_span_m = 0.0001;
-    double maximum_orientation_span_rad =
-        0.08 * 3.14159265358979323846 / 180.0;
 };
 
 enum class ForceCalibrationCaptureError {
@@ -56,7 +51,7 @@ enum class ForceCalibrationCaptureError {
     kRobotTimestampNotIncreasing,
     kSensorTimestampNotIncreasing,
     kWindowTooShort,
-    kWindowMotion,
+    kWrenchLimitExceeded,
 };
 
 const char* ForceCalibrationCaptureErrorString(
@@ -86,7 +81,7 @@ struct ForceCalibrationCaptureResult {
     ForceCalibrationCaptureDiagnostics diagnostics;
 };
 
-// Validates a stationary, synchronized no-contact capture window and reduces
+// Validates a paired, no-contact averaging window and reduces
 // it to one calibration sample. This function performs no I/O and never reads
 // the current clock, so recorded windows have deterministic results.
 ForceCalibrationCaptureResult CaptureForceCalibrationWindow(

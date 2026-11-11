@@ -123,12 +123,17 @@ public:
                              int timeout_ms = 1000);
     RMResult TryReadL(Eigen::Matrix<double, 6, 1>& pose,
                       int timeout_ms = 1000);
+    // Optional cancellation polls at most 100 ms apart while waiting. A sent
+    // move is cancelled with an explicitly acknowledged StopMotion; this is
+    // not a stationary-state confirmation. A pre-cancelled call sends nothing.
     RMResult TryMoveJ(const Eigen::Matrix<double, 7, 1>& joints,
                       int velo,
-                      int timeout_ms = 30000);
+                      int timeout_ms = 30000,
+                      const std::atomic<bool>* cancel = nullptr);
     RMResult TryMoveL(const Eigen::Matrix<double, 6, 1>& pose,
                       int velo,
-                      int timeout_ms = 30000);
+                      int timeout_ms = 30000,
+                      const std::atomic<bool>* cancel = nullptr);
     RMResult TryMoveJP(const Eigen::Matrix<double, 6, 1>& pose,
                        int velo,
                        int timeout_ms = 30000);
@@ -165,7 +170,9 @@ private:
                       bool low_priority = false);
     RMResult ReceiveJsonLocked(nlohmann::json& response, int timeout_ms);
     RMResult DrainInputLocked();
-    RMResult WaitTrajectoryResponseLocked(const char* label, int timeout_ms);
+    RMResult WaitTrajectoryResponseLocked(
+        const char* label, int timeout_ms,
+        const std::atomic<bool>* cancel = nullptr);
     RMResult AcquireAsyncReceiver();
     void ReleaseAsyncReceiver();
     void StoreLastResult(const RMResult& result);

@@ -473,8 +473,8 @@
   <joint name="camera_mount" type="fixed">
     <parent link="Link7" />
     <child link="camera_link" />
-    <!-- Direction corrected by user: -60 deg about Link7 +Z (right-hand rule). -->
-    <origin xyz="0 0 0" rpy="0 0 -1.0471975511965976" />
+    <!-- 2026-11-09: user corrected front/back by +180 deg about Link7 Z: -60 -> +120 deg. -->
+    <origin xyz="0 0 0" rpy="0 0 2.0943951023931953" />
   </joint>
 
   <!-- connector: preview mounting and CAD datum; both require physical verification. -->
@@ -497,7 +497,7 @@
     <parent link="camera_link" />
     <child link="connector_link" />
     <!-- Cancel camera yaw so connector and sensor retain their Link7 orientation. -->
-    <origin xyz="0 0 0.010" rpy="0 0 1.0471975511965976" />
+    <origin xyz="0 0 0.010" rpy="0 0 -2.0943951023931953" />
   </joint>
 
   <!-- force_sensor: preview mounting and CAD datum; both require physical verification. -->

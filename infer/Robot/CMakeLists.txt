@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.16)
 
 project(AutoRUSS_RM75 LANGUAGES CXX)
 
+# Seed a fresh build with the calibrated KWR57 profile. Runtime recalibration
+# owns an existing deployment file; configuring/building must not overwrite it.
+if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/rm75_force_calibration.json")
+    configure_file(config/force_calibration.kwr57.json
+        "${CMAKE_CURRENT_BINARY_DIR}/rm75_force_calibration.json" COPYONLY)
+endif()
+
 include(CTest)
 
 find_package(Threads REQUIRED)
@@ -12,6 +19,7 @@ find_library(HIREDIS_LIB hiredis REQUIRED)
 option(BUILD_MAINTENANCE_TOOLS
        "Build retained robot diagnostics and sensor calibration utilities"
        OFF)
+option(BUILD_CALIBRATION_SELF_COLLISION "Enable FCL guards and offline calibration filtering" OFF)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -66,6 +74,14 @@ target_link_libraries(robot_sensor PUBLIC
     Threads::Threads
     OpenSSL::Crypto
 )
+
+if(BUILD_MAINTENANCE_TOOLS OR BUILD_TESTING)
+    add_library(force_calibration_path STATIC
+        tests/tools/force_calibration_path.cpp
+    )
+    target_include_directories(force_calibration_path PUBLIC tests/tools)
+    target_link_libraries(force_calibration_path PUBLIC rm75_motion robot_sensor)
+endif()
 
 # Immutable Base -> Arm_Tip -> Tool/Sensor -> Probe TCP transform chain.
 add_library(rm75_frame_chain STATIC
@@ -146,7 +162,28 @@ if(BUILD_MAINTENANCE_TOOLS)
     target_link_libraries(force_sensor_calibration_capture PRIVATE
         realman_transport
         robot_sensor
+        force_calibration_path
     )
+    if(BUILD_CALIBRATION_SELF_COLLISION)
+        find_package(fcl 0.7 REQUIRED CONFIG)
+        set(BUILD_COLLISION_CHECKING ON)
+        set(BUILD_COLLISION_MONITOR OFF)
+        set(BUILD_COLLISION_PLANNING OFF)
+        set(BUILD_REALSENSE_SOURCE OFF)
+        set(BUILD_MONITOR_VIEWER OFF)
+        add_subdirectory(../Collision collision_calibration)
+        target_compile_definitions(force_sensor_calibration_capture PRIVATE CALIBRATION_HAS_SELF_COLLISION=1)
+        target_link_libraries(force_sensor_calibration_capture PRIVATE collision_checking)
+        add_executable(force_calibration_filter tests/tools/force_calibration_filter.cpp)
+        target_include_directories(force_calibration_filter PRIVATE tests/tools)
+        target_link_libraries(force_calibration_filter PRIVATE force_calibration_path collision_checking)
+        # The local FCL prefix includes transitive libraries (e.g. libccd).
+        # DT_RPATH lets standalone commands resolve those without shell setup.
+        foreach(calibration_target force_sensor_calibration_capture force_calibration_filter)
+            set_property(TARGET ${calibration_target} PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:fcl>")
+            target_link_options(${calibration_target} PRIVATE "LINKER:--disable-new-dtags")
+        endforeach()
+    endif()
 endif()
 
 # Single migrated RM75 production controller. Keep the entry/orchestration
@@ -217,5 +254,62 @@ if(BUILD_TESTING)
             runtime_schema_test
             runtime_config_test
             frame_chain_test
+            force_calibration_path_test
+            transport_test
     )
+    add_executable(force_calibration_path_test tests/offline/force_calibration_path_test.cpp)
+    target_link_libraries(force_calibration_path_test PRIVATE force_calibration_path)
+    add_test(NAME force_calibration_path_test COMMAND force_calibration_path_test)
+
+    add_executable(transport_test tests/offline/transport_test.cpp)
+    target_link_libraries(transport_test PRIVATE realman_transport)
+    add_test(NAME transport_test COMMAND transport_test)
+
+    if(BUILD_MAINTENANCE_TOOLS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME probe_reach_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/probe_reach_test.py
+                $<TARGET_FILE:arm_probe_pose>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tool_chain_verified.json)
+        add_dependencies(robot_offline_tests arm_probe_pose)
+        add_test(NAME force_runtime_calibration_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_runtime_calibration_test.py
+                --controller $<TARGET_FILE:main_rm75>
+                --calibration ${CMAKE_CURRENT_SOURCE_DIR}/config/force_calibration.kwr57.json
+                --probe ${CMAKE_CURRENT_SOURCE_DIR}/model/Lprobe-IFS.STL)
+        add_dependencies(robot_offline_tests main_rm75)
+        add_test(NAME force_calibration_robust_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_robust_test.py
+                --fit $<TARGET_FILE:force_sensor_calibrate>)
+        if(BUILD_CALIBRATION_SELF_COLLISION)
+            add_test(NAME force_calibration_self_collision_test
+                COMMAND ${Python3_EXECUTABLE} -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_self_collision_test.py
+                    --filter $<TARGET_FILE:force_calibration_filter>
+                    --capture $<TARGET_FILE:force_sensor_calibration_capture>)
+            add_dependencies(robot_offline_tests force_calibration_filter)
+        endif()
+        add_test(NAME force_calibration_cli_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_cli_test.py)
+        add_test(NAME force_calibration_resume_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_resume_test.py
+                --capture $<TARGET_FILE:force_sensor_calibration_capture>)
+        add_test(NAME force_calibration_limit_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_limit_test.py
+                --capture $<TARGET_FILE:force_sensor_calibration_capture>)
+        add_test(NAME force_calibration_auto_test
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/offline/force_calibration_auto_test.py
+                --capture $<TARGET_FILE:force_sensor_calibration_capture>
+                --fit $<TARGET_FILE:force_sensor_calibrate>
+        )
+        set_tests_properties(force_calibration_auto_test PROPERTIES TIMEOUT 120)
+        add_dependencies(robot_offline_tests force_sensor_calibration_capture force_sensor_calibrate)
+    endif()
 endif()

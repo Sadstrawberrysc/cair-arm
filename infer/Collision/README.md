@@ -529,4 +529,4 @@ Collision 的 CMake 功能构建及几何、FCL、监测和 OMPL 入口已建立
 - 将监督接到腕部跟随与接触扫描前，单独定义探头可接触的局部体表、方向、力和允许误差；其他连杆及附件继续避障，不能全局禁用人体碰撞。
 - 正式落地跨模块接口和控制权策略时，在 [DECISIONS.md](../../DECISIONS.md) 追加对应决策，同步 [系统架构](../../ARCHITECTURE.md)、[Robot 架构](../Robot/ARCHITECTURE.md)、[Camera_RT 架构](../Camera_RT/ARCHITECTURE.md) 和运行文档。本次仅落实独立几何基础和离线入口，尚未改变生产控制接口。
 
-相机与标定操作参考 [Camera_RT 操作](../../.runme/run/camera-rt-operations.md)、[标定说明](../hand_eye_calibration-main/README.md) 和 [标定操作](../../.runme/run/calibration-operations.md)。现有定位入口和机器人生产入口可能发送真实运动；本文不是执行这些入口的启动脚本。
+相机与标定操作参考 [Camera_RT 操作](../../.runme/run/camera-rt-operations.md)、[标定说明](../hand_eye_calibration-main/README.md) 和 [标定操作](../../.runme/run/calibration_camera.md)。现有定位入口和机器人生产入口可能发送真实运动；本文不是执行这些入口的启动脚本。

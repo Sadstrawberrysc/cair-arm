@@ -198,4 +198,39 @@ class ClickSessionTests(unittest.TestCase):
             recovery.accept_state(session, hold, time.monotonic_ns())
         self.assertFalse(recovery.waiting)
 
+    def test_observation_age_hold_requires_pause_ack_and_fresh_new_target(self):
+        session, recovery, request = self.active_model_session()
+        old_target = session.target
+        hold = self.timing_hold(session, request,
+                               follow_reason='wrist_observation_missing_stale_or_mismatched')
+        changed, pause = recovery.accept_state(session, hold, time.monotonic_ns())
+        self.assertTrue(changed)
+        self.assertEqual(pause['action'], 'pause')
+        self.assertEqual(pause['target_id'], old_target)
+        self.assertFalse(recovery.ready(session, time.monotonic_ns()))
+        self.ack_pause(session, pause, sequence=session.last_state_sequence+1, target_id=old_target)
+        self.assertTrue(recovery.ready(session, time.monotonic_ns()))
+        session.select()
+        now = time.monotonic_ns()
+        fresh = dict(valid=True, capture_monotonic_ns=now)
+        self.assertIsNone(recovery.resume(session, fresh, now))  # No new target echo yet.
+        self.ack_pause(session, pause, sequence=session.last_state_sequence+1)
+        now = time.monotonic_ns()
+        for invalid in (dict(image_valid=True, pixel=[10, 10], capture_monotonic_ns=now),
+                        dict(valid=False), dict(valid=True, capture_monotonic_ns=now-300_000_000)):
+            self.assertIsNone(recovery.resume(session, invalid, now))
+        packet = recovery.resume(session, fresh, now)
+        self.assertEqual(packet['action'], 'resume')
+        self.assertNotEqual(packet['target_id'], old_target)
+
+    def test_observation_age_hold_cannot_recover_foreign_fault_or_cancelled_intent(self):
+        for changes in (dict(request_producer_id='other'), dict(control_state='fault'),
+                        dict(target_id='other-target'), dict(runtime_session_id='other-run')):
+            session, recovery, request = self.active_model_session()
+            hold = self.timing_hold(session, request,
+                                   follow_reason='wrist_observation_missing_stale_or_mismatched')
+            hold.update(changes)
+            self.assertIsNone(recovery.accept_state(session, hold, time.monotonic_ns())[1])
+            self.assertFalse(recovery.waiting)
+
 if __name__=='__main__':unittest.main()

@@ -3,7 +3,29 @@
 > 本文件是纳入 Git 的 Runme notebook；当前架构见
 > `infer/Camera_RT/ARCHITECTURE.md`。
 
-更新日期：2026-10-12
+更新日期：2026-11-10
+
+## 2026-11-10 首次 MoveJ_P 后退距离调整为 10 cm
+
+按用户要求，初始定位沿 Tool -Z 的偏置从 -0.200 m 改为 -0.100 m，
+即距采样表面由 20 cm 改为 10 cm。保留姿态、速度及运动前几何臂展检查。
+8 项离线交接 / 姿态测试通过；未执行真实机械臂运动。下方 20 cm 记录保留为历史。
+
+## 2026-11-10 初始目标超出臂展的拦截
+
+现场日志显示，20 cm 后退目标姿态需要腕心距肩部 664.472 mm，超过 RM75 两段臂长
+合计 466 mm，超出约 198.472 mm；最终 J4=-0.053° 接近伸直，TCP 误差 198.328 mm，
+姿态误差 0.049°。控制器虽返回 trajectory_state=true，仍未到达位置目标，最终验收正确阻止串联继续。
+离线 FK 与日志起止位置一致到 0.005 mm 内，支持该臂展诊断。
+`arm_probe_pose` 新增运动前几何必要条件检查，完整目标在连接控制器前即拒绝超界；
+不缩短 20 cm 偏置、不放宽验收、不自动重试。此检查通过也不证明完整 IK 或碰撞可行。
+已构建定位工具并通过离线回归；未连接或运动真实机械臂。
+
+## 2026-11-10 首次 MoveJ_P 再远离 15 cm
+
+`run_probe_target.py` 初始定位沿 Tool -Z 的偏置从 -0.050 m 改为 -0.200 m，
+即距采样表面由 5 cm 增至 20 cm。姿态、速度及后续腕部跟随悬停设置保持不变。
+本轮仅作离线验证，未执行真实机械臂运动。
 
 ## 2026-10-12 初始末端朝向旋转 180°
 
@@ -39,12 +61,12 @@
 Camera_RT 负责 RealSense、Faster R-CNN、CLIFF / SMPL 解剖叠加及相机坐标快照；旧 YOLOv3 不在活动链路。
 当前使用左颈动脉 6 个模型顶点，像素 y 升序、顶部首点；法向随首点计算。旧记录中的左侧 8 点和底部优先属于历史。
 
-下游 `run_probe_target.py` 读取本轮新快照，用 D455 外参转换首点并构造短轴姿态，沿 Tool -Z 后退 50 mm，
-调用 `arm_probe_pose --controller-movej-p`。默认速度 3、会真实运动；`--dry-run` 仅预览，不验证控制器 IK / 可达性。
+下游 `run_probe_target.py` 读取本轮新快照，用 D455 外参转换首点并构造短轴姿态，沿 Tool -Z 后退 100 mm，
+调用 `arm_probe_pose --controller-movej-p`。默认速度 3、会真实运动；`--dry-run` 预览并检查几何臂展上界，不验证完整控制器 IK / 可达性。
 历史 `infer/Calibration` 目录已不存在，accepted Base 路径不是当前串联入口。
 
 2026-10-30 已按授权部署新 D455 50 组标定结果，`user_confirmed=true`、独立验证 false，未叠加旧经验修正；
-同批次位置一致性 RMS 2.670 mm、max 7.487 mm。标定入口见[说明](../../infer/hand_eye_calibration-main/README.md)，部署记录见[末端替换](../run/end-effector-replacement.md)。
+同批次位置一致性 RMS 2.670 mm、max 7.487 mm。标定入口见[说明](../../infer/hand_eye_calibration-main/README.md)，部署记录见[本文件外参部署记录](#2026-10-30-全局相机外参已部署)。
 
 ## 历史基础验证
 
@@ -117,3 +139,11 @@ python tools/preflight.py --runtime
 2. 使用部署外参做独立已知点验证，复核新装配 TCP 与深度误差。
 3. 按[初始定位手册](../run/camera-rt-operations.md)先预览，再在现场条件满足时执行单次定位。
 4. 补无人体检测、无效深度恢复及快照元数据；现有预检 / 格式测试不能替代空间精度验收。
+
+## 2026-10-30 全局相机外参已部署
+
+全局 D455 移动后的 50 组数据已离线求解，并按用户明确指令直接覆盖现有
+`infer/hand_eye_calibration-main/d455_to_rm75_base.json`。
+`user_confirmed=true`、`independent_validation_recorded=false`；未叠加旧经验修正。
+同批次位置一致性 RMS 2.670 mm、最大 7.487 mm；独立几何/定位及真机验证仍待完成。
+部署批次与摘要可从 `d455_to_rm75_base.json` 核查；采集 / 求解步骤见 [标定操作](../run/calibration_camera.md)。

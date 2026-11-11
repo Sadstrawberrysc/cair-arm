@@ -1,5 +1,6 @@
-"""Explicit Gemini 305 acquisition profile for surfaces around 80 mm away."""
+"""Explicit Gemini 305 RGB-D profile for neck surfaces around 300 mm away."""
 WIDTH, HEIGHT, FPS = 640, 480, 30
+DISPARITY_SEARCH_RANGE, DISPARITY_MODE = 128, 1
 
 
 def configure_close_range(device, ob):
@@ -16,18 +17,19 @@ def configure_close_range(device, ob):
     if len(matches) != 1:
         raise ValueError('Unique Close-Range preset unavailable; device presets: %r' % names)
     device.load_preset(matches[0])
-    # SDK mode enum: 1 = 128 disparities, 2 = 256 (not integer 256).
+    # Keep the selected Default preset and 128-disparity mode when changing
+    # resolution. SDK enum 1 means 128 disparities.
     prop = ob.OBPropertyID.OB_PROP_DISP_SEARCH_RANGE_MODE_INT
-    device.set_int_property(prop, 2)
+    device.set_int_property(prop, DISPARITY_MODE)
     actual = device.get_int_property(prop)
     preset = device.get_current_preset_name()
-    if actual != 2 or preset != matches[0]:
+    if actual != DISPARITY_MODE or preset != matches[0]:
         raise ValueError('Close-Range readback failed: preset=%r disparity_mode=%r' % (preset, actual))
     settings = dict(type='camera_configuration', preset=preset,
-                    disparity_search_range=256, disparity_mode=actual,
+                    disparity_search_range=DISPARITY_SEARCH_RANGE, disparity_mode=actual,
                     width=WIDTH, height=HEIGHT, fps=FPS)
-    print('Gemini: %s; disparity=256; requested RGB/depth=%dx%d @ %d FPS' %
-          (preset, WIDTH, HEIGHT, FPS))
+    print('Gemini: %s; disparity=%d; requested RGB/depth=%dx%d @ %d FPS' %
+          (preset, DISPARITY_SEARCH_RANGE, WIDTH, HEIGHT, FPS))
     return settings
 
 

@@ -791,14 +791,31 @@ RMResult RMCommand::TryReadL(Eigen::Matrix<double, 6, 1>& pose,
 }
 
 RMResult RMCommand::WaitTrajectoryResponseLocked(const char* label,
-                                                 int timeout_ms) {
+                                                 int timeout_ms,
+                                                 const std::atomic<bool>* cancel) {
     // MoveJ/MoveL/MoveJ_P 需要等待轨迹完成确认；ServoJ 不走这个阻塞路径。
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
+        if (cancel != nullptr && cancel->load()) {
+            return RMResult::Failure(RMErrorCode::kRobotRejected,
+                                     std::string(label) + " cancelled");
+        }
         nlohmann::json response;
+        const int remaining_ms = RemainingMilliseconds(deadline);
         RMResult result =
-            ReceiveJsonLocked(response, RemainingMilliseconds(deadline));
+            ReceiveJsonLocked(response, cancel != nullptr
+                                            ? std::min(remaining_ms, 100)
+                                            : remaining_ms);
+        if (cancel != nullptr && cancel->load()) {
+            return RMResult::Failure(RMErrorCode::kRobotRejected,
+                                     std::string(label) + " cancelled");
+        }
+        if (!result && result.code == RMErrorCode::kTimeout
+            && cancel != nullptr
+            && std::chrono::steady_clock::now() < deadline) {
+            continue;
+        }
         if (!result) return result;
 
         if (!quiet_) {
@@ -843,7 +860,14 @@ RMResult RMCommand::WaitTrajectoryResponseLocked(const char* label,
 
 RMResult RMCommand::TryMoveJ(const Eigen::Matrix<double, 7, 1>& joints,
                              int velo,
-                             int timeout_ms) {
+                             int timeout_ms,
+                             const std::atomic<bool>* cancel) {
+    if (cancel != nullptr && cancel->load()) {
+        const RMResult result = RMResult::Failure(
+            RMErrorCode::kRobotRejected, "MoveJ cancelled before sending");
+        StoreLastResult(result);
+        return result;
+    }
     if (!AllFinite(joints)) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kInvalidArgument, "MoveJ joints must be finite");
@@ -865,10 +889,33 @@ RMResult RMCommand::TryMoveJ(const Eigen::Matrix<double, 7, 1>& joints,
     request["r"] = 0;
     if (!quiet_) std::cout << request.dump() << std::endl;
 
-    std::lock_guard<std::mutex> receive_lock(receive_mutex_);
-    RMResult result = DrainInputLocked();
-    if (result) result = SendJson(request, "MoveJ");
-    if (result) result = WaitTrajectoryResponseLocked("MoveJ", timeout_ms);
+    RMResult result;
+    bool motion_sent = false;
+    {
+        std::lock_guard<std::mutex> receive_lock(receive_mutex_);
+        result = DrainInputLocked();
+        if (result && cancel != nullptr && cancel->load()) {
+            result = RMResult::Failure(
+                RMErrorCode::kRobotRejected, "MoveJ cancelled before sending");
+        }
+        if (result) {
+            result = SendJson(request, "MoveJ");
+            motion_sent = result.ok();
+        }
+        if (result) {
+            result = WaitTrajectoryResponseLocked("MoveJ", timeout_ms, cancel);
+        }
+    }
+    // Stop must acquire the receive lock itself. Never call it while the
+    // blocking trajectory wait owns that lock, and never report cancellation
+    // as arrival merely because a trajectory ACK raced with the request.
+    if (motion_sent && cancel != nullptr && cancel->load()) {
+        const RMResult stop = TryStopMotion(1000);
+        result = RMResult::Failure(
+            stop ? RMErrorCode::kRobotRejected : stop.code,
+            stop ? "MoveJ cancelled; StopMotion acknowledged"
+                 : "MoveJ cancelled; StopMotion failed: " + stop.message);
+    }
     if (result) StoreHoldTarget(joints);
     StoreLastResult(result);
     return result;
@@ -876,7 +923,14 @@ RMResult RMCommand::TryMoveJ(const Eigen::Matrix<double, 7, 1>& joints,
 
 RMResult RMCommand::TryMoveL(const Eigen::Matrix<double, 6, 1>& pose,
                              int velo,
-                             int timeout_ms) {
+                             int timeout_ms,
+                             const std::atomic<bool>* cancel) {
+    if (cancel != nullptr && cancel->load()) {
+        const RMResult result = RMResult::Failure(
+            RMErrorCode::kRobotRejected, "MoveL cancelled before sending");
+        StoreLastResult(result);
+        return result;
+    }
     if (!AllFinite(pose)) {
         const RMResult result = RMResult::Failure(
             RMErrorCode::kInvalidArgument, "MoveL pose must be finite");
@@ -898,10 +952,26 @@ RMResult RMCommand::TryMoveL(const Eigen::Matrix<double, 6, 1>& pose,
     request["r"] = 0;
     if (!quiet_) std::cout << request.dump() << std::endl;
 
-    std::lock_guard<std::mutex> receive_lock(receive_mutex_);
-    RMResult result = DrainInputLocked();
-    if (result) result = SendJson(request, "MoveL");
-    if (result) result = WaitTrajectoryResponseLocked("MoveL", timeout_ms);
+    RMResult result;
+    bool motion_sent = false;
+    {
+        std::lock_guard<std::mutex> receive_lock(receive_mutex_);
+        result = DrainInputLocked();
+        if (result && cancel != nullptr && cancel->load())
+            result = RMResult::Failure(RMErrorCode::kRobotRejected, "MoveL cancelled before sending");
+        if (result) {
+            result = SendJson(request, "MoveL");
+            motion_sent = result.ok();
+        }
+        if (result) result = WaitTrajectoryResponseLocked("MoveL", timeout_ms, cancel);
+    }
+    if (motion_sent && cancel != nullptr && cancel->load()) {
+        const RMResult stop = TryStopMotion(1000);
+        result = RMResult::Failure(
+            stop ? RMErrorCode::kRobotRejected : stop.code,
+            stop ? "MoveL cancelled; StopMotion acknowledged"
+                 : "MoveL cancelled; StopMotion failed: " + stop.message);
+    }
     StoreLastResult(result);
     return result;
 }

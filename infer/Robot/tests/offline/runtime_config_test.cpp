@@ -19,6 +19,15 @@ int main() {
     std::string error;
     ok &= Check(ValidateRobotRuntimeConfig(config, &error),
                 "implicit production configuration must validate");
+    ok &= Check(!config.allow_provisional_force_control && config.tare_no_contact_s==3
+                    && config.execute_warmup_s==2,
+                "production uses verified calibration plus 3-second startup tare without provisional override");
+    ok &= Check(config.sensor_protocol==ForceSensorProtocol::kKwr57Rs422
+                    && config.sensor_baud==460800 && config.expected_sensor_id=="KWR57"
+                    && config.calibration_path=="/opt/rm75/bin/rm75_force_calibration.json",
+                "production connects the calibrated KWR57 profile");
+    ok &= Check(config.EffectiveSafety().raw_torque_limit_nm==2.0,
+                "effective KWR57 torque protection remains 2 Nm");
     ok &= Check(config.control.desired_force_n == -2.0,
                 "effective force target remains -2 N");
     ok &= Check(config.control.approach_speed_m_s == 0.020,

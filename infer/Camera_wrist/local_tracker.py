@@ -3,46 +3,55 @@ import math
 import cv2
 import numpy as np
 from wrist_projection import depth_at
+from depth_diagnostics import (MIN_CONTINUOUS_NEIGHBORS, DepthNeighborhoodError,
+                               depth_cross, failure_details)
 
-STANDARD = dict(depth_jump=.005, min_points=50, plane_band=.003, inlier_ratio=.7,
-                spread=.002, rms=.002, target_residual=.003, features=12,
+SURFACE_RADIUS_M = .010
+
+STANDARD = dict(depth_jump=.030, min_points=10, plane_band=.003, inlier_ratio=.5,
+                spread=.002, rms=.002, target_residual=.003, features=6,
                 fb_px=1., affine_ratio=.6, scale_low=.9, scale_high=1.1,
                 determinant_low=.81, determinant_high=1.21, affine_reproj_px=1.,
                 pixel_jump=15., position_jump=.01)
-RELAXED = dict(depth_jump=.008, min_points=35, plane_band=.004, inlier_ratio=.55,
-               spread=.0015, rms=.0035, target_residual=.0045, features=8,
+RELAXED = dict(depth_jump=.030, min_points=10, plane_band=.003, inlier_ratio=.5,
+               spread=.0015, rms=.0035, target_residual=.0045, features=6,
                fb_px=1.5, affine_ratio=.5, scale_low=.85, scale_high=1.15,
                determinant_low=.72, determinant_high=1.32, affine_reproj_px=1.5,
                pixel_jump=20., position_jump=.015)
 
 
 def surface(depth, pixel, k, distortion, *, relaxed=False):
-    """Metric 15 mm neighbourhood; robust plane, oriented toward camera."""
+    """Metric 10 mm neighbourhood; robust plane, oriented toward camera."""
     limits = RELAXED if relaxed else STANDARD
-    z = depth_at(depth, pixel)
+    try:
+        z = depth_at(depth, pixel)
+    except ValueError as error:
+        raise DepthNeighborhoodError(str(error), depth_cross(depth, pixel, limits['depth_jump'])) from error
     ray = cv2.undistortPoints(np.asarray(pixel, np.float64).reshape(1, 1, 2), k, distortion).reshape(2)
     target = np.r_[ray, 1.] * z
     # Unproject actual pixel centres using the color distortion model.
-    radius = min(100, int(np.ceil(max(k[0, 0], k[1, 1]) * .015 / z * 1.5)) + 2)
+    radius = min(100, int(np.ceil(max(k[0, 0], k[1, 1]) * SURFACE_RADIUS_M / z * 1.5)) + 2)
     x, y = np.floor(pixel).astype(int)
     y0, y1 = max(0, y-radius), min(depth.shape[0], y+radius+1)
     x0, x1 = max(0, x-radius), min(depth.shape[1], x+radius+1)
     yy, xx = np.mgrid[y0:y1, x0:x1]
     values = depth[y0:y1, x0:x1]
-    valid = np.isfinite(values) & (values > 0) & (np.abs(values-z) < .015)
-    # Discard pixels bordering invalid depth or a selected depth discontinuity.
-    safe = valid.astype(np.uint8)
-    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-        neighbour = np.roll(values, (dy, dx), (0, 1))
-        safe &= (np.isfinite(neighbour) & (neighbour > 0) & (np.abs(values-neighbour) < limits["depth_jump"])).astype(np.uint8)
-    safe[[0, -1], :] = 0
-    safe[:, [0, -1]] = 0
+    valid = np.isfinite(values) & (values > 0) & (np.abs(values-z) < SURFACE_RADIUS_M)
+    # Count real in-bounds neighbors; padding avoids opposite-edge wraparound.
+    padded = np.pad(values, 1, mode='constant', constant_values=0)
+    count = np.zeros_like(values, dtype=np.uint8)
+    for neighbour in (padded[1:-1, :-2], padded[1:-1, 2:],
+                      padded[:-2, 1:-1], padded[2:, 1:-1]):
+        count += (np.isfinite(neighbour) & (neighbour > 0)
+                  & (np.abs(values-neighbour) < limits['depth_jump'])).astype(np.uint8)
+    safe = valid & (count >= MIN_CONTINUOUS_NEIGHBORS)
     if not safe[y-y0, x-x0]:
-        raise ValueError('target on invalid depth or depth edge')
+        raise DepthNeighborhoodError('target on invalid depth or depth edge',
+                                     depth_cross(depth, pixel, limits['depth_jump']))
     pixels = np.column_stack((xx[safe > 0], yy[safe > 0])).astype(np.float64)
     rays = cv2.undistortPoints(pixels.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
     cloud = np.column_stack((rays, np.ones(len(rays)))) * values[safe > 0, None]
-    cloud = cloud[np.linalg.norm(cloud-target, axis=1) <= .015]
+    cloud = cloud[np.linalg.norm(cloud-target, axis=1) <= SURFACE_RADIUS_M]
     if len(cloud) < limits['min_points']:
         raise ValueError('too few surface points')
     if len(cloud) > 2000:
@@ -67,12 +76,23 @@ def surface(depth, pixel, k, distortion, *, relaxed=False):
         raise ValueError('surface support nearly collinear')
     normal = vh[-1]
     rms = np.sqrt(np.mean(((points-centre) @ normal)**2))
-    if rms > limits['rms'] or abs((target-centre) @ normal) > limits['target_residual']:
-        raise ValueError('surface plane/target residual too large')
+    target_distance = float(abs((target-centre) @ normal))
+    reference_exceeded = []
+    if rms > limits['rms']:
+        reference_exceeded.append('plane_rms')
+    if target_distance > limits['target_residual']:
+        reference_exceeded.append('target_plane_distance')
+    metrics = dict(plane_rms_m=float(rms), plane_rms_limit_m=None,
+                   plane_rms_reference_m=limits['rms'],
+                   target_plane_distance_m=target_distance,
+                   target_plane_distance_limit_m=None,
+                   target_plane_distance_reference_m=limits['target_residual'],
+                   residual_gates_enabled=False, reference_exceeded=reference_exceeded,
+                   failed_checks=[])
     if normal @ target > 0:
         normal = -normal
-    return target, normal, dict(surface_points=int(len(points)), plane_rms_m=float(rms),
-                                plane_inlier_ratio=float(best.mean()))
+    return target, normal, dict(surface_points=int(len(points)),
+                               plane_inlier_ratio=float(best.mean()), **metrics)
 
 
 class LocalTracker:
@@ -123,16 +143,23 @@ class LocalTracker:
             return self.result(point, normal, quality)
         except (ValueError, cv2.error) as error:
             self.lose(error, force=True)
-            return dict(valid=False, reason=self.reason)
+            return self.failure_result(error, timestamp)
+
+    def failure_result(self, error, timestamp):
+        details = failure_details(error)
+        if details:
+            details['depth_neighborhood']['capture_monotonic_ns'] = int(timestamp)
+            self.debug.update(details)
+        result = dict(valid=False, reason=self.reason, **details)
+        return result
 
     def result(self, point, normal, quality):
         return dict(valid=True, reason='experimental_local_tracking', pixel=self.pixel.tolist(),
                     point_camera_m=point.tolist(), normal_out_camera=normal.tolist(),
                     capture_monotonic_ns=self.timestamp, quality=quality)
 
-    def update(self, image, depth, k, distortion, timestamp):
-        if not self.active:
-            return dict(valid=False, reason=self.reason)
+    def track_image(self, image, timestamp):
+        """Compute checked 2D flow without changing the stored reference frame."""
         self.debug = dict(capture_monotonic_ns=int(timestamp),
                           previous_capture_monotonic_ns=int(self.timestamp),
                           target_before_px=self.pixel.tolist(), feature_count=int(len(self.features)), stage='capture_time')
@@ -141,70 +168,76 @@ class LocalTracker:
         x0, y0, x1, y1 = bounds
         self.debug['crop_xyxy'] = list(bounds)
         self.debug_images = (self.gray[y0:y1, x0:x1].copy(), image[y0:y1, x0:x1].copy())
+        if not 0 < timestamp-self.timestamp <= 200_000_000:
+            raise ValueError('tracking capture gap or repeated frame')
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Coarse pyramid levels are unreliable when the ROI touches an image edge.
+        edge_distance = min(x, y, image.shape[1]-1-x, image.shape[0]-1-y)
+        pyramid_level = 1 if edge_distance < 80 else 3
+        self.debug['pyramid_level'] = pyramid_level
+        self.debug['stage'] = 'forward_lk'
+        nxt, status, _ = cv2.calcOpticalFlowPyrLK(self.gray, gray, self.features, None,
+                                               winSize=(21, 21), maxLevel=pyramid_level)
+        if nxt is None or status is None:
+            raise ValueError('forward optical flow failed')
+        self.debug['stage'] = 'backward_lk'
+        back, reverse, _ = cv2.calcOpticalFlowPyrLK(gray, self.gray, nxt, None,
+                                                 winSize=(21, 21), maxLevel=pyramid_level)
+        if back is None or reverse is None:
+            raise ValueError('backward optical flow failed')
+        valid = (status.ravel() > 0) & (reverse.ravel() > 0)
+        fb = np.linalg.norm(back-self.features, axis=2).ravel()
+        self.debug.update(forward_matches=int(status.sum()), backward_matches=int(reverse.sum()),
+                          fb_median_px=float(np.median(fb[np.isfinite(fb)])) if np.isfinite(fb).any() else None)
+        valid &= fb <= self.limits['fb_px']
+        old, new = self.features[valid].reshape(-1, 2), nxt[valid].reshape(-1, 2)
+        self.debug.update(fb_matches=int(len(old)), old_points=old.tolist(), new_points=new.tolist())
+        self.debug['stage'] = 'forward_backward_check'
+        if len(old) < self.limits['features']:
+            raise ValueError('fewer than %d forward-backward features' % self.limits['features'])
+        self.debug['stage'] = 'affine_consensus'
+        affine, mask = cv2.estimateAffine2D(old, new, method=cv2.RANSAC,
+                                                  ransacReprojThreshold=self.limits['affine_reproj_px'], maxIters=1000)
+        self.debug.update(affine=None if affine is None else affine.tolist(),
+                          inlier_mask=None if mask is None else mask.ravel().tolist(),
+                          affine_inliers=0 if mask is None else int(mask.sum()),
+                          affine_inlier_ratio=0. if mask is None else float(mask.mean()))
+        if (affine is None or mask is None or mask.sum() < self.limits['features']
+                or mask.mean() < self.limits['affine_ratio']):
+            raise ValueError('local affine consensus failed')
+        determinant = np.linalg.det(affine[:, :2])
+        scales = np.linalg.svd(affine[:, :2], compute_uv=False)
+        self.debug['affine_scales'] = scales.tolist()
+        self.debug['stage'] = 'affine_scale'
+        if (not self.limits['determinant_low'] <= determinant <= self.limits['determinant_high']
+                or scales.min() < self.limits['scale_low'] or scales.max() > self.limits['scale_high']):
+            raise ValueError('abnormal affine scale')
+        pixel = affine @ np.r_[self.pixel, 1.]
+        self.debug['stage'] = 'pixel_jump'
+        if np.linalg.norm(pixel-self.pixel) > self.limits['pixel_jump']:
+            raise ValueError('pixel jump exceeds %.0f px/frame' % self.limits['pixel_jump'])
+        self.debug['stage'] = 'feature_replenishment'
+        features = self._features(gray, pixel)
+        return gray, features, pixel, int(mask.sum())
+
+    def update(self, image, depth, k, distortion, timestamp):
+        if not self.active:
+            return dict(valid=False, reason=self.reason)
         try:
-            if not 0 < timestamp-self.timestamp <= 200_000_000:
-                raise ValueError('tracking capture gap or repeated frame')
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            # Coarse pyramid levels are unreliable when the ROI touches an image edge.
-            edge_distance = min(x, y, image.shape[1]-1-x, image.shape[0]-1-y)
-            pyramid_level = 1 if edge_distance < 80 else 3
-            self.debug['pyramid_level'] = pyramid_level
-            self.debug['stage'] = 'forward_lk'
-            nxt, status, _ = cv2.calcOpticalFlowPyrLK(self.gray, gray, self.features, None,
-                                                   winSize=(21, 21), maxLevel=pyramid_level)
-            if nxt is None or status is None:
-                raise ValueError('forward optical flow failed')
-            self.debug['stage'] = 'backward_lk'
-            back, reverse, _ = cv2.calcOpticalFlowPyrLK(gray, self.gray, nxt, None,
-                                                     winSize=(21, 21), maxLevel=pyramid_level)
-            if back is None or reverse is None:
-                raise ValueError('backward optical flow failed')
-            valid = (status.ravel() > 0) & (reverse.ravel() > 0)
-            fb = np.linalg.norm(back-self.features, axis=2).ravel()
-            self.debug.update(forward_matches=int(status.sum()), backward_matches=int(reverse.sum()),
-                              fb_median_px=float(np.median(fb[np.isfinite(fb)])) if np.isfinite(fb).any() else None)
-            valid &= fb <= self.limits['fb_px']
-            old, new = self.features[valid].reshape(-1, 2), nxt[valid].reshape(-1, 2)
-            self.debug.update(fb_matches=int(len(old)), old_points=old.tolist(), new_points=new.tolist())
-            self.debug['stage'] = 'forward_backward_check'
-            if len(old) < self.limits['features']:
-                raise ValueError('fewer than %d forward-backward features' % self.limits['features'])
-            self.debug['stage'] = 'affine_consensus'
-            affine, mask = cv2.estimateAffine2D(old, new, method=cv2.RANSAC,
-                                                      ransacReprojThreshold=self.limits['affine_reproj_px'], maxIters=1000)
-            self.debug.update(affine=None if affine is None else affine.tolist(),
-                              inlier_mask=None if mask is None else mask.ravel().tolist(),
-                              affine_inliers=0 if mask is None else int(mask.sum()),
-                              affine_inlier_ratio=0. if mask is None else float(mask.mean()))
-            if (affine is None or mask is None or mask.sum() < self.limits['features']
-                    or mask.mean() < self.limits['affine_ratio']):
-                raise ValueError('local affine consensus failed')
-            determinant = np.linalg.det(affine[:, :2])
-            scales = np.linalg.svd(affine[:, :2], compute_uv=False)
-            self.debug['affine_scales'] = scales.tolist()
-            self.debug['stage'] = 'affine_scale'
-            if (not self.limits['determinant_low'] <= determinant <= self.limits['determinant_high']
-                    or scales.min() < self.limits['scale_low'] or scales.max() > self.limits['scale_high']):
-                raise ValueError('abnormal affine scale')
-            pixel = affine @ np.r_[self.pixel, 1.]
-            self.debug['stage'] = 'pixel_jump'
-            if np.linalg.norm(pixel-self.pixel) > self.limits['pixel_jump']:
-                raise ValueError('pixel jump exceeds %.0f px/frame' % self.limits['pixel_jump'])
-            self.debug['stage'] = 'feature_replenishment'
-            features = self._features(gray, pixel)
+            gray, features, pixel, inliers = self.track_image(image, timestamp)
             self.debug['stage'] = 'surface_plane'
             point, normal, quality = surface(depth, pixel, k, distortion, relaxed=self.relaxed)
-            self.debug['stage'] = 'position_jump'
-            if np.linalg.norm(point-self.position) > self.limits['position_jump']:
-                raise ValueError('3D jump exceeds %.0f mm/frame' % (self.limits['position_jump']*1000))
-            quality.update(feature_inliers=int(mask.sum()), forward_backward_limit_px=self.limits['fb_px'])
+            quality.update(position_jump_m=float(np.linalg.norm(point-self.position)),
+                           position_jump_gate_enabled=False,
+                           position_jump_reference_m=self.limits['position_jump'])
+            quality.update(feature_inliers=inliers, forward_backward_limit_px=self.limits['fb_px'])
             self.gray, self.features, self.pixel = gray, features, pixel
             self.position, self.timestamp = point, timestamp
             self.debug['stage'] = 'accepted'
             return self.result(point, normal, quality)
         except (ValueError, cv2.error) as error:
             self.lose(error)
-            return dict(valid=False, reason=self.reason)
+            return self.failure_result(error, timestamp)
 
 
     def correct_from_detection(self, center_current, depth, k, distortion, timestamp,
@@ -228,14 +261,47 @@ class LocalTracker:
         try:
             point, normal, quality = surface(depth, candidate, k, distortion,
                                              relaxed=self.relaxed)
-            if np.linalg.norm(point-self.position) > self.limits['position_jump']:
-                raise ValueError('fused point exceeds 3D jump limit')
+            quality.update(position_jump_m=float(np.linalg.norm(point-self.position)),
+                           position_jump_gate_enabled=False,
+                           position_jump_reference_m=self.limits['position_jump'])
             features = self._features(self.gray, candidate)
         except (ValueError, cv2.error) as error:
             return None, str(error)
         self.pixel, self.position, self.features = candidate, point, features
         quality['feature_inliers'] = int(len(features))
         return self.result(point, normal, quality), None
+
+
+class ImagePointTracker(LocalTracker):
+    """Independent, display-only 2D flow; never supplies metric Robot targets."""
+    def adopt(self, source, result):
+        if (not source.active or not result.get('valid')
+                or source.timestamp != result.get('capture_monotonic_ns')):
+            return False
+        self.gray = source.gray.copy()
+        self.features = source.features.copy()
+        self.pixel = source.pixel.copy()
+        self.timestamp = source.timestamp
+        self.active, self.reason = True, ''
+        return True
+
+    def update(self, image, timestamp):
+        if not self.active:
+            return dict(image_valid=False, reason=self.reason)
+        try:
+            gray, features, pixel, _ = self.track_image(image, timestamp)
+            self.gray, self.features, self.pixel = gray, features, pixel
+            self.timestamp = timestamp
+            return self.result_2d()
+        except (ValueError, cv2.error) as error:
+            self.lose(error)
+            return dict(image_valid=False, reason=self.reason)
+
+    def result_2d(self):
+        if not self.active:
+            return dict(image_valid=False, reason=self.reason)
+        return dict(image_valid=True, pixel=self.pixel.tolist(),
+                    capture_monotonic_ns=self.timestamp)
 
 
 class DisplayPointSmoother:

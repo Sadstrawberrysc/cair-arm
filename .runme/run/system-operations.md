@@ -1,68 +1,118 @@
-# USPilot 常用启动入口（Runme notebook）
+# 全局定位 → 腕部跟随 → 超声扫描
 
-> 本文件只作为入口索引。连接设备、常驻进程和运动命令均排除 Run All，并应在对应模块
-> notebook 中核对前置条件后逐个执行。
+## 一键串联运行
 
-## 工作树状态
-
-```bash {"name":"git-status","excludeFromRunAll":"true"}
-git -C /home/cair-jacen/uspilot_ctrl-main status --short
+```bash {"background":"false","closeTerminalOnSuccess":"false","excludeFromRunAll":"true","interactive":"true","name":"start-scan-workflow","promptEnv":"never"}
+python3 /home/cair-jacen/uspilot_ctrl-main/scripts/run_scan_workflow.py
 ```
 
-## Redis 7777 状态
+执行一次后自动衔接各阶段，在同一终端显示进度；按键仍在对应图像窗口操作：
 
-```bash {"name":"redis-7777-ping","excludeFromRunAll":"true"}
-redis-cli -h 127.0.0.1 -p 7777 ping
+1. 全局相机：按 `s` 保存、`q` 退出，或 Esc 保存并退出，自动移动到初始点。
+2. 腕部相机：Robot 就绪后自动选点并跟随；定位完成且探头仍悬空时按 `q`。
+   脚本停止腕部 Robot，等待正常退出，再启动超声 Robot 与推理程序。
+3. 超声窗口：等待 Robot 的 3 秒悬空 tare 与预检通过，再按 `b` 接近、居中，按 `m` 扫描。
+   完成后按 `q`，脚本自动停止超声 Robot 并结束。
+
+超声 Robot 的 3 秒悬空启动预检要求：应用本次 tare 前，最大补偿合力 ≤4 N、
+最大补偿合力矩 ≤0.1 N·m；同时保留静止、采样健康和力稳定性检查。
+
+启动前停止其他机器人控制程序和串口直连程序。终端按 `Ctrl+C` 中止整条流程；
+阶段异常或 Robot 未正常退出时停止后续启动。Redis 会复用或自动启动，结束后保留。
+本入口根据窗口退出进行切换，腕部到位及扫描完成仍由操作者判断。
+
+下面保留分步命令，需要单独操作时使用；不要与一键入口同时运行，不要使用 Run All。
+
+## 1. 全局相机定位并移动到初始点
+
+```bash {"background":"false","closeTerminalOnSuccess":"false","excludeFromRunAll":"true","interactive":"true","name":"camera-rt-move-to-initial-pose"}
+source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
+conda activate camera
+cd /home/cair-jacen/uspilot_ctrl-main
+python infer/hand_eye_calibration-main/run_probe_target.py
 ```
 
-## 腕部模型 / 手动选点跟随
+相机窗口按 `s` 保存、`q` 退出，或按 Esc 保存并退出；随后自动执行一次真实 MoveJ_P，
+到达距表面 50 mm 的初始点。等待命令结束后继续。
 
-统一操作入口为 [camera-wrist-operations.md](camera-wrist-operations.md)。
-依次执行 `start-redis-7777`、`start-wrist-camera`、`start-wrist-robot`，
-默认相机自动加载模型，Robot 就绪后自动选取初始目标，通过观测和回传确认后请求跟随。
-手动选点用 `start-wrist-camera-manual` 替代相机单元；模型配置和离线验证也在该 notebook 中。
-原 [carotid-begin 最简启动](carotid-begin-operations.md) 保留为同一链路的最简入口。
+## 2. 启动 Redis
 
-下面单元只列出腕部 notebook 的命令，不执行启动或运动：
-
-```bash {"name":"list-wrist-operations","excludeFromRunAll":"true"}
-runme list --filename /home/cair-jacen/uspilot_ctrl-main/.runme/run/camera-wrist-operations.md --chdir /home/cair-jacen/uspilot_ctrl-main
+```bash {"excludeFromRunAll":"true","name":"start-redis-7777"}
+if [[ "$(redis-cli -h 127.0.0.1 -p 7777 ping 2>/dev/null)" != PONG ]]; then
+  redis-server --bind 127.0.0.1 --port 7777 --daemonize yes
+fi
 ```
 
-## 超声在线推理
+## 3. 启动腕部相机与跟随
 
-```bash {"name":"start-ultrasound-inference","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
+执行一次，依次打开腕部相机和 Robot 的独立终端。
+
+```bash {"excludeFromRunAll":"true","interactive":"true","name":"start-wrist-system","promptEnv":"never"}
+bash -c 'launcher=/home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal.sh; bash "$launcher" camera && bash "$launcher" robot'
+```
+
+Robot 就绪后自动模型选点并跟随；腕部相机窗口按 `b` 重选并开始，`p` 暂停。
+
+## 4. 结束腕部跟随，切换到超声控制
+
+腕部定位完成后，在相机窗口按 `q` 退出，再在腕部 Robot 终端按 `Ctrl+C`，
+等待进程结束。当前腕部入口为无力悬停试验，尚未实现自动交接；两种 Robot 入口不能同时运行。
+
+确认探头悬空，供启动时进行 3 秒 tare，再在独立终端执行：
+
+```bash {"background":"false","closeTerminalOnSuccess":"false","excludeFromRunAll":"true","interactive":"true","name":"start-main-rm75"}
+cd /home/cair-jacen/uspilot_ctrl-main/infer/Robot/build
+./main_rm75
+```
+
+## 5. 启动超声并完成扫描
+
+另开终端执行：
+
+```bash {"background":"false","closeTerminalOnSuccess":"false","excludeFromRunAll":"true","interactive":"true","name":"start-ultrasound-inference"}
 source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
 conda activate carotid
 cd /home/cair-jacen/uspilot_ctrl-main/intergrate_infer
 python main_redis_seg_newphase_recovery_mode.py
 ```
 
-## 接触点显示
+在超声图像窗口中操作：
 
-本机使用 `carotid` 环境（已安装 PyVista 0.49.0）；显示模型取自
-`infer/Robot/model/Lprobe-IFS.STL`。
+- `b`：启动推理、接近控制与 Tool-Y 居中；再次按下停止，每次切换都会关闭扫描。
+- `m`：接近并居中后开启 Tool-X 扫描与 Tool-RZ 对齐（RZ 仅在 phase=1 时请求）；再次按下关闭。
+- `t`：切换终止标志，结束本轮；再次按下取消该标志。
+- `s` / `y`：分别切换分割 / YOLO 显示。
+- 扫描完成后按 `q` 发送终止命令并退出超声程序，再在 Robot 终端按 `Ctrl+C` 结束。
 
-```bash {"name":"start-contact-point-viewer","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
-source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
-conda activate carotid
-cd /home/cair-jacen/uspilot_ctrl-main/infer/ContactPointShow
-python -c 'import pyvista' || { echo 'ContactPointShow 需要在 carotid 环境安装 pyvista。' >&2; exit 1; }
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 python main.py
-```
+## Tool-Y 居中状态
 
-## 独立工具：SensorMonitor
+按 `b` 后先沿当前可见血管中心做 Y 居中和 Z 力控；按 `m` 后，图像横向误差 ≤0.8 mm
+才继续 X 扫描 / RZ 对齐。超声窗口保持原显示：`y:` / `On Track`、方向箭头及既有
+phase、RZ、Recovery、分割和 YOLO 叠加；不新增中心线、选中目标标记或等待状态文字。
+未识别到血管不会继续用回归模型猜测横移；原丢失恢复仍保留。
+图像超过 300 ms 未更新时心跳停止 Y/X/RZ，保留 Z 力控；新鲜目标返回后重新确认。
+居中换算沿用成像高度 37 mm，设备成像深度改变时需同步修改超声入口的 `image_total_height_mm`。
+无需新增日志文件；已有力保护仍可能在接触力不足或卸载时暂停横移。
 
-以下单元只启动独立监控工具，不是项目启动的必要步骤。
-直接运行即可自动识别：有项目遥测时只读订阅 Redis，否则直连串口。
-选定来源后不切换，直连与 Robot 使用同一设备时互斥；清零只影响本地监控。
-采集与图片说明见[使用说明](../../docs/sensor_drift_recording.md)。
+## 超声与 tare 后六维力同步录像
 
-```bash {"name":"start-sensor-monitor","excludeFromRunAll":"true","interactive":"true","background":"false","closeTerminalOnSuccess":"false"}
-source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
-conda activate carotid
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
-  python /home/cair-jacen/uspilot_ctrl-main/infer/SensorMonitor/main.py
-```
+进入超声推理循环后自动开始保存，无需另开 SensorMonitor；按 `q` 退出或流程中断时收尾。
+终端 `[Recording]` 输出本次目录：
+`intergrate_infer/output/scan_YYYYMMDD_HHMMSS_<id>/`。
 
-Robot、Camera_RT、Camera_wrist 和标定的完整步骤见本目录对应 notebook。
+- `ultrasound.avi`：推理输入的超声裁剪画面，30 FPS；奇数宽度 557 补一列黑边至 558。
+- `wrench_tare.avi`：同时间轴的 Fx/Fy/Fz（N）、Tx/Ty/Tz（N·m）曲线，显示本次录制从 0 秒到当前时刻的全部历史，横轴随时长扩展，纵轴自动缩放。
+- `wrench_tare.csv`：Redis 接收到的六维力样本及传感器 / 接收时间戳、有效性。
+- `frames.csv`：两段视频共用的帧号、视频时间、主机录制时间、最近超声接收 / 力采样时间。
+- `recording.json`：帧率、帧数、时间原点、单位及录制错误等元信息。
+
+六维力订阅 `robot:sensor:v1` 的 `compensated_wrench_tool`，使用标定重力/质心补偿、
+本次 tare 后的 Tool 坐标值，不在录像端再次清零。Robot 必须用本次更新后的 `main_rm75`。
+缺少 tare 标记、无效或超过 500 ms 的力数据不绘为零，显示等待 / 过期并断开曲线。
+后台线程独立录制两段视频；推理未交付新图像或显示冻结时保留上一幅超声图并标注 ROI 帧龄。
+两段视频帧数 / 帧率一致，但这是基于本机单调时钟的配对记录，不是相机曝光与力传感器的硬件同步。
+Robot 原始运行 CSV 仍保留全控制周期数据；录像曲线 CSV 的采样频率取决于 Redis 遥测发布频率。
+
+三类记录都覆盖本次超声录制开始到结束，不受 `b/m` 开关影响；力曲线视频最后一帧包含整次历史。
+长时间运行时，曲线按时间分箱保留六轴最小 / 最大值，保留早期峰值与无效区间标记；
+CSV 仍逐条保存收到的数值，不因曲线显示压缩而删减。开始指超声模型加载和 idle 握手完成后的录像起点。

@@ -15,6 +15,28 @@ bool Check(bool condition, const char* message) {
 
 int main() {
     bool ok = true;
+    {
+        Rm75ControlInput visual_input;
+        visual_input.robot_valid = visual_input.wrench_valid = true;
+        visual_input.compensated_wrench_tool.z() = -2.0;
+        ControlIntent visual_intent;
+        visual_intent.action_enabled = true;
+        visual_intent.desired_force_n = -2.0;
+        // Right-of-center image publishes negative Y; existing RM75 mapping
+        // must produce +Tool-Y. Left-of-center must produce the reverse.
+        for (double error : {-0.004, 0.004}) {
+            Rm75ControlLaw visual_control;
+            visual_intent.model_y_m = error;
+            const auto aligned = visual_control.Step(visual_input, visual_intent, true);
+            ok &= Check(std::abs(aligned.requested_delta.y() + error * 0.01) < 1e-12,
+                        "image centering preserves Tool-Y direction and 4 mm/s speed bound");
+        }
+        Rm75ControlLaw no_contact_control;
+        visual_input.compensated_wrench_tool.z() = -0.5;
+        ok &= Check(no_contact_control.Step(visual_input, visual_intent, true)
+                        .requested_delta.y() == 0.0,
+                    "image centering retains no-contact lateral force gate");
+    }
     Rm75ControlLaw control;
     Rm75ControlInput input;
     input.robot_valid = true;

@@ -90,6 +90,8 @@ int main() {
     data.mode = "dry_run";
     data.completion_reason = "duration_elapsed";
     data.configuration_profile = "explicit_cli";
+    data.calibration_path="/tmp/calibration.json";
+    data.calibration_sha256=std::string(64,'a');
     data.runtime_csv = "/tmp/runtime.csv";
     data.control.config.desired_force_n = -2.0;
     data.control.config.approach_speed_m_s = 0.020;
@@ -99,6 +101,9 @@ int main() {
     const nlohmann::json summary = BuildRuntimeSummary(data);
     ok &= Check(summary["control"]["force_sensor_enabled"] == true,
                 "default summary retains force acquisition enabled");
+    ok &= Check(summary["calibration"]["path"]==data.calibration_path
+                    && summary["calibration"]["sha256"]==data.calibration_sha256,
+                "summary identifies the actual loaded force calibration");
     std::set<std::string_view> built_keys;
     for (const auto& item : summary.items()) built_keys.insert(item.key());
     ok &= Check(built_keys == summary_keys,

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from depth_diagnostics import DepthNeighborhoodError
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -137,10 +138,14 @@ def replay_selection(tracker, initial, frames, prediction, k, distortion):
     image, depth, timestamp = initial
     result = tracker.initialize(image, depth, prediction['scan_start'], k, distortion, timestamp)
     if not result.get('valid'):
+        if 'depth_neighborhood' in result:
+            raise DepthNeighborhoodError(result['reason'], result['depth_neighborhood'])
         raise ValueError(result['reason'])
     for image, depth, timestamp in frames:
         result = tracker.update(image, depth, k, distortion, timestamp)
         if not result.get('valid'):
+            if 'depth_neighborhood' in result:
+                raise DepthNeighborhoodError(result['reason'], result['depth_neighborhood'])
             raise ValueError(result['reason'])
     return result
 

@@ -236,7 +236,18 @@ nlohmann::json BuildRuntimeSummary(const RuntimeSummaryData& data) {
     summary["fault_code"] = data.fault_code.empty()
         ? nlohmann::json(nullptr) : nlohmann::json(data.fault_code);
     summary["calibration"] = {
+        {"path", data.calibration_path},
+        {"sha256", data.calibration_sha256},
+        {"created_at", calibration.created_at},
         {"sensor_id", calibration.sensor_id},
+        {"gravity_base_n", {calibration.gravity_base_n.x(),calibration.gravity_base_n.y(),calibration.gravity_base_n.z()}},
+        {"force_bias_n", {calibration.force_bias_n.x(),calibration.force_bias_n.y(),calibration.force_bias_n.z()}},
+        {"torque_bias_nm", {calibration.torque_bias_nm.x(),calibration.torque_bias_nm.y(),calibration.torque_bias_nm.z()}},
+        {"center_of_mass_sensor_m", {calibration.center_of_mass_sensor_m.x(),calibration.center_of_mass_sensor_m.y(),calibration.center_of_mass_sensor_m.z()}},
+        {"force_rms_n", calibration.force_residual_rms_n},
+        {"force_max_n", calibration.force_residual_max_n},
+        {"torque_rms_nm", calibration.torque_residual_rms_nm},
+        {"torque_max_nm", calibration.torque_residual_max_nm},
         {"probe_model", calibration.probe_model},
         {"probe_model_sha256", data.selected_probe_sha256},
         {"controller_pose_frame", "arm_tip"},

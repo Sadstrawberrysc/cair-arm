@@ -1,0 +1,80 @@
+{
+  "created_at": "2026-11-09T07:19:48Z",
+  "gravity_model": {
+    "center_of_mass_sensor_m": [
+      -0.00016879067205302487,
+      0.0025215127855537085,
+      0.06118087528162148
+    ],
+    "force_bias_n": [
+      -2.7160326826533163,
+      1.1506973804121854,
+      0.1018721836767547
+    ],
+    "gravity_base_n": [
+      -0.01547941855640438,
+      -0.0645580882322825,
+      -2.3921404282741774
+    ],
+    "torque_bias_nm": [
+      0.0024617957017547946,
+      0.10251607749208781,
+      0.11881910797456113
+    ]
+  },
+  "probe_model": "Lprobe-IFS.STL",
+  "probe_model_sha256": "03f751286e06e4e8f05ba05bc89d7d797c7defff7bcb8d9f8f43727ff9f7c82d",
+  "probe_tcp_sensor_m": [
+    0.0,
+    0.0,
+    0.188
+  ],
+  "probe_to_sensor": {
+    "rotation_row_major": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "quality": {
+    "accepted_force_max_n": 0.6,
+    "accepted_torque_max_nm": 0.1,
+    "force_max_n": 0.593051693748685,
+    "force_rms_n": 0.3436602074819299,
+    "residuals_verified": true,
+    "torque_max_nm": 0.0481270782541891,
+    "torque_rms_nm": 0.01885531969178247
+  },
+  "schema_version": 2,
+  "sensor_id": "KWR57",
+  "sensor_to_tool": {
+    "rotation_row_major": [
+      0.8660254037844387,
+      -0.49999999999999994,
+      0.0,
+      0.49999999999999994,
+      0.8660254037844387,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "translation_sensor_to_tool_m": [
+      0.0,
+      0.0,
+      -0.0125
+    ]
+  },
+  "tool_chain_verified": true,
+  "units": {
+    "force": "N",
+    "length": "m",
+    "torque": "N*m"
+  }
+}

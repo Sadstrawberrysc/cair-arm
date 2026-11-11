@@ -122,3 +122,16 @@ COLLISION_PLANNER_BIN="$PWD/infer/Collision/build-plan/collision_plan" ./infer/C
 
 算法接口依据 [OMPL MotionValidator](https://ompl.kavrakilab.org/classompl_1_1base_1_1MotionValidator.html) 和
 [RRTConnect](https://ompl.kavrakilab.org/classompl_1_1geometric_1_1RRTConnect.html)；路径段复用本项目的保守位移界检查，不采用默认离散端点采样。
+
+
+## 标定路径整段审核
+
+`collision_check` 新增 `--calibration-path <标定路径JSON>`，与原来的 `--urdf`、`--request`、
+`--mesh-dir` 和 `--drop-zero-area-triangles` 配合。请求中的现场场景和 `joint_positions_rad`
+分别作为检查场景和实际起点；标定审核请求无需设置额外的 `goal_joint_positions_rad`。
+路径中的 `preserved_prefix_count` 为已采完、不再经过的目标数量。
+程序检查起点到下一个目标、后续每个关节线性段，以及 `return_to_center` 指定的返回段。
+碰撞或无法证明净空时停止并报告具体段和碰撞体；报告绑定路径文件 SHA-256。
+
+该功能是离线快照检查，不连接机器人，不发送运动；`ready_for_execution=false`。
+现场数据、禁区及起点尚未核对时，不把模板、合成场景或 TCP 点筛选当作运动证明。

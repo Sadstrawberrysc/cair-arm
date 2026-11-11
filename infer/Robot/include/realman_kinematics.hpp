@@ -8,6 +8,8 @@ public:
 
     RMKinematics();
     void GetKinematics(Eigen::Matrix4d& kinematics, Eigen::Matrix<double,7,1>& joints);
+    std::array<Eigen::Matrix4d, kJointCount> GetLinkKinematics(
+        const Eigen::Matrix<double,7,1>& joints) const;
     void GetJacobian(Eigen::Matrix<double,6,7>& jacobian, Eigen::Matrix<double,7,1>& joints);
     const std::array<double, kJointCount>& JointMinimums() const noexcept {
         return joint_min;
