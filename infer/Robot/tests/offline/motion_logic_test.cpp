@@ -194,14 +194,14 @@ int main() {
         input.action = "begin";
         input.capture_ns = 1'000'000'000;
         input.normal_base = -Eigen::Vector3d::UnitZ();
-        input.surface_base = Eigen::Vector3d(.005, 0., .05);
+        input.surface_base = Eigen::Vector3d(.007, 0., .05);
         const auto first = wrist_position.Step(input);
         ok &= Check(first.following && !first.motion_requested
                     && first.tcp_reference.topRightCorner<3,1>().isZero(1e-12),
-                    "position remains still at the 5 mm start threshold");
+                    "position remains still at the 7 mm start threshold");
 
         input.capture_ns += 33'000'000;
-        input.surface_base.x() = .006;
+        input.surface_base.x() = .008;
         const auto moving = wrist_position.Step(input);
         ok &= Check(moving.motion_requested && std::abs(moving.tcp_reference(0,3)-.003*input.cycle_s)<1e-12,
                     "position starts outside the deadband and advances at the reference speed limit");
@@ -215,13 +215,13 @@ int main() {
         wrist_position.Commit(within_hysteresis.tcp_reference);
 
         input.capture_ns += 33'000'000;
-        input.surface_base.x() = within_hysteresis.tcp_reference(0,3) + .0019;
+        input.surface_base.x() = within_hysteresis.tcp_reference(0,3) + .0029;
         const auto settled = wrist_position.Step(input);
         ok &= Check(settled.following && !settled.motion_requested
                     && (settled.tcp_reference-within_hysteresis.tcp_reference).norm()<1e-12,
-                    "position stops inside 2 mm without dropping follow authorization");
+                    "position stops inside 3 mm without dropping follow authorization");
         input.capture_ns += 33'000'000;
-        input.surface_base.x() = settled.tcp_reference(0,3) - .004;
+        input.surface_base.x() = settled.tcp_reference(0,3) - .006;
         ok &= Check(!wrist_position.Step(input).motion_requested,
                     "small reversals after settling do not restart translation");
 

@@ -408,8 +408,8 @@ struct WristFollowOutput {
 };
 class WristFollowController {
 public:
-    static constexpr double kPositionStartErrorM = .005;
-    static constexpr double kPositionStopErrorM = .002;
+    static constexpr double kPositionStartErrorM = .007;
+    static constexpr double kPositionStopErrorM = .003;
     static constexpr double kPositionSpeedMPerS = .003;
     static constexpr double kAngularSpeedDegPerS = 3.0;
 

@@ -17,7 +17,7 @@ bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal
 ## 机械臂
 
 TCP 位置参考限速为 3 mm/s，姿态参考及每关节命令限速为 3°/s。
-TCP 位置误差大于 5 mm 才启动平移，收敛到 2 mm 内时停止。
+TCP 位置误差大于 7 mm 才启动平移，收敛到 3 mm 内时停止。
 
 ```bash {"excludeFromRunAll":"true","interactive":"true","name":"start-wrist-robot"}
 bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal.sh robot
