@@ -186,7 +186,7 @@ class DetectionCenterFusion:
         if not target_id or target_id != self.target_id or not current_result.get('valid'):
             return None, 'no active target for fusion'
         if not isinstance(response, dict) or response.get('valid') is not True:
-            return None, 'detection is not a unique valid target'
+            return None, 'detection has no valid selected target'
         stamp = response.get('capture_monotonic_ns')
         if not isinstance(stamp, int) or not 0 <= now_ns-stamp <= self.max_age_ns:
             return None, 'detection is stale or from the future'

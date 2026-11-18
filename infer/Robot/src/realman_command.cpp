@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 // 本文件实现 RM75 的 TCP 传输层，分为五部分：
-// 1) JSON 报文与单位转换；2) 同步维护命令；3) 10 ms 控制所用的异步
+// 1) JSON 报文与单位转换；2) 同步维护命令；3) 5 ms 控制所用的异步
 // 状态读取；4) 无锁 ServoJ 邮箱；5) Stop 的优先级与确认机制。
 // 上层 main_rm75/rm75_control 只通过 realman_command.hpp 的接口调用，不应
 // 依赖这里的 socket、报文拆包或线程同步细节。
@@ -31,7 +31,6 @@ namespace {
 // RM75 协议的关节角使用毫度；位置使用微米，姿态使用毫弧度。
 constexpr double kMilliDegreeToRad = M_PI / 180000.0;
 constexpr double kRadToMilliDegree = 180000.0 / M_PI;
-constexpr std::int64_t kMinimumAsyncServoSendGapNs = 10'000'000;
 
 std::int64_t SteadyNowNanoseconds() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -472,8 +471,14 @@ RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) 
                                  "receive timeout must be non-negative");
     }
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    return ReceiveJsonUntilLocked(response, std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout_ms));
+}
+
+RMResult RMCommand::ReceiveJsonUntilLocked(nlohmann::json& response, std::chrono::steady_clock::time_point deadline) {
+    if (!connected_.load() || rlm_socket < 0) {
+        return RMResult::Failure(RMErrorCode::kNotConnected, "robot is not connected");
+    }
     bool polled_once = false;
     for (;;) {
         std::string line;
@@ -496,13 +501,15 @@ RMResult RMCommand::ReceiveJsonLocked(nlohmann::json& response, int timeout_ms) 
                                      "robot receive timed out");
         }
 
-        int remaining_ms = timeout_ms == 0 ? 0 : RemainingMilliseconds(deadline);
+        const auto remaining_us = std::max<std::int64_t>(0,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                deadline - std::chrono::steady_clock::now()).count());
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(rlm_socket, &read_fds);
         timeval timeout{};
-        timeout.tv_sec = remaining_ms / 1000;
-        timeout.tv_usec = (remaining_ms % 1000) * 1000;
+        timeout.tv_sec = remaining_us / 1000000;
+        timeout.tv_usec = remaining_us % 1000000;
 
         int ready = 0;
         do {
@@ -1012,8 +1019,94 @@ RMResult RMCommand::TryMoveJP(const Eigen::Matrix<double, 6, 1>& pose,
 // 模块五：ServoJ、保持与停止
 // -------------------------------------------------------------------------
 
+RMResult RMCommand::TryStartMoveJ(const Eigen::Matrix<double, 7, 1>& joints, int velocity_percent) {
+    if (!AllFinite(joints) || velocity_percent<1 || velocity_percent>100)
+        return RMResult::Failure(RMErrorCode::kInvalidArgument,"Invalid MoveJ joints or velocity percent");
+    std::lock_guard<std::mutex> lock(movej_mutex_);
+    if (!async_receiver_active_.load() || !connected_.load())
+        return RMResult::Failure(RMErrorCode::kNotConnected,"Asynchronous MoveJ requires a running state reader");
+    if (movej_status_.restart_required)
+        return RMResult::Failure(RMErrorCode::kBusy,"Interrupted MoveJ session requires process restart");
+    if (movej_active_.load() || servo_stop_active_.load() || servo_pending_sequence_.load())
+        return RMResult::Failure(RMErrorCode::kBusy,"MoveJ, ServoJ or StopMotion is still active");
+    const auto sequence=movej_status_.sequence+1;
+    movej_status_={}; movej_status_.sequence=sequence;
+    movej_target_=joints; movej_velocity_percent_=velocity_percent;
+    movej_active_.store(true);
+    return RMResult::Success();
+}
+RMMoveJStatus RMCommand::MoveJStatus() const {
+    std::lock_guard<std::mutex> lock(movej_mutex_);
+    return movej_status_;
+}
+RMResult RMCommand::SendPendingMoveJ() {
+    if (!movej_active_.load()) return RMResult::Success();
+    Eigen::Matrix<double,7,1> target;
+    int velocity=0;
+    std::uint64_t sequence=0;
+    {
+        std::lock_guard<std::mutex> lock(movej_mutex_);
+        if (!movej_active_.load() || movej_status_.sent || servo_stop_active_.load()) return RMResult::Success();
+        target=movej_target_; velocity=movej_velocity_percent_; sequence=movej_status_.sequence;
+    }
+    nlohmann::json request={{"command","movej"},{"v",velocity},{"r",0},{"trajectory_connect",0}};
+    FillJointCommand(request,target);
+    if (servo_stop_active_.load()) return RMResult::Success();
+    // Never hold the status mutex across socket I/O: the execution watchdog
+    // must still read progress and request Stop if a send stalls.
+    const auto result=SendJson(request,"MoveJ mailbox");
+    std::lock_guard<std::mutex> lock(movej_mutex_);
+    if (movej_status_.sequence!=sequence || !movej_active_.load()) return result;
+    movej_status_.sent=bool(result); movej_status_.result=result;
+    if (!result) {
+        movej_status_.completed=true; movej_status_.restart_required=true;
+        movej_active_.store(false);
+    }
+    return result;
+}
+void RMCommand::AbortMoveJ(const RMResult& result) {
+    std::lock_guard<std::mutex> lock(movej_mutex_);
+    if (!movej_active_.load()) return;
+    // The wire protocol has no request ID. A stopped in-flight trajectory can
+    // report late completion, so do not reuse its session for another MoveJ.
+    movej_status_.restart_required=movej_status_.sent;
+    movej_status_.completed=true; movej_status_.result=result;
+    movej_active_.store(false);
+}
+bool RMCommand::HandleMoveJResponse(const nlohmann::json& response) {
+    if (!movej_active_.load()) return false;
+    std::lock_guard<std::mutex> lock(movej_mutex_);
+    if (!movej_active_.load() || !movej_status_.sent) return false;
+    const bool acknowledgement=response.contains("command") && response["command"].is_string()
+        && response["command"]=="movej" && response.contains("receive_state");
+    const bool completion=response.contains("trajectory_state") &&
+        (!response.contains("device") || response["device"]==0);
+    if (!acknowledgement && !completion) return false;
+    const auto& flag=response[acknowledgement ? "receive_state" : "trajectory_state"];
+    RMResult result=RMResult::Success();
+    if (!flag.is_boolean()) result=RMResult::Failure(RMErrorCode::kProtocol,"Invalid MoveJ acknowledgement/completion");
+    else if (!flag.get<bool>()) result=RobotRejection("MoveJ",response);
+    else if (completion && !movej_status_.accepted)
+        result=RMResult::Failure(RMErrorCode::kProtocol,"MoveJ completion arrived before acceptance");
+    if (response.contains("arm_err")) {
+        int error=0;
+        if (!ParseErrorValue(response["arm_err"],error))
+            result=RMResult::Failure(RMErrorCode::kProtocol,"Invalid MoveJ arm_err");
+        else if (error) result=RobotRejection("MoveJ",response);
+    }
+    movej_status_.result=result;
+    if (!result || completion) {
+        movej_status_.completed=true;
+        movej_status_.restart_required=!result;
+        movej_active_.store(false);
+    } else movej_status_.accepted=true;
+    return true;
+}
+
 RMResult RMCommand::TryServoJ(const Eigen::Matrix<double, 7, 1>& joints,
                               bool follow) {
+    if (movej_active_.load())
+        return RMResult::Failure(RMErrorCode::kBusy,"ServoJ disabled during MoveJ");
     const bool asynchronous =
         async_receiver_active_.load(std::memory_order_acquire);
     if (!AllFinite(joints)) {
@@ -1353,7 +1446,7 @@ RobotStateSnapshot RMCommand::CachedRobotState(
 // -------------------------------------------------------------------------
 // 模块六：异步 ServoJ 邮箱（控制线程 -> I/O 线程）
 // -------------------------------------------------------------------------
-// 控制线程在 10 ms 周期中只发布固定大小的关节目标；I/O 线程负责 JSON 序列化、
+// 控制线程在 5 ms 周期中只发布固定大小的关节目标；I/O 线程负责 JSON 序列化、
 // socket 发送和结果记录。邮箱最多保留一个待发或在途目标，防止 I/O 卡顿后积压旧轨迹。
 
 bool RMCommand::TryPublishServoTarget(
@@ -1461,7 +1554,7 @@ bool RMCommand::LoadServoTarget(
 }
 
 RMResult RMCommand::SendLatestServoTarget(
-    std::uint64_t& last_dispatched_sequence) {
+    std::uint64_t& last_dispatched_sequence, std::chrono::nanoseconds minimum_gap) {
     const std::uint64_t sequence =
         servo_pending_sequence_.load(std::memory_order_acquire);
     if (sequence == 0 || sequence == kServoMailboxWriting) {
@@ -1471,7 +1564,7 @@ RMResult RMCommand::SendLatestServoTarget(
         servo_sent_time_ns_.load(std::memory_order_acquire);
     if (previous_send_ns > 0
         && SteadyNowNanoseconds() - previous_send_ns
-               < kMinimumAsyncServoSendGapNs) {
+               < minimum_gap.count()) {
         // Leave the target pending; the I/O loop continues receiving state and
         // retries without blocking once the minimum dispatch gap has elapsed.
         return RMResult::Success();
@@ -1605,6 +1698,7 @@ void RMCommand::ReleaseAsyncReceiver() {
     servo_stop_active_.store(true, std::memory_order_release);
     DiscardPendingServoTarget();
     async_receiver_active_.store(false);
+    AbortMoveJ(RMResult::Failure(RMErrorCode::kBusy,"State reader stopped during MoveJ"));
     stop_in_flight_sequence_.store(0, std::memory_order_release);
     CompleteStopRequest(
         stop_requested_sequence_.load(std::memory_order_acquire),
@@ -1666,14 +1760,16 @@ BestEffortStopGuard::~BestEffortStopGuard() {
 // -------------------------------------------------------------------------
 // 模块八：RMStateReader 异步状态与 I/O 线程
 // -------------------------------------------------------------------------
-// 该线程是 socket 接收的唯一所有者：周期性请求 arm_state、发送最新 ServoJ、
+// 该线程是 socket 接收的唯一所有者：周期性请求 arm_state、发送 ServoJ 或异步 MoveJ、
 // 优先处理 Stop ACK，并将最新机器人状态发布为线程安全快照。
 
 RMStateReader::RMStateReader(RMCommand& command,
                              std::chrono::milliseconds poll_period,
-                             std::chrono::milliseconds stale_after)
+                             std::chrono::milliseconds stale_after,
+                             std::chrono::milliseconds servo_period)
     : command_(command),
-      poll_period_(std::max(std::chrono::milliseconds(10), poll_period)),
+      poll_period_(std::max(std::chrono::milliseconds(5), poll_period)),
+      servo_period_(std::max(std::chrono::milliseconds(5), servo_period)),
       stale_after_(std::max(std::chrono::milliseconds(1), stale_after)),
       latest_snapshot_(std::make_shared<const RobotStateSnapshot>(
           command.CachedRobotState(stale_after_))),
@@ -1769,6 +1865,7 @@ void RMStateReader::StoreReaderResult(const RMResult& result) {
 
 void RMStateReader::ThreadMain() {
     auto next_request = std::chrono::steady_clock::now();
+    auto state_retry_after = next_request;
     std::uint64_t last_servo_dispatched =
         std::max(command_.servo_sent_sequence_.load(std::memory_order_acquire),
                  std::max(
@@ -1790,6 +1887,7 @@ void RMStateReader::ThreadMain() {
             command_.stop_requested_sequence_.load(std::memory_order_acquire);
         if (requested_stop > last_stop_dispatched) {
             last_stop_dispatched = requested_stop;
+            command_.AbortMoveJ(RMResult::Failure(RMErrorCode::kRobotRejected,"MoveJ interrupted by StopMotion"));
             const std::uint64_t discarded =
                 command_.DiscardPendingServoTarget();
             last_servo_dispatched =
@@ -1806,12 +1904,14 @@ void RMStateReader::ThreadMain() {
         }
 
         if (command_.stop_in_flight_sequence_.load(std::memory_order_acquire) == 0) {
-            const RMResult servo_send_result =
-                command_.SendLatestServoTarget(last_servo_dispatched);
+            const auto movej_result=command_.SendPendingMoveJ();
+            if (!movej_result) StoreReaderResult(movej_result);
+            const RMResult servo_send_result = command_.movej_active_.load() ? RMResult::Success() :
+                command_.SendLatestServoTarget(last_servo_dispatched, servo_period_);
             if (!servo_send_result) StoreReaderResult(servo_send_result);
         }
 
-        if (now >= next_request) {
+        if (now >= next_request && now >= state_retry_after) {
             // 状态查询是低优先级发送：ServoJ 正在占用发送锁时，本周期直接跳过，
             // 下一个 poll 周期再请求，不能阻塞 ServoJ。
             const RMResult send_result = command_.SendJson(
@@ -1821,14 +1921,27 @@ void RMStateReader::ThreadMain() {
             if (!send_result && send_result.code != RMErrorCode::kBusy) {
                 StoreReaderResult(send_result);
             }
-            next_request = now + poll_period_;
+            // Bound queued queries if the controller returns feedback slowly.
+            // Retry a missing response after the existing freshness window.
+            if (send_result) state_retry_after = now + stale_after_;
+            next_request += poll_period_;
+            if (next_request <= now) next_request = now + poll_period_;
         }
 
         nlohmann::json response;
         RMResult receive_result;
         {
             std::lock_guard<std::mutex> receive_lock(command_.receive_mutex_);
-            receive_result = command_.ReceiveJsonLocked(response, 5);
+            // Recheck new mailbox work within 1 ms. If a target is waiting
+            // for the send gap, wake at its precise dispatch deadline.
+            auto wake = std::min(std::max(next_request, state_retry_after),
+                                 std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+            if (command_.servo_pending_sequence_.load(std::memory_order_acquire) != 0
+                && !command_.servo_stop_active_.load() && !command_.movej_active_.load()) {
+                const auto sent_ns = command_.servo_sent_time_ns_.load(std::memory_order_acquire);
+                wake = std::min(wake, std::chrono::steady_clock::time_point(std::chrono::nanoseconds(sent_ns)) + servo_period_);
+            }
+            receive_result = command_.ReceiveJsonUntilLocked(response, wake);
         }
         if (!receive_result) {
             if (receive_result.code != RMErrorCode::kTimeout) {
@@ -1875,8 +1988,11 @@ void RMStateReader::ThreadMain() {
             continue;
         }
 
+        if (command_.HandleMoveJResponse(response)) continue;
+
         if (response.contains("arm_state")) {
-            // 正常状态帧：解析、分配递增序号并原子发布，供 10 ms 控制循环读取。
+            state_retry_after = std::chrono::steady_clock::time_point{};
+            // 正常状态帧：解析、分配递增序号并原子发布，供 5 ms 控制循环读取。
             RobotStateSnapshot parsed;
             const RMResult parse_result = ParseRobotStateMessage(response, parsed);
             if (!parse_result) {

@@ -2,7 +2,6 @@
 """Wrist tracking UI: model selection by default, mouse selection with --manual."""
 import argparse
 import json
-import math
 import os
 from pathlib import Path
 import time
@@ -32,31 +31,32 @@ class StartupFramesUnavailable(RuntimeError):
     """The first synchronized RGB-D frame never arrived after stream start."""
 
 
-def draw_detection_boxes(image, response, now_ns, *, max_age_ns=500_000_000):
-    """Draw recent model boxes without treating them as tracked or Robot-valid."""
-    if not response or response.get('image_size') != [image.shape[1], image.shape[0]]:
+def draw_selected_detection(image, response, now_ns, *, max_age_ns=500_000_000):
+    """Draw the single box selected by the detector for a recent frame."""
+    if (not response or response.get('valid') is not True
+            or response.get('image_size') != [image.shape[1], image.shape[0]]):
         return False
     stamp = response.get('capture_monotonic_ns')
     if not isinstance(stamp, int) or not 0 <= now_ns - stamp <= max_age_ns:
         return False
-    for box in response.get('detections', []):
-        try:
-            x, y, width, height, confidence = (
-                float(box[key]) for key in ('x', 'y', 'width', 'height', 'confidence'))
-            if not all(map(math.isfinite, (x, y, width, height, confidence))):
-                continue
-            if width <= 0 or height <= 0 or not 0 <= confidence <= 1:
-                continue
-            x0, y0 = max(0, round(x-width/2)), max(0, round(y-height/2))
-            x1, y1 = min(image.shape[1]-1, round(x+width/2)), min(image.shape[0]-1, round(y+height/2))
-            if x0 > x1 or y0 > y1:
-                continue
-            color = (0, 165, 255)
-            cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
-            label = '%s %.2f' % (box.get('class', '?'), confidence)
-            cv2.putText(image, label, (x0, max(12, y0-4)), cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
-        except (KeyError, TypeError, ValueError, OverflowError):
-            continue
+    try:
+        selected = response['prediction']
+        x0, y0, x1, y1 = map(float, selected['box_xyxy'])
+        confidence = float(selected['confidence'])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if not (0 <= x0 < x1 <= image.shape[1] and 0 <= y0 < y1 <= image.shape[0]
+            and 0 <= confidence <= 1):
+        return False
+    left, top = round(x0), round(y0)
+    right = min(image.shape[1]-1, round(x1))
+    bottom = min(image.shape[0]-1, round(y1))
+    if left > right or top > bottom:
+        return False
+    color = (0, 165, 255)
+    cv2.rectangle(image, (left, top), (right, bottom), color, 2)
+    label = '%s %.2f' % (selected.get('class_name', '?'), confidence)
+    cv2.putText(image, label, (left, max(12, top-4)), cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
     return True
 
 
@@ -508,10 +508,8 @@ def main():
                     heartbeat = session.envelope(); heartbeat['action'] = 'heartbeat'
                     heartbeat['target_id'] = session.target or recovery.old_target
                     publish(COMMAND, heartbeat); last_heartbeat = time.monotonic()
-                if selector is not None:
-                    shown = draw_detection_boxes(image, latest_detection, time.monotonic_ns())
-                    status = 'boxes: %d' % len(latest_detection.get('detections', [])) if shown else 'boxes: waiting'
-                    cv2.putText(image, status, (10, 175), 0, .45, (0, 165, 255), 1)
+                if selector is not None and not draw_selected_detection(image, latest_detection, time.monotonic_ns()):
+                    cv2.putText(image, 'box: waiting', (10, 175), 0, .45, (0, 165, 255), 1)
                 if result.get('valid'):
                     display_position = result['point_camera_m']
                     cv2.putText(image, 'p(m): '+str(np.round(display_position,3)), (10,75), 0,.5,(0,255,255),1)

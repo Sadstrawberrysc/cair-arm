@@ -162,6 +162,51 @@ bool TestNormalMove(bool cancellable) {
     return ok;
 }
 
+bool TestControlStream() {
+    using Clock = std::chrono::steady_clock;
+    constexpr int ticks = 200;
+    int targets = 0;
+    FakeController controller([&](int socket) {
+        for (;;) {
+            const auto line = ReadLine(socket);
+            if (line.empty()) return true;
+            const auto command = nlohmann::json::parse(line).at("command").get<std::string>();
+            if (command == "movej_canfd") {
+                ++targets;
+            } else if (command == "get_current_arm_state") {
+                if (!Send(socket, R"({"arm_state":{"joint":[0,0,0,0,0,0,0],"pose":[0,0,0,0,0,0]}})" "\n")) return false;
+            } else {
+                return false;
+            }
+        }
+    });
+    RMCommand command(controller.Config());
+    command.SetQuiet(true);
+    bool ok = Check(command.TryConnectTCPSocket().ok(), "stream connection");
+    RMStateReader reader(command, 5ms, 200ms, 5ms);
+    ok &= Check(reader.Start().ok(), "start 200 Hz reader");
+    const auto start = Clock::now();
+    ServoSendSnapshot previous;
+    for (int tick = 0; tick < ticks; ++tick) {
+        const auto status = command.ServoStatus();
+        if (status.sent_sequence > previous.sent_sequence && previous.sent_sequence != 0)
+            ok &= Check(status.sent_at - previous.sent_at >= 5ms, "minimum send gap");
+        previous = status;
+        if (status.submitted_sequence == status.sent_sequence)
+            ok &= Check(command.TryServoJ(Eigen::Matrix<double,7,1>::Zero(), false).ok(), "submit target");
+        std::this_thread::sleep_until(start + (tick + 1) * 5ms);
+    }
+    const auto feedback = reader.Latest();
+    reader.Stop();
+    command.CloseTCPSocket();
+    ok &= Check(controller.Finish(), "mock controller received valid stream");
+    std::cout << "200 control ticks: " << targets << " wire targets, "
+              << feedback.sequence << " fresh feedback frames\n";
+    ok &= Check(targets >= 180 && feedback.sequence >= 180 && !feedback.stale,
+                "both streams sustain near 200 Hz under loopback load");
+    return ok;
+}
+
 bool TestOverallTimeout() {
     FakeController controller([](int socket) {
         const auto move = nlohmann::json::parse(ReadLine(socket));
@@ -185,7 +230,8 @@ bool TestOverallTimeout() {
 }  // namespace
 
 int main() {
-    bool ok = TestPreCancelled();
+    bool ok = TestControlStream();
+    ok &= TestPreCancelled();
     ok &= TestMidMoveCancellation(true);
     ok &= TestMidMoveCancellation(false);
     ok &= TestPreCancelled(true);

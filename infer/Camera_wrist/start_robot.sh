@@ -15,7 +15,7 @@ fi
 mkdir -p -- "$wrist_dir/log"
 run_dir=$(mktemp -d "$wrist_dir/log/wrist_continuous_XXXXXXXX")
 echo "Wrist trial: no force sensor, candidate extrinsic; TCP displacement, total orientation, and TCP position tracking error limits disabled."
-echo "Continuous until Ctrl+C or fault; model mode automatically selects the initial target and follows when ready. Limits: 4 mm/s TCP, 4 deg/s orientation/joints. Logs: $run_dir"
+echo "Continuous until Ctrl+C or fault; model mode automatically selects the initial target and follows when ready. Logs: $run_dir"
 # Export after normal exit or a controller fault, preserving its exit status.
 export_simple_log() {
   if [[ -f "$run_dir/runtime.csv" ]]; then
@@ -36,7 +36,7 @@ trap forward_stop HUP INT TERM
   --calibration "$project_dir/infer/Robot/build/rm75_force_calibration.json" \
   --probe-model "$project_dir/infer/Robot/model/Lprobe-IFS.STL" \
   --wrist-follow "$wrist_dir/gemini305_to_rm75_armtip.json" \
-  --publish-every 1 --duration-sec 0 --runtime-log "$run_dir/runtime.csv" &
+  --publish-every 2 --duration-sec 0 --runtime-log "$run_dir/runtime.csv" &
 robot_pid=$!
 set +e
 while true; do

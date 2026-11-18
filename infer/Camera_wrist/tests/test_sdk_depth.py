@@ -25,13 +25,16 @@ class Frame:
 
 class Filter:
     def __init__(self, transform):
-        self.params = dict(magnitude=1., alpha=.5, radius=1., disp_diff=160.)
+        self.params = dict(magnitude=1., alpha=.5, radius=1., disp_diff=160.,
+                           diff_scale=.1, weight=.4)
         self.transform = transform
+        self.reset_count = 0
 
     def set_config_value(self, name, value): self.params[name] = float(value)
     def get_config_value(self, name): return self.params[name]
     def enable(self, value): self.enabled = value
     def process(self, frame): return self.transform(frame)
+    def reset(self): self.reset_count += 1
 
 
 class SdkDepthTests(unittest.TestCase):
@@ -50,8 +53,13 @@ class SdkDepthTests(unittest.TestCase):
             data[data == 0] = 2500
             return Frame(data, frame.stamp, frame.scale, frame.fmt)
 
-        self.spatial, self.holes = Filter(spatial), Filter(fill)
-        filters = {'SpatialAdvancedFilter': self.spatial, 'HoleFillingFilter': self.holes}
+        def temporal(frame):
+            self.calls.append('temporal')
+            return Frame(frame.array.copy(), frame.stamp, frame.scale, frame.fmt)
+
+        self.spatial, self.holes, self.temporal = Filter(spatial), Filter(fill), Filter(temporal)
+        filters = {'SpatialAdvancedFilter': self.spatial, 'HoleFillingFilter': self.holes,
+                   'TemporalFilter': self.temporal}
         self.sdk = SimpleNamespace(
             OBFormat=SimpleNamespace(Y16='Y16'),
             OBHoleFillingMode=SimpleNamespace(FURTHEST=SimpleNamespace(value=2)),
@@ -64,7 +72,7 @@ class SdkDepthTests(unittest.TestCase):
         original = data.copy()
         frame = Frame(data)
         result = self.processor.process(frame)
-        self.assertEqual(self.calls, ['spatial', 'holes'])
+        self.assertEqual(self.calls, ['spatial', 'holes', 'temporal'])
         np.testing.assert_array_equal(frame.array, original)
         np.testing.assert_array_equal(result.raw_m, original*.0001)
         self.assertAlmostEqual(result.filtered_m[0, 0], .2501)
@@ -73,7 +81,8 @@ class SdkDepthTests(unittest.TestCase):
         self.assertEqual(result.stats['filled_pixels'], 36)
         self.assertEqual(result.stats['filtered_invalid_pixels'], 0)
         self.assertIsNone(self.processor.configuration['hole_area_limit'])
-        self.assertFalse(self.processor.configuration['temporal_filter'])
+        self.assertTrue(self.processor.configuration['temporal_filter'])
+        self.assertEqual(self.processor.configuration['temporal'], dict(diff_scale=.2, weight=.6))
         self.assertEqual(self.holes.params['hole_filling_mode'], 2)
 
     def test_remaining_holes_stay_invalid_instead_of_using_previous_depth(self):

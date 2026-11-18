@@ -28,7 +28,7 @@ int main() {
             Rm75ControlLaw visual_control;
             visual_intent.model_y_m = error;
             const auto aligned = visual_control.Step(visual_input, visual_intent, true);
-            ok &= Check(std::abs(aligned.requested_delta.y() + error * 0.01) < 1e-12,
+            ok &= Check(std::abs(aligned.requested_delta.y() + error * 0.005) < 1e-12,
                         "image centering preserves Tool-Y direction and 4 mm/s speed bound");
         }
         Rm75ControlLaw no_contact_control;
@@ -90,11 +90,11 @@ int main() {
     moved_joints[0] += 10.0 * M_PI / 180.0;
     const auto moved_pose = wrist_speed_planner.PoseFromJoints(moved_joints);
     const auto wrist_speed_plan = wrist_speed_planner.Plan(joints, pose, moved_pose);
-    const double joint_step_limit_rad = M_PI / 180.0 * 0.02;
+    const double joint_step_limit_rad = M_PI / 180.0 * 0.01;
     ok &= Check(wrist_speed_plan.valid
                     && wrist_speed_plan.joint_delta.cwiseAbs().maxCoeff()
                            <= joint_step_limit_rad + 1e-12,
-                "wrist planner caps every 10 ms joint step at 2 deg/s");
+                "wrist planner caps every 5 ms joint step at 2 deg/s");
     ok &= Check(wrist_speed_plan.valid
                     && wrist_speed_plan.joint_delta.cwiseAbs().maxCoeff()
                            >= joint_step_limit_rad * 0.99,
@@ -164,27 +164,142 @@ int main() {
     {
         WristFollowController filtered;
         WristFollowInput input;
+        input.producer_id="producer"; input.capture_ns=1000000000;
         input.fresh=true; input.target_id="noise"; input.request_token="begin"; input.action="begin";
         input.normal_base=Eigen::Vector3d(0,0,-1);
         auto first=filtered.Step(input);
         filtered.Commit(first.tcp_reference);
         input.action="heartbeat";
-        input.normal_base=Eigen::AngleAxisd(4.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
+        input.normal_base=Eigen::AngleAxisd(14.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
         auto small=filtered.Step(input);
         ok &= Check((small.tcp_goal.topLeftCorner<3,3>()-first.tcp_goal.topLeftCorner<3,3>()).norm()<1e-12,
-                    "four-degree normal change retains orientation goal");
-        input.normal_base=Eigen::AngleAxisd(6.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
+                    "fourteen-degree normal change retains orientation goal");
+        input.normal_base=Eigen::AngleAxisd(16.*M_PI/180.,Eigen::Vector3d::UnitY())*Eigen::Vector3d(0,0,-1);
         auto large=filtered.Step(input);
         ok &= Check((large.tcp_goal.topLeftCorner<3,3>().col(2)+input.normal_base).norm()<1e-12,
                     "real tilt beyond deadband updates orientation goal");
         const double angle_step = Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
             Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()));
-        ok &= Check(std::abs(angle_step-4.*M_PI/180.*input.cycle_s) < 1e-12,
-                    "filtered orientation advances at 4 deg/s for a distant goal");
+        ok &= Check(std::abs(angle_step-3.*M_PI/180.*input.cycle_s) < 1e-12,
+                    "wrist orientation advances at 3 deg/s for a distant goal");
+    }
+
+    {
+        WristFollowController wrist_position;
+        WristFollowInput input;
+        input.fresh = true;
+        input.producer_id = "producer";
+        input.target_id = "deadband";
+        input.request_token = "producer:begin";
+        input.action = "begin";
+        input.capture_ns = 1'000'000'000;
+        input.normal_base = -Eigen::Vector3d::UnitZ();
+        input.surface_base = Eigen::Vector3d(.005, 0., .05);
+        const auto first = wrist_position.Step(input);
+        ok &= Check(first.following && !first.motion_requested
+                    && first.tcp_reference.topRightCorner<3,1>().isZero(1e-12),
+                    "position remains still at the 5 mm start threshold");
+
+        input.capture_ns += 33'000'000;
+        input.surface_base.x() = .006;
+        const auto moving = wrist_position.Step(input);
+        ok &= Check(moving.motion_requested && std::abs(moving.tcp_reference(0,3)-.003*input.cycle_s)<1e-12,
+                    "position starts outside the deadband and advances at the reference speed limit");
+        wrist_position.Commit(moving.tcp_reference);
+
+        input.capture_ns += 33'000'000;
+        input.surface_base.x() = moving.tcp_reference(0,3) + .004;
+        const auto within_hysteresis = wrist_position.Step(input);
+        ok &= Check(within_hysteresis.motion_requested,
+                    "an active translation continues inside the start threshold");
+        wrist_position.Commit(within_hysteresis.tcp_reference);
+
+        input.capture_ns += 33'000'000;
+        input.surface_base.x() = within_hysteresis.tcp_reference(0,3) + .0019;
+        const auto settled = wrist_position.Step(input);
+        ok &= Check(settled.following && !settled.motion_requested
+                    && (settled.tcp_reference-within_hysteresis.tcp_reference).norm()<1e-12,
+                    "position stops inside 2 mm without dropping follow authorization");
+        input.capture_ns += 33'000'000;
+        input.surface_base.x() = settled.tcp_reference(0,3) - .004;
+        ok &= Check(!wrist_position.Step(input).motion_requested,
+                    "small reversals after settling do not restart translation");
+
+        input.capture_ns += 33'000'000;
+        input.normal_base = Eigen::AngleAxisd(20.*M_PI/180., Eigen::Vector3d::UnitY())
+            * -Eigen::Vector3d::UnitZ();
+        input.surface_base = settled.tcp_reference.topRightCorner<3,1>() - .050*input.normal_base;
+        const auto orienting = wrist_position.Step(input);
+        ok &= Check(orienting.motion_requested
+                    && (orienting.tcp_reference.topRightCorner<3,1>()
+                        -settled.tcp_reference.topRightCorner<3,1>()).norm()<1e-12,
+                    "position deadband still allows an orientation-only correction");
+    }
+
+    {
+        WristFollowInput input;
+        input.fresh = true;
+        input.producer_id = "producer";
+        input.target_id = "pose-wait";
+        input.request_token = "producer:begin";
+        input.action = "begin";
+        input.capture_ns = 1'000'000'000;
+        input.normal_base = -Eigen::Vector3d::UnitZ();
+        input.surface_base.z() = .1;
+        WristFollowController late_feedback, paused, rejected;
+        const auto first = late_feedback.Step(input);
+        late_feedback.Commit(first.tcp_reference);
+        paused.Step(input);
+        rejected.Step(input);
+
+        input.capture_ns += 33'000'000;
+        input.fresh = false;
+        input.awaiting_pose_feedback = true;
+        input.reject_reason = "wrist_pose_time_unmatched";
+        for (double waited_s = 0.; waited_s < .050; waited_s += input.cycle_s) {
+            const auto waiting = late_feedback.Step(input);
+            ok &= Check(waiting.following && waiting.waiting_for_pose
+                        && (waiting.tcp_reference-first.tcp_reference).norm()<1e-12,
+                        "the reference stays frozen while eligible feedback is pending, including beyond 20 ms");
+        }
+        paused.Step(input);
+        rejected.Step(input);
+
+        auto pause = input;
+        pause.request_token = "producer:pause";
+        pause.action = "pause";
+        const auto stopped = paused.Step(pause);
+        ok &= Check(!stopped.following && !stopped.waiting_for_pose && stopped.reason == "operator_paused",
+                    "operator pause wins while awaiting pose feedback");
+        auto invalid = input;
+        invalid.awaiting_pose_feedback = false;
+        invalid.reject_reason = "wrist_observation_missing_stale_or_mismatched";
+        const auto lost = rejected.Step(invalid);
+        ok &= Check(!lost.following && lost.reason == invalid.reject_reason,
+                    "an observation that becomes invalid or stale ends the wait immediately");
+
+        auto matched = input;
+        matched.fresh = true;
+        matched.awaiting_pose_feedback = false;
+        matched.surface_base.x() = .01;
+        const auto continued = late_feedback.Step(matched);
+        ok &= Check(continued.following && !continued.waiting_for_pose && !continued.reference_reset,
+                    "feedback arriving after the old 20 ms limit continues the same follow session");
+        const Eigen::Vector3d expected_goal = matched.surface_base + .050*matched.normal_base;
+        ok &= Check((continued.tcp_goal.topRightCorner<3,1>()-expected_goal).norm()<1e-12,
+                    "the first matched frame supplies the entire new surface position");
+        ok &= Check((continued.tcp_reference.topRightCorner<3,1>()-
+                     first.tcp_reference.topRightCorner<3,1>()).norm()<=.003*input.cycle_s+1e-12,
+                    "the Cartesian reference still limits the step toward the latest surface position");
+        --matched.capture_ns;
+        const auto backwards = late_feedback.Step(matched);
+        ok &= Check(!backwards.following && backwards.reason == "wrist_capture_time_reversed",
+                    "an older observation still causes Hold without position filtering");
     }
 
     WristFollowController wrist;
     WristFollowInput wi;
+    wi.producer_id="producer"; wi.capture_ns=1000000000;
     wi.fresh=true; wi.target_id="target1"; wi.request_token="producer:1"; wi.action="begin";
     wi.normal_base=Eigen::Vector3d(0,0,-1);
     wi.surface_base=Eigen::Vector3d(.01,0,.10);
@@ -192,8 +307,8 @@ int main() {
     ok &= Check(wo.following && wo.reference_reset, "wrist explicit begin resets measured reference");
     ok &= Check((wo.tcp_goal.topRightCorner<3,1>()-Eigen::Vector3d(.01,0,.05)).norm()<1e-12,
                 "wrist adds exactly 50 mm outward");
-    ok &= Check(std::abs(wo.tcp_reference.topRightCorner<3,1>().norm()-.004*wi.cycle_s)<1e-12,
-                "wrist TCP reference advances at 4 mm/s for a distant goal");
+    ok &= Check(std::abs(wo.tcp_reference.topRightCorner<3,1>().norm()-.003*wi.cycle_s)<1e-12,
+                "wrist TCP reference advances at 3 mm/s for a distant goal");
     ok &= Check((wo.tcp_goal.topLeftCorner<3,3>().col(2)-Eigen::Vector3d(0,0,1)).norm()<1e-12,
                 "wrist Tool Z points inward");
     wrist.Commit(wo.tcp_reference);
@@ -205,7 +320,12 @@ int main() {
     ok &= Check(!wrist.Step(wi).following, "resume needs a new click");
     wi.target_id="target2"; wi.request_token="producer:3"; wi.actual_tcp(0,3)=.2;
     wo=wrist.Step(wi);
-    ok &= Check(wo.following && wo.reference_reset && std::abs(wo.tcp_reference(0,3)-.2)<.000051,
+    const Eigen::Vector3d resume_step = wo.tcp_reference.topRightCorner<3,1>()
+        - wi.actual_tcp.topRightCorner<3,1>();
+    const Eigen::Vector3d resume_goal_delta = wo.tcp_goal.topRightCorner<3,1>()
+        - wi.actual_tcp.topRightCorner<3,1>();
+    ok &= Check(wo.following && wo.reference_reset && resume_step.norm()<=.003*wi.cycle_s+1e-12
+                && resume_step.dot(resume_goal_delta)>0.,
                 "wrist resume rebases on actual TCP");
     wi.request_token="producer:4"; wi.action="pause";
     ok &= Check(!wrist.Step(wi).following, "pause remains explicit Hold");
@@ -213,7 +333,7 @@ int main() {
     wi.normal_base=Eigen::Vector3d(.1,0,-1).normalized();
     wo=wrist.Step(wi);
     ok &= Check(wo.following && Eigen::AngleAxisd(wo.tcp_reference.topLeftCorner<3,3>()).angle()
-                <=4.*M_PI/180.*.01+1e-9, "angular reference limited to 4 deg/s");
+                <=3.*M_PI/180.*wi.cycle_s+1e-9, "angular reference limited to 3 deg/s");
     wrist.Hold("planner_rejected");
     ok &= Check(!wrist.Step(wi).following, "planner rejection is latched");
     wi.normal_base=Eigen::Vector3d(1,0,0); wi.target_id="degenerate";

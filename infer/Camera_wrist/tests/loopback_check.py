@@ -28,7 +28,7 @@ try:
    if r.ping():break
   except redis.RedisError:time.sleep(.02)
  sub=r.pubsub(ignore_subscribe_messages=True);sub.subscribe('robot:wrist:state:v1')
- command=[str(ROOT/'infer/Robot/build/main_rm75'),'--simulate','--redis-enabled','--redis-port',str(port),'--duration-sec','0' if args.continuous else '15','--publish-every','1','--wrist-follow',str(ROOT/'infer/Camera_wrist/gemini305_to_rm75_armtip.json'),'--calibration',str(ROOT/'infer/Robot/build/rm75_force_calibration.json'),'--probe-model',str(ROOT/'infer/Robot/model/Lprobe-IFS.STL'),'--runtime-log',str(folder/'runtime.csv')]
+ command=[str(ROOT/'infer/Robot/build/main_rm75'),'--simulate','--redis-enabled','--redis-port',str(port),'--duration-sec','0' if args.continuous else '15','--publish-every','2','--wrist-follow',str(ROOT/'infer/Camera_wrist/gemini305_to_rm75_armtip.json'),'--calibration',str(ROOT/'infer/Robot/build/rm75_force_calibration.json'),'--probe-model',str(ROOT/'infer/Robot/model/Lprobe-IFS.STL'),'--runtime-log',str(folder/'runtime.csv')]
  if args.no_force:command.append("--wrist-no-force")
  if args.candidate_trial:command.append("--wrist-candidate-trial")
  if args.unlimited_excursion:command.append("--wrist-unlimited-excursion")
@@ -49,7 +49,7 @@ try:
  probe=np.array(force.get('probe_to_sensor',{}).get('rotation_row_major',np.eye(3).ravel())).reshape(3,3)
  tool_rotation=base_arm[:3,:3]@mount@probe
  tcp=base_arm[:3,3]+base_arm[:3,:3]@mount@(np.array(force['probe_tcp_sensor_m'])-np.array(force['sensor_to_tool']['translation_sensor_to_tool_m']))
- normal=-tool_rotation[:,2];skin=tcp+np.array([.008 if (args.unlimited_excursion or args.unlimited_translation) else .001,0,0])-.05*normal
+ normal=-tool_rotation[:,2];skin=tcp+np.array([.008 if (args.unlimited_excursion or args.unlimited_translation) else .006,0,0])-.05*normal
  seq=0;events=[];capture=0;history=[state];capture_state=state
  def envelope(target):
   global seq
@@ -185,7 +185,8 @@ try:
  main_rows=list(csv.DictReader((folder/'runtime.csv').open()))
  joints=np.array([[float(row['j%d_rad' % joint]) for joint in range(1,8)] for row in main_rows])
  max_joint_step_deg=float(np.rad2deg(np.abs(np.diff(joints,axis=0)).max()))
- assert max_joint_step_deg<=.020001, ('joint command step exceeds 2 deg/s at 10 ms',max_joint_step_deg)
+ assert summary['timing']['period_ms']==5
+ assert max_joint_step_deg<=summary['control']['joint_speed_cap_deg_s']*.005+1e-6, ('joint speed cap exceeded',max_joint_step_deg)
  assert summary['simulated'] and summary['mode']=='dry_run'
  assert summary['servo']['sent_sequence']==0
  if args.unlimited_excursion or args.unlimited_translation:
@@ -195,7 +196,7 @@ try:
  assert summary['control']['wrist_translation_limit_enabled'] == (not (args.unlimited_excursion or args.unlimited_translation))
  assert summary['control']['wrist_orientation_limit_enabled'] == (not args.unlimited_excursion)
  assert summary['control']['wrist_position_tracking_error_limit_enabled'] == (not args.unlimited_position_tracking_error)
- assert summary['control']['joint_speed_cap_deg_s'] == 2.0
+ assert summary['control']['joint_speed_cap_deg_s'] == 3.0
  assert summary['control']['wrist_candidate_trial'] == args.candidate_trial
  assert summary['control']['force_sensor_enabled'] == (not args.no_force)
  if args.no_force:

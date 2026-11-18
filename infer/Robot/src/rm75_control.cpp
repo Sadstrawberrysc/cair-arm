@@ -271,8 +271,8 @@ Eigen::Matrix<double, 6, 1> Rm75ControlLaw::FilterWrench(
     const Eigen::Matrix<double, 6, 1>& wrench) {
     if (!config_.legacy_wrench_filter_enabled) return wrench;
     const double measurement_noise =
-        config_.legacy_wrench_filter_measurement_noise;
-    const double process_noise = config_.legacy_wrench_filter_process_noise;
+        config_.legacy_wrench_filter_measurement_noise * (0.010 / config_.cycle_s);
+    const double process_noise = config_.legacy_wrench_filter_process_noise * (config_.cycle_s / 0.010);
     if (!wrench_filter_initialized_) {
         filtered_wrench_ = wrench;
         wrench_filter_covariance_.setConstant(process_noise);
@@ -295,8 +295,8 @@ Eigen::Vector3d Rm75ControlLaw::FilterContactPoint(
     const Eigen::Vector3d& point) {
     if (!config_.legacy_contact_filter_enabled) return point;
     const double measurement_noise =
-        config_.legacy_contact_filter_measurement_noise;
-    const double process_noise = config_.legacy_contact_filter_process_noise;
+        config_.legacy_contact_filter_measurement_noise * (0.010 / config_.cycle_s);
+    const double process_noise = config_.legacy_contact_filter_process_noise * (config_.cycle_s / 0.010);
     if (!contact_filter_initialized_) {
         filtered_contact_point_ = point;
         contact_filter_covariance_.setConstant(process_noise);
@@ -862,7 +862,7 @@ Rm75ControlOutput Rm75ControlLaw::Step(const Rm75ControlInput& input,
         // Roll 与 Pitch 必须使用同一份 Kalman 后接触点，避免原始接触点
         // 的瞬时噪声绕过滤波器而直接形成 Pitch 姿态指令。
         delta_pitch = Clamp(
-            -config_.contact_pitch_gain_rad_per_m
+            -config_.contact_pitch_gain_rad_per_m * (dt / 0.010)
                 * output.filtered_contact_point_probe_m.y(),
             -max_angular_step,
             max_angular_step);
@@ -1222,6 +1222,8 @@ Rm75ServoPlan Rm75ServoPlanner::Plan(
 
 void WristFollowController::Hold(const std::string& reason) {
     following_ = false; reason_ = reason;
+    tracking_position_ = false;
+    last_capture_ns_ = 0;
 }
 WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
     WristFollowOutput out;
@@ -1237,8 +1239,16 @@ WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
         token_ = in.request_token;
         Hold(in.action == "end" ? "operator_ended" : "operator_paused");
     }
+    if (in.awaiting_pose_feedback && following_ && !new_request && !in.external_hold
+        && in.producer_id == producer_ && in.target_id == target_
+        && in.capture_ns > last_capture_ns_) {
+        out.following = true;
+        out.waiting_for_pose = true;
+        return out;
+    }
     if (in.external_hold || !in.fresh || !in.actual_tcp.allFinite()
         || !in.surface_base.allFinite() || !in.normal_base.allFinite()
+        || in.capture_ns <= 0 || in.producer_id.empty() || in.target_id.empty()
         || std::abs(in.normal_base.norm()-1.) > .01
         || !std::isfinite(in.cycle_s) || in.cycle_s <= 0 || in.cycle_s > .05) {
         if (following_ || (new_request && (in.action == "begin" || in.action == "resume")))
@@ -1257,12 +1267,19 @@ WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
             Hold("resume_requires_new_click");
         else {
             following_ = true; ever_started_ = true; target_ = in.target_id;
+            producer_ = in.producer_id;
             reference_ = in.actual_tcp; out.reference_reset = true; reason_.clear();
         }
     }
     if (!following_) { out.reason = reason_; return out; }
     if (in.target_id != target_) {
         Hold("target_changed_while_following"); out.reason = reason_; return out;
+    }
+    if (in.producer_id != producer_) {
+        Hold("producer_changed_while_following"); out.reason = reason_; return out;
+    }
+    if (in.capture_ns < last_capture_ns_) {
+        Hold("wrist_capture_time_reversed"); out.reason = reason_; return out;
     }
     const Eigen::Vector3d n = in.normal_base.normalized(), z = -n;
     Eigen::Vector3d x = reference_.topLeftCorner<3,3>().col(0);
@@ -1281,17 +1298,25 @@ WristFollowOutput WristFollowController::Step(const WristFollowInput& in) {
         orientation_goal_ = rotation;
     }
     rotation = orientation_goal_;
+    last_capture_ns_ = in.capture_ns;
     out.tcp_goal.topLeftCorner<3,3>() = rotation;
-    out.tcp_goal.topRightCorner<3,1>() = in.surface_base + .050*n;
-    out.actual_gap_m = (in.actual_tcp.topRightCorner<3,1>() - in.surface_base).dot(n);
     Eigen::Vector3d delta = out.tcp_goal.topRightCorner<3,1>() - reference_.topRightCorner<3,1>();
     const double distance = delta.norm();
-    if (distance > .004*in.cycle_s) delta *= .004*in.cycle_s/distance;
     out.tcp_reference = reference_;
-    out.tcp_reference.topRightCorner<3,1>() += delta;
+    const double position_threshold = tracking_position_ ? kPositionStopErrorM : kPositionStartErrorM;
+    tracking_position_ = distance > position_threshold;
+    if (tracking_position_) {
+        const double maximum_step = kPositionSpeedMPerS * in.cycle_s;
+        if (distance > maximum_step) delta *= maximum_step / distance;
+        out.tcp_reference.topRightCorner<3,1>() += delta;
+    }
     Eigen::Quaterniond current(reference_.topLeftCorner<3,3>()), desired(rotation);
     const double angle = current.angularDistance(desired);
-    const double fraction = angle < 1e-12 ? 1. : std::min(1., (4.*M_PI/180.)*in.cycle_s/angle);
-    out.tcp_reference.topLeftCorner<3,3>() = current.slerp(fraction, desired).normalized().toRotationMatrix();
+    if (angle > 1e-12) {
+        const double maximum_step = kAngularSpeedDegPerS * kDegToRad * in.cycle_s;
+        const double fraction = std::min(1., maximum_step / angle);
+        out.tcp_reference.topLeftCorner<3,3>() = current.slerp(fraction, desired).normalized().toRotationMatrix();
+    }
+    out.motion_requested = tracking_position_ || angle > 1e-12;
     out.following = true; return out;
 }

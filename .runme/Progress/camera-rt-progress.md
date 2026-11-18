@@ -1,9 +1,58 @@
-# Camera_RT 项目进展（Runme notebook）
+# Camera_RT 项目进展
 
-> 本文件是纳入 Git 的 Runme notebook；当前架构见
-> `infer/Camera_RT/ARCHITECTURE.md`。
+> 本文件记录进展、验证结果与待办；当前架构见
+> [Camera_RT 架构](../../infer/Camera_RT/ARCHITECTURE.md)，操作见
+> [全局相机手册](../run/camera-rt-operations.md)。
 
-更新日期：2026-11-10
+更新日期：2026-11-16
+
+## 2026-11-16：共享图像窗口改为仅显示颈动脉采样点
+
+按用户指定，共享模式显示 color stream（原始画面＋颈动脉点），首点红圈突出，
+不显示 result 模型叠加窗口；无检测目标时也只刷新 color stream。
+点云红点匹配及规划逻辑保持原值。仅语法与显示分支静态检查，未启动设备或 GUI。
+
+## 2026-11-16：共享一台 D455 的颈动脉／点云双窗口
+
+现场 errno=16 来自旧 Collision 执行模式占用 D455，未停止该进程。新增 camera_access 启动前只读提示。
+全局 --collision 改为同源双窗口：C++ 独占相机、共享 RGB／对齐深度，cliff_demo --shared-frames 不再打开设备。
+实时返回带源身份的识别结果，C++ 最近点匹配、红点显示和规划目标替换，沿法向后退 100 mm。
+无需先保存 TXT；P 规划、E 执行、空格停止，退出窗口结束本阶段；未完成执行时不交接腕部。
+两个窗口异步，识别失效发布 invalid，过期识别不显示实时红点，不回退旧文件。
+旧串行模式和未启用 Collision 的 MoveJ_P 入口保留，旧记录按原执行范围解释。
+构建、既有交接／深度投影／采样顺序测试、临时共享协议与 C++ 匹配合成验证通过；
+未启动 GPU 模型、相机、GUI 或机械臂，实际显示和映射精度待现场验证。
+
+## 2026-11-13：可选 Collision 粗定位执行链路
+
+run_probe_target.py 新增 --collision：本轮采点并释放相机后进入 C++ 相机场景／IK／OMPL，
+以 Robot 关节路径执行替代该分支的单次 MoveJ_P。--dry-run 只规划，原默认入口保留。
+一键流程也可选用该分支；规划、执行或停止确认失败不启动腕部阶段。
+终点沿外法向后退 100 mm，执行参考最高 3°/s；其他约束见
+[执行说明](../../infer/Collision/EXECUTION.md)。10 项采点／交接、8 项模拟流程生命周期测试及
+既有 probe_reach_test 通过，C++ 构建和仅本机回环的执行／停止模拟通过；未执行真实设备验证。
+
+## 2026-11-13：按最新要求统一后退 10 cm
+
+生产全局定位的 Tool-Z 偏置改为 -0.100 m，Collision 日常配置及 C++ 缺省后退值改为 0.10 m。
+两条链路均沿原外法向后退 100 mm，相关提示、文档和既有测试预期同步；下方 20 cm 记录保留为历史。
+Collision 监测程序编译、8 项既有离线交接／姿态测试、三处默认距离一致性和差异检查通过。
+保留姿态采样、速度、可达性和碰撞检查策略，未启动相机或真实机械臂。
+
+## 2026-11-13：生产全局定位与 Collision 统一后退 20 cm
+
+按用户要求，`run_probe_target.py` 的初始 Tool-Z 偏置由 -0.100 m 改为 -0.200 m，
+与 Collision 的 `standoff_m=0.20` 一致；输出提示、既有交接测试预期及当前文档同步。
+保留短轴姿态、速度参数 6 和运动前几何臂展检查，旧的 10 cm 调整记录保留为历史。
+8 项既有离线交接／姿态测试、Python 语法、两入口距离一致性及差异检查通过。
+未启动相机或真实机械臂；统一目标距离不代表已接通 OMPL 路径执行。
+
+## 2026-11-13：第一步定位速度翻倍
+
+按用户要求，全局定位后的单次 MoveJ_P 默认速度参数由 3 调为 6，
+启动脚本和 `arm_probe_pose` 的速度参数范围同步支持 6。
+`arm_probe_pose` 已重编译；9 项 Robot 离线测试及 8 项模拟交接 / 姿态测试通过，
+覆盖默认速度 6 透传及工具接受 6、拒绝 7。未启动真实机械臂，尚未进行真机速度验收。
 
 ## 2026-11-10 首次 MoveJ_P 后退距离调整为 10 cm
 
@@ -31,7 +80,7 @@
 
 按用户反馈，`run_probe_target.py` 将 Tool +X 沿顶部首点到后续点的投影切向，
 相对原 -X 对齐绕局部 Tool Z 旋转 180°。Tool +Z 朝内与后退 50 mm 的目标位置不变，
-控制器欧拉角和可选腕部投影 seed 同步使用修正后的姿态；启动命令保持不变。
+控制器欧拉角和可选腕部投影 seed 同步使用修正后的姿态。
 12 项相机离线测试与 8 项模拟交接/姿态测试通过，覆盖斜向法向下的局部 Z 半圈旋转、
 位置不变、欧拉角还原及 seed 朝向一致。本轮未采集真实相机或执行机械臂运动。
 
@@ -39,7 +88,7 @@
 
 按用户要求，采样像素改为 y 从小到大稳定排序；新快照第二行是最上方采样点，
 法向在该点邻域计算，下游切向从该点指向后续首个非重复点。
-机械臂仍读取本轮新快照的首点生成初始位姿，启动命令保持不变。
+机械臂仍读取本轮新快照的首点生成初始位姿。
 此前“最下方首点”的记录保留为历史。
 12 项相机离线测试与 5 项模拟下游交接测试通过，含图像最上方点与三维 Y 最小点
 不一致的回归场景；本轮未采集真实相机或执行机械臂运动。
@@ -53,8 +102,8 @@
   `QObject::moveToThread` 和字体警告均为零。
 - 渲染分桶容量设为单个网格的全部面数。CPU 与宿主 GPU 的 10,001 面合成网格
   渲染检查通过；路径格式、采样顺序、深度反投影共 11 项离线测试通过。
-- 启动命令保持 `python infer/hand_eye_calibration-main/run_probe_target.py`。
-  本轮未采集真实相机画面、未连接或运动机械臂，完整现场流程仍待复验。
+
+本轮未采集真实相机画面、未连接或运动机械臂，完整现场流程仍待复验。
 
 ## 当前状态
 
@@ -62,7 +111,7 @@ Camera_RT 负责 RealSense、Faster R-CNN、CLIFF / SMPL 解剖叠加及相机�
 当前使用左颈动脉 6 个模型顶点，像素 y 升序、顶部首点；法向随首点计算。旧记录中的左侧 8 点和底部优先属于历史。
 
 下游 `run_probe_target.py` 读取本轮新快照，用 D455 外参转换首点并构造短轴姿态，沿 Tool -Z 后退 100 mm，
-调用 `arm_probe_pose --controller-movej-p`。默认速度 3、会真实运动；`--dry-run` 预览并检查几何臂展上界，不验证完整控制器 IK / 可达性。
+通过 `arm_probe_pose` 执行控制器 MoveJ_P，默认速度 6；只读预览支持几何臂展上界检查，尚不验证完整控制器 IK / 可达性。
 历史 `infer/Calibration` 目录已不存在，accepted Base 路径不是当前串联入口。
 
 2026-10-30 已按授权部署新 D455 50 组标定结果，`user_confirmed=true`、独立验证 false，未叠加旧经验修正；
@@ -91,7 +140,7 @@ Camera_RT 负责 RealSense、Faster R-CNN、CLIFF / SMPL 解剖叠加及相机�
 | 检测器缓存 | Faster R-CNN checkpoint 已存在于 Torch hub cache，大小 167502836 bytes |
 | PyTorch3D 来源 | 0.7.5 原生扩展由 `/home/cair-jacen/Pytorch/pytorch3d` editable checkout 提供 |
 
-2026-09-02 在普通宿主终端重新运行 `python tools/preflight.py --runtime`，结果为
+2026-09-02 在普通宿主终端重新运行宿主预检，结果为
 `blocked=0, warnings=2`：NVIDIA driver、Torch CUDA、RealSense kernel 和 RealSense SDK
 device 全部通过。当时的两个警告分别是 PyTorch3D 使用外部 editable checkout，以及
 Faster R-CNN checkpoint 尚未缓存；后者现已缓存，只剩 editable 安装可移植性警告。
@@ -119,16 +168,7 @@ SDK `camera_info.serial_number` 为运行身份，同时保留 USB descriptor se
 - 路径输出没有时间戳、设备身份、内参摘要、置信度或坐标 schema 版本。
 - `artery_path_rbt.txt` 没有当前生成器，历史含义不可信。
 
-## 当前验证命令
-
-```bash {"ignore":"true"}
-source /home/cair-jacen/anaconda3/etc/profile.d/conda.sh
-conda activate camera
-cd /home/cair-jacen/uspilot_ctrl-main/infer/Camera_RT
-python tools/preflight.py --static
-python -m unittest tools/test_path_format.py tools/test_sample_order.py tools/test_depth_projection.py
-python tools/preflight.py --runtime
-```
+## 已有验证结果
 
 静态预检、格式测试、宿主运行预检与入口启动均已通过。该结论证明依赖、资产、设备访问和
 实时程序可用，但尚不代表叠加精度、深度精度或输出路径空间准确性已经验收。

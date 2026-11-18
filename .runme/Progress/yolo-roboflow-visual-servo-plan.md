@@ -74,7 +74,7 @@ v1 未保留多框数值，工具随后补齐全部检测框；历史报告为 `
 用户报告自采约 50 张并在 Roboflow 训练；当时本机未取得文件、划分、标注和结果，不与 P001 的 30 组混计。
 提供的 [v4 页面](https://app.roboflow.com/songjiatong/carotid-detect-c9gi9/4?openModelEval=true) 为账号页面，URL 不能证明模型类型、训练完成或评估指标。
 交接需记录项目 / 模型 / 数据版本、框或关键点的目标定义、主体划分、预测样例及本地部署格式，离线复核后再联调。
-旧 ANNOTATION / DEPLOYMENT / RETRAINING 文档已移除；当前模型更换方法见[模型进展](carotid-begin-progress.md#更换模型)。
+旧 ANNOTATION / DEPLOYMENT / RETRAINING 文档已移除；当前模型更换方法见[腕部操作](../run/camera-wrist-operations.md#更换模型)。
 
 ## 早期工作包（历史方案）
 

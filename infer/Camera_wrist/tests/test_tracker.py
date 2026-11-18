@@ -57,16 +57,16 @@ class TrackerTests(unittest.TestCase):
         self.assertIsNone(q['target_plane_distance_limit_m'])
         self.assertLess(q['target_plane_distance_m'], 1e-6)
 
-    def test_six_texture_features_are_accepted_but_five_rejected(self):
+    def test_four_texture_features_are_accepted_but_three_rejected(self):
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
         features = np.array([[[150+x*5, 115+y*5]]
-                             for y in range(2) for x in range(3)], np.float32)
+                             for y in range(2) for x in range(2)], np.float32)
         for relaxed in (False, True):
             tracker = LocalTracker(relaxed=relaxed)
             with patch('local_tracker.cv2.goodFeaturesToTrack', return_value=features):
-                self.assertEqual(len(tracker._features(gray, [160, 120])), 6)
-            with patch('local_tracker.cv2.goodFeaturesToTrack', return_value=features[:5]):
-                with self.assertRaisesRegex(ValueError, 'fewer than 6 texture features'):
+                self.assertEqual(len(tracker._features(gray, [160, 120])), 4)
+            with patch('local_tracker.cv2.goodFeaturesToTrack', return_value=features[:3]):
+                with self.assertRaisesRegex(ValueError, 'fewer than 4 texture features'):
                     tracker._features(gray, [160, 120])
 
     def test_ten_surface_points_within_ten_mm_are_accepted(self):

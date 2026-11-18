@@ -143,7 +143,7 @@ public:
         const std::string& session, const std::string& hash, const std::string& boot,
         std::int64_t now_ns, WristPacket& output, std::string& error);
     // Startup-only Redis I/O. A fresh matching seed is required before hardware
-    // acquisition starts; no seed reads or JSON work in the 10 ms loop.
+    // acquisition starts; no seed reads or JSON work in the 5 ms loop.
     bool LoadWristProjectionSeed(const std::string& global_hash,
                                 const std::string& wrist_hash,
                                 std::string* error);

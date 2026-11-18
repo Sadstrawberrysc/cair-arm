@@ -584,11 +584,11 @@
        Geometry only: no invented mass/inertia, no TCP or camera optical calibration. -->
   <!-- Override these mounting parameters for preview after physical measurement. -->
   <xacro:arg name="camera_mount_xyz" default="0 0 0" />
-  <!-- 2026-11-09: camera front/back corrected +180 deg about Link7 Z: -60 -> +120 deg; Lprobe unchanged. -->
-  <xacro:arg name="camera_mount_rpy" default="0 0 2.0943951023931953" />
-  <xacro:arg name="connector_mount_xyz" default="0 0 0.010" />
-  <!-- Compensate camera yaw to retain connector and sensor orientation. -->
-  <xacro:arg name="connector_mount_rpy" default="0 0 -2.0943951023931953" />
+  <!-- 2026-11-13: retain Z yaw -60 deg, then rotate +180 deg about the camera mounting frame's local Y. -->
+  <xacro:arg name="camera_mount_rpy" default="0 3.141592653589793 -1.0471975511965976" />
+  <!-- Compensate camera rotation and reversed Z so downstream Link7 poses remain unchanged. -->
+  <xacro:arg name="connector_mount_xyz" default="0 0 -0.010" />
+  <xacro:arg name="connector_mount_rpy" default="0 3.141592653589793 -1.0471975511965976" />
   <xacro:arg name="force_sensor_mount_xyz" default="0 0 0.010" />
   <xacro:arg name="force_sensor_mount_rpy" default="0 0 0" />
   <xacro:arg name="Lprobe_mount_xyz" default="0 0 0.030" />
@@ -596,15 +596,17 @@
 
   <!-- camera: preview mounting and CAD datum; both require physical verification. -->
   <link name="camera_link">
+    <!-- With the local Y flip, offset the CAD datum by its 36.607 mm thickness
+         so the camera stays on the positive-Z side of the Link7 flange. -->
     <visual>
-      <origin xyz="-0.0285 0.0285 0" rpy="1.5707963267948966 0 0" />
+      <origin xyz="-0.0285 0.0285 -0.036607" rpy="1.5707963267948966 0 0" />
       <geometry>
         <mesh filename="package://rm_description/meshes/rm_75_arm/camera.STL" scale="0.001 0.001 0.001" />
       </geometry>
       <material name="camera_preview_material"><color rgba="0.75 0.85 1 1" /></material>
     </visual>
     <collision>
-      <origin xyz="-0.0285 0.0285 0" rpy="1.5707963267948966 0 0" />
+      <origin xyz="-0.0285 0.0285 -0.036607" rpy="1.5707963267948966 0 0" />
       <geometry>
         <mesh filename="package://rm_description/meshes/rm_75_arm/camera.STL" scale="0.001 0.001 0.001" />
       </geometry>

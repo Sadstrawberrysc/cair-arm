@@ -72,16 +72,26 @@ Esc 写入当前结果后退出，`s` 写入后继续。此前已经保存的文
 
 输出窗口为 `result`（骨骼 / 血管叠加）和 `color stream`（采样像素辅助画面），均缩放到
 800×600。文件内坐标来自缩放前的原图；画面里的标记不能据此认作 P0 真值。
+共享双窗口模式只显示 `color stream`：原始相机画面和颈动脉采样点，首点红圈突出；
+不显示 `result`，另一窗口由 Collision 显示点云及红色匹配点。
 旧 `artery_path_rbt.txt` 没有可信生成器或当前 schema，文件名不能证明坐标属于机器人。
 
 ## 下游初始定位
+
+默认仍由 run_probe_target 调用单次 MoveJ_P。显式 `--collision` 分支同时打开识别图与点云窗口，
+仅 C++ 打开 D455；cliff_demo 的 --shared-frames 模式读取 C++ 原子发布的 RGB／对齐深度及内参，
+返回带源帧号、采集时间、相机／标定／会话身份的颈动脉首点、法向和切向。
+C++ 将首点匹配到当前保留环境点云并标红；P 固定红点，沿法向后退 100 mm 规划，E 执行。
+识别失效时发布 invalid，不回退旧 TXT；双窗口异步更新，未实现硬同步。
+`--dry-run` 在该分支只读。执行成功并确认静止、退出窗口后才交接，详见
+[执行说明](../Collision/EXECUTION.md)。下表的 MoveJ_P／投影 seed 描述属于原分支。
 
 | 步骤 | 已实现行为 | 源码 / 验收边界 |
 | --- | --- | --- |
 | 采集快照 | `run_probe_target` 记录旧文件签名，运行相机，成功退出后要求新快照且读取期间未变 | [run_probe_target.py](../hand_eye_calibration-main/run_probe_target.py)；签名含 device / inode / size / mtime / ctime，mtime 不是曝光时间 |
 | 提取首点 / 方向 | 一行非零法向 + 至少两点；取首点与第一个间距 >1 μm 的后续点，单位化法向与切向 | 同上；所有行必须三列有限值；单位切向在切平面的投影范数 <0.001 时拒绝短轴姿态 |
 | 相机 → Base | `p_base=R×p_camera+t`；方向只乘 R | [transform_point.py](../hand_eye_calibration-main/transform_point.py) |
-| 构造短轴姿态 | Tool +Z 朝内，+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转 180°）；沿 Tool -Z 后退 100 mm | `run_probe_target`；100 mm 是计算偏置，不是实际净空 |
+| 构造短轴姿态 | Tool +Z 朝内，+X 沿血管投影切向（相对原姿态绕 Tool Z 旋转 180°）；沿 Tool -Z 后退 100 mm，与 Collision 一致 | `run_probe_target`；100 mm 是计算偏置，不是实际净空 |
 | 单点调用 | 传 `--target-pose-m-rad --controller-movej-p` 给 `arm_probe_pose` | [Robot 维护工具](../Robot/tests/tools/arm_probe_pose.cpp)；默认编排可执行运动，非只读相机功能 |
 | 可选投影 seed | `--wrist-handoff` 起始先删除旧 seed；非 dry-run、定位子进程成功退出且两份外参摘要未变才写入 TTL 60 秒 seed | `scope=projection_preview_only`；不授权腕部自动运动；dry-run 也会删除旧 seed，但不发布新 seed |
 

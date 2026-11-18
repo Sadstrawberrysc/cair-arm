@@ -30,7 +30,8 @@ bool AsyncRuntimeLogger::Start(const std::string& path, std::string* error, bool
         wrist_stream_.open(path+".wrist.csv");
         if (!wrist_stream_) { if (error) *error="cannot open wrist log"; return false; }
         wrist_stream_ << "cycle,monotonic_ns,valid,age_ms,pose_span_ms,actual_gap_m,target,reason,"
-            "camera_x,camera_y,camera_z,base_x,base_y,base_z,normal_x,normal_y,normal_z,goal_x,goal_y,goal_z,observation_sequence,capture_monotonic_ns,planner_attempted,planner_valid,planner_error\n";
+            "camera_x,camera_y,camera_z,base_x,base_y,base_z,normal_x,normal_y,normal_z,goal_x,goal_y,goal_z,observation_sequence,capture_monotonic_ns,planner_attempted,planner_valid,planner_error,"
+            "filtered_base_x,filtered_base_y,filtered_base_z,position_filter_valid,position_filter_updated,position_filter_reset,position_filter_dt_s,position_filter_alpha,position_filter_tau_s,position_filter_reset_reason\n";
         wrist_stream_ << std::fixed << std::setprecision(9);
     }
     queue_.resize(kMaximumRows);
@@ -209,7 +210,9 @@ void AsyncRuntimeLogger::ThreadMain() {
             for (const auto* vector : {&row.wrist_point_camera,&row.wrist_surface_base,&row.wrist_normal_base,&row.wrist_goal_tcp})
                 for (int i=0;i<3;++i) wrist_stream_ << ',' << (*vector)[i];
             wrist_stream_ << ',' << row.wrist_observation_sequence << ',' << row.wrist_capture_ns
-                << ',' << row.wrist_plan_attempted << ',' << row.wrist_plan_valid << ',' << row.wrist_plan_error << '\n';
+                << ',' << row.wrist_plan_attempted << ',' << row.wrist_plan_valid << ',' << row.wrist_plan_error;
+            // Preserve the wrist CSV columns for readers of older logs.
+            wrist_stream_ << ",,,,0,0,0,0,0,0,\n";
         }
     }
     stream_.flush();

@@ -1,5 +1,7 @@
 #pragma once
 #include "collision/monitor.hpp"
+#include "collision/robot_read_only.hpp"
+#include <functional>
 #include <memory>
 
 namespace uspilot::collision {
@@ -8,9 +10,13 @@ struct LiveSourceOptions {
     int robot_port = 8080;
     std::string camera_serial;
     int pixel_stride = 8;
+    std::function<ReadOnlyRobotState()> feedback;
+    std::filesystem::path shared_frame_directory;
+    std::string calibration_id;
 };
 // Available only with BUILD_REALSENSE_SOURCE=ON. Opens a single D455 and a
-// separate state-only controller connection for standalone diagnostics.
+// state-only controller connection, or an injected Robot execution feedback
+// source. The injected source prevents opening a second controller connection.
 class LiveMonitorSource {
   public:
     explicit LiveMonitorSource(const LiveSourceOptions &options);

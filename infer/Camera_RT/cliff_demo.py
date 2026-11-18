@@ -1,6 +1,21 @@
 import atexit
+import argparse
 import os
+import sys
 from pathlib import Path
+from camera_access import ensure_global_camera_free
+
+shared_frame_directory = None
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--shared-frames', type=Path, help='Read the C++ camera stream; do not open D455')
+    shared_frame_directory = parser.parse_args().shared_frames
+    try:
+        if shared_frame_directory is None:
+            ensure_global_camera_free()
+    except ValueError as error:
+        print('BLOCKED: {}'.format(error), file=sys.stderr)
+        raise SystemExit(2)
 
 import cv2
 
@@ -36,6 +51,7 @@ from common import constants
 from common.utils import strip_prefix_if_present, cam_crop2full, video_to_images
 from common.utils import estimate_focal_length
 from common.imutils import process_image
+from shared_frames import SharedFrames
 
 
 def top_first_pixels(pixels):
@@ -228,46 +244,46 @@ if __name__ == '__main__':
     # Setup the SMPL model
     smpl_model = smplx.create(constants.SMPL_MODEL_DIR, "smpl").cuda()
 
-    # realsense
-    align = rs.align(rs.stream.color)
-    # Create pipeline
-    pipeline = rs.pipeline()
-
-    # Create a config object
-    config = rs.config()
-
-    # Configure the streams before starting the pipeline. These are the same
-    # stream requests used previously; only the initialization order changes.
-    config.enable_stream(rs.stream.depth, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color)
-
-    # bag file
-    # rs.config.enable_device_from_file(config, '/home/olefine/Documents/male_1.bag')
-    # profile = pipeline.start(config)
-    # playback = profile.get_device().as_playback()
-    # playback.set_real_time(False)
-
-    # # real-time
-    profile = pipeline.start(config)
+    pipeline = None
+    shared = SharedFrames(shared_frame_directory) if shared_frame_directory else None
+    pending_shared = None
     def close_camera_resources():
         try:
-            pipeline.stop()
+            if pipeline is not None:
+                pipeline.stop()
         except RuntimeError:
             pass
         cv2.destroyAllWindows()
 
     atexit.register(close_camera_resources)
 
-    intr = profile.get_stream(
-        rs.stream.color).as_video_stream_profile().get_intrinsics()
+    if shared:
+        while pending_shared is None:
+            pending_shared = shared.next()
+        _, _, intr, depth_scale = pending_shared
+    else:
+        align = rs.align(rs.stream.color)
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.depth, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color)
+        try:
+            profile = pipeline.start(config)
+        except RuntimeError as error:
+            close_camera_resources()
+            atexit.unregister(close_camera_resources)
+            if 'errno=16' in str(error) or 'Device or resource busy' in str(error):
+                print('BLOCKED: D455 被其他程序占用；双窗口使用 start_monitor.sh --carotid，共享一台相机。', file=sys.stderr)
+                raise SystemExit(2) from None
+            raise
+        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
     pinhole_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
         intr.width, intr.height, intr.fx, intr.fy, intr.ppx, intr.ppy)
 
 
     extrinsic = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 
-    depth_sensor = profile.get_device().first_depth_sensor()
-    depth_scale = depth_sensor.get_depth_scale()
     depth_scale_inv = 1 / depth_scale
 
     skel_file = 'data/skel_params.pkl'
@@ -279,23 +295,37 @@ if __name__ == '__main__':
 
     # The expanded Qt toolbar loads Conda image plugins linked to another Qt.
     # Use plain windows; s/q/Esc are still handled by waitKey below.
-    cv2.namedWindow("result", cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    if not shared:
+        cv2.namedWindow("result", cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
     cv2.namedWindow("color stream", cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
 
     while True:
 
-        rs_frames = pipeline.wait_for_frames()
-        aligned_frames = align.process(rs_frames)
-        rs_depth_frame = aligned_frames.get_depth_frame()
-        np_depth = np.asanyarray(rs_depth_frame.get_data())
-
-        rs_color_frame = aligned_frames.get_color_frame()
-        image = np.asanyarray(rs_color_frame.get_data())  # 原始图像
+        if shared:
+            sample = pending_shared if pending_shared is not None else shared.next()
+            pending_shared = None
+            if sample is None:
+                if cv2.waitKey(20) & 0xFF in (ord('q'), 27):
+                    break
+                continue
+            image, np_depth, intr, depth_scale = sample
+        else:
+            rs_frames = pipeline.wait_for_frames()
+            aligned_frames = align.process(rs_frames)
+            np_depth = np.asanyarray(aligned_frames.get_depth_frame().get_data())
+            image = np.asanyarray(aligned_frames.get_color_frame().get_data())
 
         input_image = image.copy()
         det_input = det_transform(input_image).cuda()
         det_output = det_model([det_input])[0]
-        bbox = np.array(get_one_box(det_output))  # list
+        box = get_one_box(det_output)
+        if box is None and shared:
+            shared.publish()
+            cv2.imshow('color stream', cv2.resize(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), (800, 600)))
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                break
+            continue
+        bbox = np.array(box)
 
         img_h, img_w, _ = input_image.shape
         focal = estimate_focal_length(img_h, img_w)
@@ -386,46 +416,53 @@ if __name__ == '__main__':
         image_vis = image_vis.astype(np.uint8)
         image_vis = cv2.cvtColor(image_vis, cv2.COLOR_RGB2BGR)
 
-        artery_pixel_coords = top_first_pixels(artery_pixel_coords.cpu().numpy())
-
         # 像素坐标转换为相机坐标
-        artery_camera_coords = kpt_2d_to_3d(artery_pixel_coords, np_depth, intr, depth_scale)
-        # 求初始点法向量
-        x_range = np.arange(artery_pixel_coords[0, 0] - 2, artery_pixel_coords[0, 0] + 2)
-        y_range = np.arange(artery_pixel_coords[0, 1] - 2, artery_pixel_coords[0, 1] + 2)
-        xx, yy = np.meshgrid(x_range, y_range)
-        neighborhood = np.column_stack((xx.ravel(), yy.ravel()))
-        neighborhood = kpt_2d_to_3d(neighborhood, np_depth, intr, depth_scale)
-        # 拟合平面
-        centroid = np.mean(neighborhood, axis=0)
-        centered_points = neighborhood - centroid
-        _, _, V = svd(centered_points)
-        normal_vector = V[-1]
-
-        ### Add by Guanglin to prevent the normal vector opposite
-        if normal_vector[2] > 0:
-            normal_vector = -normal_vector
+        valid_target = True
+        try:
+            artery_pixel_coords = top_first_pixels(artery_pixel_coords.cpu().numpy())
+            artery_camera_coords = kpt_2d_to_3d(artery_pixel_coords, np_depth, intr, depth_scale)
+            x_range = np.arange(artery_pixel_coords[0, 0] - 2, artery_pixel_coords[0, 0] + 2)
+            y_range = np.arange(artery_pixel_coords[0, 1] - 2, artery_pixel_coords[0, 1] + 2)
+            xx, yy = np.meshgrid(x_range, y_range)
+            neighborhood = np.column_stack((xx.ravel(), yy.ravel()))
+            neighborhood = kpt_2d_to_3d(neighborhood, np_depth, intr, depth_scale)
+            centroid = np.mean(neighborhood, axis=0)
+            _, _, V = svd(neighborhood - centroid)
+            normal_vector = V[-1]
+            if normal_vector[2] > 0:
+                normal_vector = -normal_vector
+            if shared:
+                shared.publish(artery_camera_coords, normal_vector)
+        except (ValueError, np.linalg.LinAlgError):
+            if not shared:
+                raise
+            shared.publish()
+            valid_target = False
+            artery_pixel_coords = np.empty((0, 2))
 
         # 绘制每个点
         pixel_coords = artery_pixel_coords.astype(int)
         for i in range(pixel_coords.shape[0]):
             x, y = pixel_coords[i]
             cv2.circle(image, (x, y), radius=3, color=(255, 0, 0), thickness=-1)
-        image_vis = cv2.resize(image_vis,(800,600))
-        cv2.imshow("result", image_vis)
+        if valid_target and len(pixel_coords):
+            cv2.circle(image, tuple(pixel_coords[0]), radius=6, color=(255, 0, 0), thickness=2)
+            cv2.circle(image_vis, tuple(pixel_coords[0]), radius=6, color=(0, 0, 255), thickness=2)
+        if not shared:
+            image_vis = cv2.resize(image_vis,(800,600))
+            cv2.imshow("result", image_vis)
         # cv2.moveWindow("result", 100, 2200)
 
         # cv2.imshow("depth Stream", np_depth)
 
         img_show_pcd = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        img_pcd_part = img_show_pcd#[0:1080,400:800]
-        img_pcd_part = cv2.resize(img_pcd_part,(800,600))
+        img_pcd_part = cv2.resize(img_show_pcd,(800,600))
         cv2.imshow("color stream", img_pcd_part)
 
         # cv2.moveWindow("color stream", 1500, 2200)
         
         key = cv2.waitKey(1)
-        if key & 0xFF == ord('s') or key == 27:
+        if valid_target and (key & 0xFF == ord('s') or key == 27):
             # np.savetxt('artery_path.txt', artery_camera_coords, fmt='%.6f')
             with open("artery_path.txt", "w") as f:
                 data_save = "{:.3f} {:.3f} {:.3f}\n".format(normal_vector[0],normal_vector[1],normal_vector[2])

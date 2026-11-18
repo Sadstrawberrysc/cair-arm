@@ -1,17 +1,29 @@
-# C++ 只读相机—机械臂碰撞监测
+# C++ 相机—机械臂碰撞监测与可选执行
 
 更新：2026-11-03。入口为 `build-monitor/collision_monitor`，当前已完成编译、SDK 动态链接和离线夹具验证；真实 D455／RM75 联机与空间误差尚未验收。
 
 模块分层、坐标／时间契约及与 Robot 的连接边界见 [ARCHITECTURE.md](ARCHITECTURE.md)；后续规划与执行路线见 [README.md](README.md)。
 
 本工具可以打开 D455、通过独立 TCP 连接读取七轴反馈，显示 Base 下点云和机械臂，查询已观测障碍物的距离。
-它不发送 MoveJ、ServoJ、Hold 或 Stop，不会控制或自动保护正在运动的机械臂；已支持按 P 用相机快照触发 OMPL，Robot 停止监督尚未接入。
+默认模式不发送 MoveJ、ServoJ、Hold 或 Stop，不控制其他进程的运动；按 P 使用相机快照触发 OMPL。
+显式 `--execute` 启用 Robot 关节路径执行与新场景许可监督，P 规划、E 执行、空格停止，
+从采点到执行的命令与约束见 [EXECUTION.md](EXECUTION.md)。下文只读说明均指未启用 `--execute` 的模式。
 独立人工场景 OMPL 入口见 [PLANNING.md](PLANNING.md)，系统架构与进展见 [ARCHITECTURE.md](ARCHITECTURE.md)、[PROGRESS.md](PROGRESS.md)。
 所有非机器人深度观测都参与障碍物检查，包括人体、床和设备，当前不进行人体分类。
 
 ## 当前本机直接使用
 
+同时显示实时颈动脉识别和点云，匹配环境最近点并标红：
+
+```bash
+./infer/Collision/start_monitor.sh --carotid
+```
+
+按 P 使用红点作为表面基准、沿法向后退 100 mm 规划；加 --execute 才可按 E 执行。
+此模式只打开一台 D455，不依赖保存 TXT，操作见 [EXECUTION.md](EXECUTION.md)。
+
 实时启动默认启用粗定位，无需 `--coarse`；在窗口按 P 规划。加 `--monitor-only` 仅监测，原 `--coarse` 参数仍兼容。
+日常配置 `joint_limit_margin_deg=3`：IK、关节搜索和状态／路径段复查均预留 3° 关节限位裕量。
 回放仍默认只监测，需要规划时显式加 `--coarse` 或 `--goal`。
 默认精简输出：启用规划时不打印正常采集帧，只在规划后输出一行 `camera_plan` 结果；
 无目标监测时只在状态或风险对象变化时打印。输入失效和致命错误仍报告。
@@ -161,7 +173,7 @@ cmake --build infer/Collision/build-monitor --target collision_monitor -j2
 ./infer/Collision/start_monitor.sh --coarse
 ```
 
-窗口按 **P** 后执行：TXT 顶部首点／法向／切向 → 同一相机标定下的 Base 目标 → 探头 TCP 沿外法向后退 200 mm →
+窗口按 **P** 后执行：TXT 顶部首点／法向／切向 → 同一相机标定下的 Base 目标 → 探头 TCP 沿外法向后退 100 mm →
 URDF 数值 IK 候选 → 当前相机场景的整臂状态检查 → OMPL → 全路径复查。绿色线和 JSON 结果仍为只读预览。
 无窗口计算一次使用 `./infer/Collision/start_monitor.sh --coarse --plan-once --headless`。
 
@@ -174,7 +186,7 @@ URDF 数值 IK 候选 → 当前相机场景的整臂状态检查 → OMPL → �
 | `camera_calibration_file` | 当前 D455→Base 文件 | 摘要及序列号必须与当前监测场景一致 |
 | `tool_calibration_file` | `Robot/build/rm75_force_calibration.json` | 复用 Robot schema-v2 中的 ArmTip／Sensor／Tool 和探头 TCP 几何，要求几何链已确认 |
 | `arm_tip_link` | `Link7` | 控制器 ArmTip 对应的 URDF 连杆，不能把 CAD 的 `Lprobe_link` 原点当作 TCP |
-| `standoff_m` | `0.20` | 沿表面外法向（目标 Tool -Z）后退 200 mm；不是整臂净空，整臂仍受 FCL 约束 |
+| `standoff_m` | `0.10` | 沿表面外法向（目标 Tool -Z）后退 100 mm；不是整臂净空，整臂仍受 FCL 约束 |
 | `max_target_age_s` | `0` | 0 关闭文件时效检查，允许旧文件；正数（最多 3600 秒）恢复读取前及规划后的时效检查 |
 | `surface_match_tolerance_m` | `0` | 0 关闭目标点云匹配门限，距离仅用于诊断；正数（m，最大 0.1）可重新启用 |
 | `ik_options` | 每姿态最多 8 初值、80 次迭代，共享 4 s | 有界数值 IK；收敛容差 1 mm／0.01 rad，不是物理精度承诺 |
@@ -183,7 +195,7 @@ URDF 数值 IK 候选 → 当前相机场景的整臂状态检查 → OMPL → �
 | `ik_options.max_normal_deviation_deg` | 10 | 每个收敛 IK 解的终点法向偏差必须不超过此值，配置上限为 10° |
 | `ik_options.max_candidates_per_pose` | 1 | 每种姿态最多保留的关节构型，允许 1～4；当前全局最多 5 个候选 |
 
-原始法向与切向给出名义姿态；终点搜索保持沿原外法向后退 0.20 m 的位置，组合绕法向旋转与 9° 倾斜。
+原始法向与切向给出名义姿态；终点搜索保持沿原外法向后退 0.10 m 的位置，组合绕法向旋转与 9° 倾斜。
 采样 9° 为 10° 上限留数值余量，最终仍通过 FK 检查实际轴线角度，超限 IK 解不会进入碰撞或路径规划。
 轴线约定沿用原工程：TCP -Z 对应朝外方向，与原外法向比较；等价于 TCP +Z 与内法向比较。
 10° 限制针对目标姿态，不是整条粗定位路径的姿态约束。仅设置旋转采样 `[0]`、倾斜采样 `[[0,0]]` 可恢复名义姿态。
@@ -309,7 +321,7 @@ IK 与 OMPL 共用总时间和碰撞查询预算；IK 自身还受 `ik_options.t
 | 橙色目标线框 | 目标构型下实际参与 FCL 的凸包／基本体 |
 | 红色目标线框 | 报告违规的目标碰撞体 |
 | 绿色目标表面 | 违规部件在同一目标姿态的原始 STL，便于与凸包对照 |
-| 白色点 | 目标 TCP，按颈动脉表面点沿外法向后退 200 mm |
+| 白色点 | 目标 TCP，按颈动脉表面点沿外法向后退 100 mm |
 | 黄色端点和连线 | FCL 报告的部件／环境最近点及间距 |
 | 附近橙色体素框 | 环境最近点周围 50 mm 内的占据体素，来自同一规划快照 |
 

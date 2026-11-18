@@ -56,6 +56,10 @@ add_library(rm75_motion STATIC
 )
 target_link_libraries(rm75_motion PUBLIC robot_project_options)
 
+# Optional consumer: Collision coarse-positioning pilot; no force/Redis runtime.
+add_library(rm75_joint_path_execution STATIC src/joint_path_executor.cpp)
+target_link_libraries(rm75_joint_path_execution PUBLIC realman_transport rm75_motion)
+
 add_library(rm75_runtime_config STATIC
     src/rm75_runtime_config.cpp
 )

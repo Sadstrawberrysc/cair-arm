@@ -456,15 +456,17 @@
 
   <!-- camera: preview mounting and CAD datum; both require physical verification. -->
   <link name="camera_link">
+    <!-- With the local Y flip, offset the CAD datum by its 36.607 mm thickness
+         so the camera stays on the positive-Z side of the Link7 flange. -->
     <visual>
-      <origin xyz="-0.0285 0.0285 0" rpy="1.5707963267948966 0 0" />
+      <origin xyz="-0.0285 0.0285 -0.036607" rpy="1.5707963267948966 0 0" />
       <geometry>
         <mesh filename="package://rm_description/meshes/rm_75_arm/camera.STL" scale="0.001 0.001 0.001" />
       </geometry>
       <material name="camera_preview_material"><color rgba="0.75 0.85 1 1" /></material>
     </visual>
     <collision>
-      <origin xyz="-0.0285 0.0285 0" rpy="1.5707963267948966 0 0" />
+      <origin xyz="-0.0285 0.0285 -0.036607" rpy="1.5707963267948966 0 0" />
       <geometry>
         <mesh filename="package://rm_description/meshes/rm_75_arm/camera.STL" scale="0.001 0.001 0.001" />
       </geometry>
@@ -473,8 +475,8 @@
   <joint name="camera_mount" type="fixed">
     <parent link="Link7" />
     <child link="camera_link" />
-    <!-- 2026-11-09: user corrected front/back by +180 deg about Link7 Z: -60 -> +120 deg. -->
-    <origin xyz="0 0 0" rpy="0 0 2.0943951023931953" />
+    <!-- 2026-11-13: retain Z yaw -60 deg, then rotate +180 deg about the camera mounting frame's local Y. -->
+    <origin xyz="0 0 0" rpy="0 3.141592653589793 -1.0471975511965976" />
   </joint>
 
   <!-- connector: preview mounting and CAD datum; both require physical verification. -->
@@ -496,8 +498,8 @@
   <joint name="connector_mount" type="fixed">
     <parent link="camera_link" />
     <child link="connector_link" />
-    <!-- Cancel camera yaw so connector and sensor retain their Link7 orientation. -->
-    <origin xyz="0 0 0.010" rpy="0 0 -2.0943951023931953" />
+    <!-- Compensate camera rotation and reversed Z so downstream Link7 poses remain unchanged. -->
+    <origin xyz="0 0 -0.010" rpy="0 3.141592653589793 -1.0471975511965976" />
   </joint>
 
   <!-- force_sensor: preview mounting and CAD datum; both require physical verification. -->

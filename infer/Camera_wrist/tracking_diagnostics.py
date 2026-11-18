@@ -39,7 +39,12 @@ class TrackingDiagnostics:
         if now_active and kind != 'tracking_initialization':
             value['flow_diagnostics'] = {k: tracker.debug[k] for k in (
                 'feature_count', 'forward_matches', 'backward_matches', 'fb_matches',
-                'fb_median_px', 'affine_inliers', 'affine_inlier_ratio', 'affine_scales') if k in tracker.debug}
+                'fb_median_px', 'affine_inliers', 'affine_inlier_ratio', 'affine_scales',
+                'affine_determinant', 'affine_scale_gate_enabled', 'affine_scale_reference_range',
+                'affine_determinant_reference_range', 'affine_reference_exceeded',
+                'affine_scale_diagnostic_error', 'affine_estimation_error', 'tracking_method',
+                'tracking_feature_count', 'tracking_feature_support', 'fallback_reason',
+                'translation_displacement_px') if k in tracker.debug}
         if loss:
             self.event_id += 1
             if event == 'lost':

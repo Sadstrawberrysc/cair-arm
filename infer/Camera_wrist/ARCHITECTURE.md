@@ -1,359 +1,297 @@
 # Camera_wrist 架构
 
-Orbbec Gemini 305 提供腕部同步 RGB-D，
-本模块负责选点、局部追踪、表面法向和观测发布；Robot 独占坐标转换、规划与运动发送。
-`click_follow.py` 与启动脚本无参数时均使用 Roboflow 模型检测 `carotid`；
-模型模式在 Robot 就绪后自动初始选点，有效观测及目标回传确认后请求跟随；`b` 重选并跟随、`d` 只选点。
-传入 `--manual` 切换鼠标选点跟踪；两种模式始终连接 Redis。
+## 业务目标与职责边界
 
-| 能力 / 路径 | 状态 | 当前边界 |
-| --- | --- | --- |
-| 同步 RGB-D、模型 / 鼠标选点、光流与表面法向 | 已实现 | 标准质量门限；程序有效不等于位置真值已验收 |
-| 同源帧检测融合、自动初始开始、暂停回执后的自动恢复 | 已实现 / 真实目标待验收 | 模型服务独立进程；Robot 任意 Hold 不都可恢复 |
-| 全局 seed 投影与可选本地跟踪 | 已实现 / 空间与时序待验收 | `projection_preview_only`，不发布控制请求 |
-| 外参、TCP 净空、动态定位与连续恢复独立评估 | 待验收 | 外参仍为 `independent_validation_recorded=false` |
-| 无力悬停与接触超声力控自动交接 | 后续扩展，当前未实现 | 当前专用脚本不采集力、不执行力闭环 |
+腕部相机提供颈部可见表面的连续观测，供 Robot 生成探头的空中跟随目标。
+业务主线是：建立目标 → 持续定位 → 发布观测 → 确认开始 → Robot 规划执行 → 失效后暂停与重建目标。
 
-| 入口/模块 | 用途 |
-| --- | --- |
-| [click_follow.py](click_follow.py) | 运行参数、RGB-D 采集、窗口、跟踪融合与 Redis I/O，不需要全局相机/seed |
-| [follow_session.py](follow_session.py) | ClickSession 会话与请求，ModelStart 待启动和 ModelRecovery 暂停确认 / 恢复状态机 |
-| [model_selection.py](model_selection.py) | 模型子进程、后台私有 socket 请求、源帧缓存 / 赶帧、检测中心时间对齐融合 |
-| [detector/](detector/ARCHITECTURE.md) | 模型配置、凭据、CUDA 加载、单帧检测、私有协议和常驻 worker |
-| [launch_wrist_terminal.sh](launch_wrist_terminal.sh) | Runme/普通终端统一启动入口：按 `robot` 或 `camera` 打开独立窗口并防止重复启动 |
-| [start_camera.sh](start_camera.sh) | 激活 `camera` 环境、透传模式参数与保存终端日志；首批完整帧超时退出码 7 时只重启一次，不启动 Robot |
-| [start_robot_terminal.sh](start_robot_terminal.sh) | Runme 机器人独立终端：调用既有 `start_robot.sh` 并保留终端输出与退出码 |
-| [projection_preview.py](projection_preview.py) | 全局 seed 投影；加 --track 做本地追踪，不发布控制请求 |
-| [gemini_config.py](gemini_config.py) | 近距离预设、视差读回与视频流选择 |
-| [local_tracker.py](local_tracker.py) | LK 光流、局部仿射与深度平面法向 |
-| [wrist_projection.py](wrist_projection.py) | 标定读取、位姿插值和投影 |
-| [tracking_diagnostics.py](tracking_diagnostics.py) | 失效事件与图像证据 |
+- **腕部相机进程**负责同步 RGB-D、二维选点与跟踪、相机坐标系下的表面点 / 外法向、观测及跟随请求。
+- **模型进程**负责从图像产生二维候选，参与初始选点和持续纠偏。
+- **Robot 进程**独占机械臂反馈、按采集时刻进行坐标转换、生成 TCP 参考、规划和运动发送。
 
-数据流：Gemini → 相机坐标观测 → Redis → Robot 坐标转换/控制/planner；Robot 回传相机位姿和状态。
-模型运行在相机启动的 `ultralytics` Python 子进程，通过继承的私有 `socketpair` 收发 NPZ / JSON，
-没有独立 TCP 服务端口。相机后台线程交换模型请求，主循环采集、跟踪、处理状态和窗口事件；
-同一时刻只有一个模型请求在途。默认模型 ID 由 [detector/config.py](detector/config.py)
-的 `DEFAULT_MODEL_ID` 统一定义；`CAROTID_MODEL_ID` 环境变量覆盖默认值，显式
-`--model-id` 优先级最高。模型服务职责与协议见 [detector 架构](detector/ARCHITECTURE.md)。
-标定采集与求解见本机 [标定操作 notebook](../../.runme/run/calibration_camera.md)。
-[腕部外参](gemini305_to_rm75_armtip.json) 定义 Camera→ArmTip 变换；标定与验收状态见本机
-[Camera_wrist 进展 notebook](../../.runme/Progress/camera-wrist-progress.md)。环境与操作见本机
-[Camera_wrist 操作 notebook](../../.runme/run/camera-wrist-operations.md)。
+主链可以独立于全局相机运行；系统也可以先完成全局粗定位，再进入腕部跟随。
+默认使用模型选点，手动模式仅替换初始像素的来源，后续定位和 Robot 请求链相同。
+本模块当前用于无接触悬停；接触力闭环和根据到位结果自动切换超声控制尚未接入。
+系统启动编排可以在操作者结束腕部阶段后切换进程，见[系统操作](../../.runme/run/system-operations.md)。
 
-## 模型选点入口
+## Runtime：运行时结构
 
-在仓库根目录执行 `bash infer/Camera_wrist/start_camera.sh`，或在 `camera` 环境直接运行
-`python infer/Camera_wrist/click_follow.py`，均默认进入模型模式，无需传入模型参数。
-默认 ID 为 `songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1`；模型模式使用既有 Robot
-`click_follow` 协议和 LocalTracker。选点使用下一完整源帧，经检测、源帧追踪及赶帧后发布新目标；Robot 回传目标身份后再请求 begin / resume。
+```mermaid
+flowchart LR
+    G["Gemini 305：同步 RGB-D"]
+    subgraph C["腕部相机进程 · camera 环境"]
+        A["采集线程：只保留最新帧"]
+        B["主循环：深度处理、追踪定位、会话判断"]
+        E["后台交换线程：一个模型请求在途"]
+        A --> B
+        B -->|源帧与采集时间| E
+        E -->|同源检测结果| B
+    end
+    D["常驻模型子进程 · ultralytics 环境"]
+    Q["Redis · 127.0.0.1:7777"]
+    subgraph R["Robot 执行进程"]
+        P["反馈历史、时序匹配、坐标转换、目标与规划"]
+        IO["机械臂反馈读取与运动发送"]
+        IO -->|带时间的反馈| P
+        P -->|有效计划| IO
+    end
+    RM["RM75"]
+    G --> A
+    E <-->|私有 socketpair| D
+    B -->|观测与操作请求| Q
+    Q -->|observation / command| P
+    P -->|state：会话、目标、请求回执| Q
+    Q -->|Robot 状态| B
+    IO <-->|机械臂通信| RM
+```
 
-手动模式使用 `bash infer/Camera_wrist/start_camera.sh --manual`，或直接运行
-`python infer/Camera_wrist/click_follow.py --manual`；此模式不启动模型子进程，左键选点后
-沿用光流、深度几何和 Redis 请求链，观测有效后由人工 `b/r` 请求跟随。
-模型模式禁用鼠标，检测等待期间清除
-旧目标；帧缓冲最多 45 帧；超限、时间间断或跟踪失败均拒绝。追帧结束若过期，
-等待新鲜相机帧且暂不创建目标，2 秒内仍不能追上则拒绝。模型输出只是
-P0 的原图像素，三维点和外法向由既有跟踪器计算，Robot 继续拥有坐标变换与运动权限。
-相机每次启动都连接 Redis 并订阅 Robot 状态，使用标准视觉门槛。
-跟踪有效时模型检测源帧中心与同帧光流点对齐后，以 0.25 增益和单次 2 px
-上限校正当前点；不再按两点距离拒绝检测。连接 Robot 时，
-同一融合结果经 Redis 发送；光流或深度失效、1 秒无模型确认会 Hold，
-首次自动开始或人工 `b`/`r` 后，视觉丢失会在暂停回执确认后自动重选；新目标观测
-送达 Robot 后自动 `resume`。人工暂停、通信异常、Robot 重启及非视觉拒绝
-取消自动恢复，其中通信异常指 Redis 发布或 Robot 状态通信异常。
-模型私有 socket 交换错误拒绝当次结果，不直接取消已有恢复意图，也不自动重建工作进程。
-Robot 主动 `wrist_pose_time_unmatched` Hold 也可恢复：
-仅已启用跟随意图、同一会话和目标、本进程请求回执且无故障时，相机发送
-新的暂停请求，收到回执后重选，确认新目标后请求 resume。时间匹配仍失败
-则保持 Hold 并再次走完整流程，其他主动 Hold 不自动进入该路径。
-显示点与 Redis 观测均使用融合结果。操作命令见
-[模型模式最简启动](../../.runme/run/camera-wrist-operations.md)和
-[进展记录](../../.runme/Progress/carotid-begin-progress.md)。
+采集持续进行，主循环消费最新帧，避免处理队列积压。模型异步推理，等待结果期间继续采集和跟踪；
+同一时刻只允许一个模型请求。后台交换线程只负责私有 socket 通信，源帧重放、追踪和融合仍由主循环完成。
+相机和模型使用独立 Python 环境；模型通信不经过 Redis，也没有独立 TCP 服务端口。
 
-| 操作 / 检查 | 当前模型模式行为 |
-| --- | --- |
-| `b` | 需要新鲜 Robot Hold、无 Fault、未跟随；清除旧点，完成新选点和目标回传后首次 begin，有开始历史则 resume；重复不排队 |
-| `d` | 取消待启动；接受新的只选点操作时取消恢复意图；跟随期间不能直接换目标 |
-| `r` | 对已经选好的有效新鲜目标 resume，需要已有开始历史，不执行新的模型选点 |
-| `p/q` | pause / end，取消待启动和恢复，清除控制目标 / RGB-D 跟踪；p 后仍可显示黄色二维点，q 退出相机 |
-| 目标回传 | 只确认观测身份进入 Robot 状态，不能视作规划或实体运动成功 |
-| 模型确认 | 校正成功或 already aligned 才刷新；失败保留光流，超过 1 秒无确认则丢失 |
+## 核心业务逻辑序列
 
-显示使用独立的 `ImagePointTracker`，与 Robot 的 RGB-D 观测分开：
-绿色仅表示新鲜三维观测、同帧二维跟踪及匹配的 Robot following 回执同时有效；
-黄色表示二维光流仍有效，但深度校验失败、观测过期或 Robot 已 Hold / 暂停。
-二维显示结果只有 `image_valid`、像素和采集时间，不包含 `valid=true` 或三维目标，
-不能用于 begin / resume 或 Robot 观测。二维光流失败、图像缺失或采集年龄超过 200 ms 时隐藏。
-同一 Robot 会话的 Hold 不再直接清空视觉跟踪；机器人重启仍清空跟踪。
+### 1. 等待业务就绪，形成带采集时间的 RGB-D
 
-Robot 的 `wrist_pose_time_unmatched` 和 `wrist_observation_missing_stale_or_mismatched`
-均可进入模型恢复，但必须属于原会话、原目标、本进程已确认的跟随请求且无 Fault。
-恢复继续要求新的暂停回执、新 target_id、新鲜三维观测和目标回传；二维点不能恢复运动。
+相机确认设备身份、视频流及内参 / 畸变，连接 Redis 并接收 Robot 状态。
+模型模式需要新鲜、无 Fault 的 Robot Hold 状态和完整新帧，才进入初始选点。
 
-采集由 `live_frames.py` 的单线程持续读取 SDK，槽位只保留最新帧；主循环处理最新帧并统计覆盖数，
-不改变 SDK 采集时间，不使用取帧时间代替采集时间。正常处理与 SDK 校时检查仍保留 200 ms 门。
-JSONL 的 `frame_timing` 每秒记录一次：采集到接收、接收到取帧、对齐、解码、
-追踪 / 模型、二维显示计算耗时、采集到处理及采集到发布前的年龄（ms），以及累计丢弃旧帧数。
-无控制目标时仍记录处理耗时，发布字段为 null。`tracking_display` 记录绿 / 黄 / 隐藏状态的切换。
+当前彩色 MJPG / 深度 Y16 均为 640×480 @ 30 FPS，采用 Close Range Default、128 视差。
+主跟踪入口的深度先对齐到彩色图像，再依次做 SDK 空间滤波、FURTHEST 补洞和时域平滑。
+时域滤波当前帧权重为 0.6，帧间深度变化比例阈值为 0.2；相近深度可融合历史，较大的变化交由 SDK 阈值区分。
+保留本帧空间处理 / 补洞后的有效掩码，仍为 0 的位置在时域输出中也保持无效，不能只靠历史深度补成有效观测。
+原始深度单独保留，补齐值标明 SDK 估计，正常有效点标明空间及时间平滑来源。
 
-默认模型出框阈值和选点阈值均为 0.4，可用 `--model-confidence` 修改选点阈值。
-融合最多保存 60 帧历史，按源时间精确匹配；模型 / 光流距离本身没有 15 px 拒绝门，
-15 px/帧仍是光流自身的跳变门限。当前入口未调用 `DisplayPointSmoother`，也没有宽松视觉 CLI。
+采集间断超过 200 ms、尺寸 / 格式 / 深度尺度变化或处理异常时清除时域历史；重复 / 倒序采集时间拒绝。
+SDK 尚未积累出时域输出时跳过该帧，不绕过滤波发布原始值。每个阶段都核对当前帧元数据和采集时间。
+此处理不做帧间运动配准，深度数值包含历史贡献，移动时可能有滞后；仍受当前观测时效和有效性检查约束。
 
-### 异步检测与超时边界
+每帧保留设备采集时间，并映射到本机单调时钟；采集时刻贯穿检测、追踪、发布与 Robot 位姿匹配。
+接收时间、处理时间和心跳时间不能替代采集时间。
+配置与深度处理实现见 [gemini_config.py](gemini_config.py)、[sdk_depth.py](sdk_depth.py)。
 
-模型加载、请求、融合与机器人心跳使用不同期限，不能把 socket 等待期限当作观测有效期。
-源码入口为 [ModelSelector](model_selection.py) 和 [相机主循环](click_follow.py)。
+### 2. 产生初始候选，并从检测源帧追到当前帧
 
-| 检查 / 调度 | 当前值与起算点 | 超时或拒绝后的行为 |
-| --- | --- | --- |
-| 模型就绪 | readiness 的 socket 操作 timeout 60 s；必须回传同一 model_id | 不是总加载截止时间；构造失败关闭 socket、终止进程并报错；发生在 pipeline.start 之前 |
-| 单次模型交换 | 私有 socket 操作 timeout 15 s；同一时刻仅一请求 | 后台线程把错误交给主循环；不是 15 s 的观测使用许可，也不是请求整体耗时保证 |
-| 选点追帧 | 提交请求时源帧需 ≤200 ms；缓存最多 45 帧；创建目标时检查最终追帧观测 ≤200 ms | 溢出、无更新帧、身份不符或追踪失败拒绝；追帧观测过期时暂等新帧，追帧状态超过 2 s 则拒绝；合格前不生成 target_id |
-| 正常预览 / 融合 | 仅空闲时按最小 0.1 s 间隔提交；检测源帧年龄 ≤500 ms，必须有同源跟踪历史 | 迟到或找不到源帧不校正；不是固定 10 Hz 推理；选点与普通预览共享一个在途槽 |
-| 模型确认 | 初次选点刷新确认；校正成功 / already aligned 再刷新；超过 1 s 无确认 | 锁存跟踪丢失；已有跟随意图时进入暂停 / 重选，不复用显示框作有效目标 |
-| Robot 状态 / 观测 | Robot 状态及观测采集年龄均 ≤200 ms；Robot 接收 envelope 另要求 ≤500 ms | 相机状态超时取消开始 / 恢复；Robot 拒绝过期观测，心跳不能延长采集期限 |
-| 完整 RGB-D | pipeline.start 后，尚无首帧时连续缺帧超过 10 s；取得首帧后连续缺帧超过 5 s | 首批失败退出码 7，start_camera.sh 等待 1 s 后只重启一次；后续断流不走此重启分支 |
+模型检测 `carotid`，默认置信度门槛为 0.4；合格候选中取最高置信度框中心，同分取输出中靠前者。
+无合格候选则本次选点失败。手动模式直接提供图像像素，不启动模型进程。
+模型候选仅表示二维位置，三维点和表面方向由当前 RGB-D 计算。
 
-追帧、光流、融合及窗口事件仍在相机主循环中执行；后台线程只交换模型请求。
-模型返回时源帧可以已超过 200 ms，选点只要求源身份一致、缓存重放有效，
-并追到最终有效新鲜观测；不会再按源帧年龄 200 ms 拒绝。普通融合另外检查检测源帧年龄 ≤500 ms。
-收到新的 `b` / `d` 或取消意图不会终止正在交换的私有 socket 请求，
-因此恢复重选可能需要等待当前请求结束；日志中的模型框显示年龄、融合年龄与 Robot 观测年龄是不同检查。
+异步检测返回的是源帧上的位置，必须执行以下顺序：
 
-## Redis 空中跟随全流程
+1. 核对检测结果与请求源帧的采集时间一致。
+2. 在源 RGB-D 帧上初始化跟踪和表面几何。
+3. 逐帧重放推理期间缓存的后续 RGB-D，将目标追到新鲜帧。
+4. 最终观测合格且足够新鲜后，建立新的 `target_id`；随后发布观测。
 
-主链路直接选取 Gemini 可见表面点，不需要全局相机、数字人、粗定位或 seed。
-相机进程只生成观测和操作请求；Robot 独占机器人状态读取、坐标转换、规划和运动发送。
-相机启动后等待有效 Robot 状态；模型模式的 `ModelStartup` 在新鲜 Hold 和完整新帧后
-自动排队初始选点，`ModelStart` 等待新鲜观测和 Robot 新目标回执后发出 begin/resume。
-初始选点失败时每隔至少 0.1 秒重试；开始后不再使用初始启动意图。
-已排队后的 Robot 重启、故障、状态接收异常或 Redis 发布失败取消初始意图；人工 `b/d/r/p/q`
-也取消该意图。`b` 仍可重新排队选点和跟随，手动模式保持鼠标选点及人工开始。
+选点缓存最多 45 帧；溢出、跟踪失败或无法追到新鲜观测时拒绝本次选点，不把旧检测坐标直接用于控制。
+初始模型选点失败可以重试，尚未完成目标确认时不发运动开始请求。
+检测规则见[模型服务架构](detector/ARCHITECTURE.md)，赶帧与融合见 [model_selection.py](model_selection.py)。
 
-新目标回传只确认身份，后续规划和发送仍由 Robot 决定。
+### 3. 用当前图像跟踪，用当前深度生成三维观测
 
-### 相机观测生成
+选点后即持续跟踪，是否允许机械臂运动由后续会话请求和 Robot 状态决定。
+每帧先对目标附近的特征做 LK 前后向光流，再按以下顺序更新原目标像素：
 
-启动配置集中在 [gemini_config.py](gemini_config.py)，两个相机入口共用。
-预设、视差读回不符或视频流组合不支持时退出，不自动降低帧率。
-预期相机到颈部距离约 300 mm，采用 Close Range Default（兼容 Close-Range）、
-128 视差、RGB MJPG / 深度 Y16，均为 640×480 @ 30 FPS。
-2026-11-10 16:38 现场连接为 USB 2 / 480 Mbps，此次双路枚举最高为 30 FPS；
-固定请求该档位，不自动回退。若要恢复 60 FPS，需先恢复 USB 3 并重新核查实际支持的档位。
-切换分辨率后从所选彩色流读取内参 / 畸变，深度继续对齐到该彩色流；不复用旧分辨率像素坐标。
-保留本机已使用的 Default 预设和 128 视差模式。工作距离不是机器人 TCP 目标距离，
-源码未增加绝对深度裁剪，也未提供该配置在皮肤表面的精度或处理延迟验收保证。
+```text
+当前有效光流点足够
+    → 优先拟合局部仿射变换
+    → 仿射合格：变换原目标像素
+    → 仿射估计 / 共识或候选像素 / 纹理失败：
+        用 median(当前点 - 上帧点) 做平移回退
+    → 检查更新位置并补充特征
+```
 
-腕部跟随入口在 RGB-D 对齐后使用 [sdk_depth.py](sdk_depth.py)：
-`SpatialAdvancedFilter` → `HoleFillingFilter`，不启用时域滤波。
-空间滤波固定 magnitude=1、alpha=0.5、radius=1，保留 SDK 默认 disp_diff（本机读回为 160）；
-补洞采用 FURTHEST 模式。按用户最新要求不限制空洞面积，小孔和大块缺失均交给 SDK 处理，
-SDK 输出仍为 0 时继续按无效深度处理，不填入旧帧值，不改动原采集时间。
-滤波器在打开指定设备后通过 `FilterFactory.create_filter` 创建；本机 SDK 在未激活滤波库时
-直接调用专用构造器可能原生崩溃，public factory 会返回可诊断错误。
-每个阶段核对尺寸、格式、深度尺度和 global 采集时间不变，异常不绕过滤波继续发布。
+回退使用本帧实际通过光流检查的点，不复用旧帧运动或伪造支持点。
+RGB-D 跟踪、模型赶帧和独立二维跟踪共享该逻辑。有效光流不足或回退也不合格时，观测失效。
 
-`depth_filter_configuration` 记录完整配置；`frame_timing` 增加空间 / 补洞耗时、
-原始与处理后无效像素数、补齐像素数。追踪和模型重放使用处理后深度。
-同帧结果的 `depth_processing` 记录 raw / filtered 目标深度和 depth_source，
-原始目标无效且处理后有效时标记 `sdk_filled`；原始为空洞或当前观测失败时再保存原始 / 处理后的四邻接诊断。
-这些值表示 SDK 估计，不能当作原始直接测量。原始深度在调用 SDK 前复制，未覆盖设备帧或校准文件。
-相机当前帧与异步模型结果时间不一致时，不附加错误帧的原始对照；本次不修改只读投影入口。
+随后用目标像素的处理后深度和去畸变光线反投影：
 
-点击位置先检查深度和纹理；跟踪采用 Shi–Tomasi 特征、金字塔 LK 前后向检查、
-RANSAC 局部仿射，使用仿射更新原目标像素，不以特征均值替换目标。
-邻域三维点用于稳健平面拟合，法向统一朝相机。
+```text
+p_camera = depth(pixel) × [x_normalized, y_normalized, 1]
+```
 
-| 检查 | 当前门限 |
-| --- | --- |
-| 纹理区域 | 最多 80×80 像素；到图像边缘时裁切，仍需至少 6 个特征 |
-| 光流一致特征 | 至少 6 个；前后向误差 ≤1 px |
-| 仿射内点比例 | ≥0.6；轴向尺度 0.9～1.1，行列式 0.81～1.21；RANSAC 重投影门限 1 px |
-| 像素 / 三维跳变 | 像素 ≤15 px/帧；三维帧间位移仅记录，不拒绝 |
-| 深度连续性 | 目标深度有效；四邻接至少 2 个有效且与目标深度差 <30 mm |
-| 法向点云 | 半径 10 mm 邻域，至少 10 点；平面内点带宽 3 mm，比例 ≥0.5（标准 / 宽松一致） |
-| 平面误差 / 退化 | RMS、目标到平面距离仅记录，不拒绝；第二主轴散布 ≥2 mm |
-| 帧间采集时间 | 递增且间隔 ≤200 ms |
+目标周围 10 mm 三维半径内的点云经 RANSAC 平面共识和 SVD 计算法向，法向统一朝相机。
+表面点位置直接取目标像素深度；拟合平面用于估计表面方向和验证局部支撑。
 
-平面 RMS、目标到平面的距离和三维帧间位移均保留为诊断量，不再作为拒绝条件。
-`quality` 记录 `plane_rms_m`、`target_plane_distance_m`，原有两个 `*_limit_m` 为 null，
-`residual_gates_enabled=false`、`failed_checks=[]`；原 2 mm / 3 mm 参考值放在
-`plane_rms_reference_m`、`target_plane_distance_reference_m`，超出项放在 `reference_exceeded`。
-跟踪更新与模型校正均记录 `position_jump_m`、`position_jump_gate_enabled=false` 和历史参考位移。
-这些参考值仅帮助分析日志，不影响观测 valid。深度有效性 / 连续性、表面点数、
-RANSAC 平面内点与退化检查、二维光流及时间有效性仍保留；Robot 不再以 RMS 上限拒绝观测。
+持续模型检测与光流并行。返回结果先与同一源帧的历史光流点对齐，再把偏差迁移到当前帧：
 
-目标处理后深度无效或连续性检查失败时，结果与失败证据记录 `depth_neighborhood`（当前实际用于追踪的深度）：
-目标浮点像素、实际 floor 后像素、对应 SDK 采集时间、目标及上下左右四邻接的深度（m），
-各邻点相对目标的带符号差 / 绝对差、深度差门限（标准 / 宽松均为 30 mm）及通过状态。
-`valid_neighbor_count` 记录有效邻点数，`continuous_neighbor_count` 记录同时通过深度差检查的邻点数，
-`minimum_continuous_neighbors=2`。`neighbor_issues` 列出无效 / 深度差超限的方向，
-只有目标无效或通过邻点不足 2 个时才产生 `failure_causes`：`target_invalid_depth` 或
-`insufficient_continuous_neighbors` 及对应方向问题。图像边界单独用 `target_on_image_border` 标记，
-不直接拒绝；越界邻点不计数，平面支撑点筛选使用相同的至少 2 邻点规则，不使用数组循环回绕。
-无效值区分 zero / negative / nonfinite / out_of_bounds；非有限及越界深度写 null，保留类型，
-不填补深度或替换判定值。追踪失败 JSONL、`failure_diagnostics` / `details.json` 和模型选点拒绝事件均保留该结构；
-模型追帧失败另记录原始 tracking_reason。旧日志仅含 RGB 证据图，不能反推出未保存的原始深度。
+```text
+当前模型候选 = 当前光流点 + 模型源帧中心 - 源帧光流点
+```
 
-P0 只需落在原图内，不要求距四边 40 px。靠边时纹理区域裁切，
-光流使用较浅金字塔并保留原有前后向、仿射和跳变门限；
-若裁切后特征、深度邻域或连续追踪不合格，仍会拒绝或 Hold。
+以 0.25 增益、单次最多 2 px 修正当前点，重新计算当前深度几何并补点。
+校正失败保留本帧原有光流结果；超过 1 秒没有成功校正或已对齐确认，则判定模型确认丢失。
+几何与跟踪实现见 [local_tracker.py](local_tracker.py)。
 
-### Robot 坐标与参考生成
+### 4. 先交付观测，再确认跟随请求
 
-按照观测采集时刻取得插值位姿，使用以下坐标链（位置单位 m）：
+相机发送观测后，等待 Robot 状态回显同一 `target_id`，再发送首次 `begin` 或后续 `resume`。
+目标回显只确认观测身份已被接收，不表示目标可达、规划成功或机械臂已到位。
+
+Robot 独立检查请求、观测、来源和运行会话是否匹配，并决定接受跟随还是保持 Hold。
+跟随期间不能直接接管另一个目标；换目标通过暂停、重选和确认恢复完成。
+会话流程见 [follow_session.py](follow_session.py)，业务编排见 [click_follow.py](click_follow.py)。
+
+### 5. Robot 按采集时刻生成目标并执行
+
+Robot 用包围观测采集时刻的反馈插值相机位姿，不使用处理时刻的机械臂姿态代替，也不外推。
+坐标链和目标关系为（位置单位 m，`T_A_B` 将 B 坐标映射到 A）：
 
 ```text
 T_base_camera(t) = T_base_armtip(t) × T_armtip_camera
 p_surface_base  = R_base_camera × p_camera + t_base_camera
 n_out_base      = R_base_camera × n_out_camera
 p_tcp_goal      = p_surface_base + 0.050 × n_out_base
-Tool-Z          = -n_out_base
+Tool-Z 候选     = -n_out_base
 ```
 
-Tool-X 使用上一参考姿态的 X 轴在新切平面上的投影，退化则 Hold。
-姿态候选与上次接受的目标旋转比较：变化不超过 **5°** 时保持目标，超过才更新。
-开始和恢复时重置接受目标；位置偏置继续使用原始有效法向，姿态死区不修改观测。
-因此上述 Tool-Z 公式描述候选方向，接受目标在死区内可以偏离瞬时法向。
-开始或确认恢复时，从实测 TCP 和关节重建参考；后续每次成功提交计划后才推进参考。
-50 mm 只添加一次，表示目标 TCP 到局部表面的法向间距，不保证瞬时实测间距或夹板净空。
-4 mm/s、4°/s 分别限制 TCP 位置与姿态参考生成；腕部 ServoJ 规划每关节
-命令步长另限为 4°/s（10 ms 周期最多 0.04°）。这些限速不能保证各关节实际角速度或实体 TCP 始终
-满足同一数值。
+TCP 目标与实际间距直接使用当前有效表面点和法向，Tool-Z 候选使用同一法向。
+相机继续以 30 FPS 采集，Robot 以 200 Hz 生成运动参考。
 
-腕部模式独立管理参考，不进入超声 Tool-Y 参考自动重置分支。
-腕部实测 TCP 与规划模型位置误差配置值为 **50 mm**；当前候选试验启动
-脚本关闭此检查。普通超声模式仍为 25 mm，检查继续启用。
-配置见 `Rm75RuntimeSafetyConfig` 与 `RobotRuntimeConfig::EffectiveSafety()`。
+Tool-X 由上一参考 X 轴投影到新切平面得到，退化则 Hold。
+完整姿态候选相对上次接受目标变化超过 15°才更新；开始 / 恢复重新接受当前有效目标。
+Robot 从实测 TCP / 关节重建运动参考，按当前位置、姿态及关节步长限制生成候选计划。
+当前源码参考限速为 3 mm/s、3°/s，腕部每关节命令步长限速为 3°/s。
+TCP 目标相对已提交位置参考的距离大于 5 mm 时启动平移，收敛到 2 mm 内时停止。
+死区内继续处理视觉观测，并保留跟随会话。
+只有规划和提交成功才推进运动参考。
 
-### 操作、Hold 与退出
+50 mm 是施加于当前估计表面位置的法向偏置。
+实际运动、规划拒绝及硬保护的完整边界见 [Robot 架构](../Robot/ARCHITECTURE.md)。
 
-按 `d` 或左键仅选点，不启动运动；跟随期间不能直接换点。心跳不会刷新观测采集年龄。
-模型模式首次人工开始/恢复后保留跟随意图：视觉丢失先请求暂停，确认本进程
-暂停回执后自动重选新的框中心；观测有效且 Robot 回传新目标 ID 后自动请求
-恢复。没有点时保持 Hold。`p/q`、Robot 重启、通信异常和非视觉拒绝取消该意图，
-后续需要人工重新开始。接受 `d` 的只选点操作也取消恢复意图。
-暂停回执必须同时匹配本进程 producer、请求 sequence 和新于请求的状态；仅看到 Hold 不足以恢复。
-重选失败可在约 0.75 秒间隔后继续重试，此间隔不保证恢复时长。
-自动恢复同样使用新 target_id，不复用旧观测。
-`q` 退出相机而 Robot 保持 Hold；Robot 的 `Ctrl+C` 或致命故障进入停止流程。
-Hold 仍可能通过当前模型关节发送保持目标，不等同于断电或已确认实体静止。
-`stop_not_physically_confirmed` 表示静止确认未通过，不能记录为安全停止验收成功。
+## Runtime：从选点到跟随的时序
 
-当前 [start_robot.sh](start_robot.sh) 显式启用真实腕部执行、无力传感器和候选外参试验，
-持续运行直至停止或故障；`--wrist-unlimited-excursion` 关闭实际与规划 TCP
-距起点的累计位移和累计转角检查，`--wrist-unlimited-position-tracking-error`
-关闭腕部实测 TCP 与规划模型间的位置误差检查。当前模型模式自动完成初始选点和开始；`b` 可重选并跟随。
-后续符合条件的视觉丢失按上述流程自动恢复。
-Runme 操作入口把 Robot 与相机分别放入独立 Terminator 窗口，避免 VS Code Runme
-执行终端结束时带走常驻进程。Robot 捕获 INT、TERM 和 HUP，按正常控制路径请求
-StopMotion、确认静止并写入结束摘要；终端脚本转发这些停止信号。
-它不读取力传感器，不进行 tare 或力闭环；机器人标定文件仍用于 TCP 几何。
-关节位置跟踪误差、关节限位、规划、通信、周期与停止保护仍保留，
-启动脚本不会自动完成空间验证。
+图中模型模式的业务消息均携带原始采集时间和目标身份；观测 / 请求 / 状态经 Redis 传递。
 
-### 日志与诊断职责
-
-- 相机：`log/wrist_click_*.jsonl` 记录配置、点击、观测、操作请求和拒绝原因；
-  同名 `.tracking/` 目录记录丢失诊断与图像证据。
-- Robot：`log/wrist_continuous_*/runtime.csv` 记录参考、规划关节、实测状态与故障；
-  `runtime.csv.wrist.csv` 记录点、法向、间距、采集年龄、插值跨度及 planner 结果；
-  `runtime.summary.json` 记录有效配置和最终停止结果。
-- 排查时按同机单调时间关联两端日志。相机 `Robot state timeout` 可能是 Robot
-  已发生 Fault 的后果，应先查 Robot 首个故障；`operator_paused` 也可能来自相机自动暂停。
-- 运行结果、问题排查、测试结论和待验收事项统一记录在本机
-  [Camera_wrist 进展 notebook](../../.runme/Progress/camera-wrist-progress.md)。
-
-## Redis 接口
-
-实例：`127.0.0.1:7777`。位置 m，矩阵采用列向量，`T_A_B` 将 B 映射到 A。
-SHA-256 按标定文件原始字节计算，包括空白。
-
-| 名称 | 类型/方向 |
-| --- | --- |
-| robot:wrist:state:v1 | Pub/Sub，Robot → 相机 |
-| robot:wrist:observation:v1 | Pub/Sub，点击入口 → Robot |
-| robot:wrist:command:v1 | Pub/Sub，点击入口 → Robot |
-| robot:wrist:seed:v1 | TTL 60 秒键，粗定位 → 投影模式；点击模式不读写 |
-
-### 跟随模式（scope=click_follow）
-
-Robot 参数为 `--wrist-follow FILE`，状态 `scope=click_follow`，与投影模式互斥。
-
-观测/命令公共字段：version=1、runtime_session_id、producer_id、target_id、sequence、
-timestamp_monotonic_ns、boot_id、calibration_sha256（腕部摘要字符串）、
-frame=gemini305_color_optical、length_unit=m。每个 producer、每个通道分别维护递增正整数序号。
-producer_id 每进程更新，target_id 每次成功模型选点或鼠标选点尝试更新；
-pause/end 可为空目标，其余请求不可为空。
-
-有效观测附加字段（以下片段需合并公共字段）：
-
-```json
-{"valid":true,"capture_monotonic_ns":123456789000,"pixel":[320,240],"point_camera_m":[0,0,0.2],"normal_out_camera":[0,0,-1],"quality":{"surface_points":100,"feature_inliers":20,"plane_rms_m":0.001,"plane_inlier_ratio":0.95}}
+```mermaid
+sequenceDiagram
+    participant W as 腕部相机
+    participant D as 模型进程
+    participant Q as Redis
+    participant R as Robot
+    R-->>Q: 新鲜 Hold 状态与会话身份
+    Q-->>W: Robot 已就绪
+    W->>D: 源帧图像与采集时间 t0
+    Note over W: 推理期间持续采集，缓存后续 RGB-D
+    D-->>W: 源帧二维候选 P0(t0)
+    W->>W: 源帧初始化，重放到当前新鲜观测
+    W->>Q: 新 target_id 的三维观测
+    Q->>R: observation
+    R-->>Q: 状态回显 target_id
+    Q-->>W: 新目标身份确认
+    W->>Q: begin / resume 请求
+    Q->>R: command
+    R->>R: 位姿匹配、坐标转换、滤波、目标与规划
+    R-->>Q: following / Hold 与请求回执
+    Q-->>W: 跟随状态及原因
+    loop 每个新鲜帧
+        W->>W: 光流跟踪、必要时平移回退、当前深度几何
+        opt 已有模型结果完成
+            D-->>W: 之前请求的源帧检测结果
+            W->>W: 同源对齐并校正当前观测
+        end
+        opt 模型空闲且达到请求间隔
+            W->>D: 异步提交下一次纠偏请求
+        end
+        W->>Q: 新采集时刻的三维观测
+        Q->>R: observation
+        R->>R: 更新目标；有效计划提交后推进参考
+    end
 ```
 
-点必须有限且 z>0；法向单位化并朝相机，normal·point<0。
-Robot 质量检查为 feature_inliers>=6、surface_points>=10、plane_inlier_ratio>=0.5；plane_rms_m 仅要求有限且非负，不设残差上限。
-相机侧特征及表面点门限为 6 / 10，宽松模式也使用 6 / 10 及 10 mm 半径；
-绿点表示新鲜三维观测及匹配 Robot 跟随回执同时有效；只有二维追踪或 Robot 暂停时为黄点。
-Robot 仍独立检查质量、时序与状态后决定是否接受观测和执行跟随，颜色不是物理运动验收。
-valid=false 带 reason，停止使用坐标并锁存 Hold。
+模型请求并非每帧必发；主循环不必等待下一次推理完成即可更新观测。
+最多每 0.1 秒尝试提交一次，已有请求在途时继续处理相机帧，不再提交另一请求。
+跟随及恢复等待期间约每 100 ms 发送心跳，心跳只维持请求链，不延长观测采集期限。
 
-命令附加 action=begin/resume/pause/end/heartbeat。跟随或恢复等待中约每 100 ms 发心跳，500 ms 超时 Hold。
-开始被拒、丢失或重启后的恢复需有效新目标和显式 begin/resume，来源可为人工操作或上述自动恢复；
-心跳不刷新曝光时间、不解除 Hold。
-会话/boot/摘要/坐标不符、重复乱序、旧采集时间、断线或无效观测会被拒绝或锁存。
-新目标只在 Hold 中显式接管，跟随中切换目标会停止；Pub/Sub 丢失结束消息时由超时处理。
+## 失效、暂停与恢复的业务闭环
 
-状态含 version、scope、runtime_session_id、boot_id、calibration_sha256（字符串）、frame、length_unit、
-sequence、timestamp_monotonic_ns、valid、T_base_camera、control_state，以及：
+观测不可用时发布无效结果；正在跟随则请求暂停。自动恢复需要保留的模型跟随意图，且必须经过本进程的暂停回执。
+Robot 主动报告观测过期 / 不匹配或位姿时间未匹配时，也只能在原会话、原目标、原请求归属和无 Fault 的条件下进入该流程。
 
-- follow_state=following/hold、follow_reason、target_id；
-- request_producer_id、request_sequence（最近处理的显式请求）、resume_required；
-- actual_normal_gap_m、target_normal_gap_m=0.050、observation_age_ms、pose_span_ms、
-  surface_base_m、normal_base、goal_tcp_base_m；
-- pose_time_basis=host_feedback_receive_not_controller_sample。
+```mermaid
+stateDiagram-v2
+    state "等待就绪 / 选点" as Selecting
+    state "等待新目标回显" as TargetAck
+    state "请求开始 / 恢复并等待状态" as StartAck
+    state "持续跟随" as Following
+    state "暂停并等待本进程回执" as PauseAck
+    state "重选并追到新鲜观测" as Reselecting
+    state "等待人工重新开始" as ManualWait
+    state "Robot 故障停止" as Fault
+    [*] --> Selecting
+    Selecting --> TargetAck: 选点和三维观测合格
+    TargetAck --> StartAck: Robot 回显新目标身份
+    StartAck --> Following: Robot 接受请求并回传 following
+    Following --> PauseAck: 视觉失效或符合条件的时序 Hold
+    PauseAck --> Reselecting: 同会话暂停回执确认
+    Reselecting --> TargetAck: 新 target_id 与新鲜三维观测
+    Reselecting --> Reselecting: 选点失败后间隔重试
+    Following --> ManualWait: 人工取消跟随意图
+    Following --> ManualWait: 通信异常或 Robot 会话变化
+    TargetAck --> ManualWait: 开始意图取消或会话异常
+    StartAck --> ManualWait: 请求未被接受或意图取消
+    PauseAck --> ManualWait: 通信异常、会话变化或非恢复原因
+    Selecting --> Fault: Robot Fault
+    StartAck --> Fault: Robot Fault
+    Following --> Fault: Robot Fault
+    PauseAck --> Fault: Robot Fault
+    ManualWait --> Selecting: 显式重新开始且 Robot 就绪
+```
 
-### 采集与反馈时序
+恢复重选失败可间隔约 0.75 秒重试；该间隔不保证恢复总时长。
+恢复始终要求新目标、新鲜三维观测和目标回显；二维跟踪或仅看到 Hold 状态不足以恢复运动。
+人工取消、Robot 重启、Redis 发布 / Robot 状态通信异常及不符合恢复条件的拒绝会取消开始或恢复意图。
+模型 socket 交换错误只拒绝当次结果，不直接取消已有恢复意图；worker 退出后当前不自动重建。
 
-[projection_preview.py](projection_preview.py) 中共享 CaptureClock 将 SDK global capture 映射到同机单调时钟：30 帧预热，wall/monotonic 采样跨度 <=1 ms、
-相邻偏移变化 <=2 ms、彩深差 <=20 ms。采集时间递增、观测年龄 <=200 ms。
-按采集时刻插值 Robot 位姿（平移线性、旋转 SLERP），跨度 <=50 ms，不外推。
-状态保留原反馈序号和接收时间，不因重发刷新；机器人接收时刻不是控制器采样时刻，延迟需独立量测。
+Hold 表示停止目标跟随，Robot 仍可能发送保持目标。致命故障或进程停止进入停止和静止确认路径。
+关节限位等硬保护可使 Robot 退出；视觉恢复不能解除这些故障。关节接近限位时提前减速、避限位或自动换构型尚未实现。
 
-### 投影模式（scope=projection_preview_only）
+## 进程间契约与关键约束
 
-scope=projection_preview_only；不发布观测/命令，--track 结果仅写日志。
-与点击状态共用 channel，但 calibration_sha256 为 {global,wrist} 对象，不能混用。
+Redis 实例为 `127.0.0.1:7777`，主链路 scope 为 `click_follow`，坐标单位为 m。
 
-seed 字段：version=1、session_id、target_id、sequence=1、timestamp_monotonic_ns、expires_monotonic_ns、
-boot_id、camera_serial、calibration_sha256、surface_point_base_m、initial_tool_rotation_base、
-frame=rm75_base、length_unit=m、coarse_positioning_succeeded=true、scope、independently_validated=false。
-surface_point_base_m 不含 50 mm 后退；sample_unix_ns 是文件 mtime，
-sample_time_basis=snapshot_file_mtime_not_exposure，不是曝光时间。
-
-状态继承 version/session_id/target_id/boot_id/calibration_sha256，增加 runtime_session_id、sequence、
-timestamp_monotonic_ns、T_base_camera、frame=gemini305_color_optical、length_unit=m、valid、control_state、scope，
-pose_time_basis=host_feedback_receive_not_controller_exposure。
-Robot 启动读取有效 seed 后固定身份；预览遇到运行会话变化退出，不自动换目标。
-
-预览启动时检查 seed 有效期、boot、相机序列号和两份标定摘要，固定该身份；
-启动后不重读 seed，也不因 Redis TTL 到期自动换目标。最多保留 100 条状态，
-使用上一相机帧等待包围采集时间的位姿，按同一 200 ms / 50 ms 门限处理；投影失败只记录和显示原因。
-
-实现入口：[click_follow.py](click_follow.py)、[wrist_projection.py](wrist_projection.py)、
-[RedisBridge](../Robot/src/redis_bridge.cpp)。操作见本机
-[Camera_wrist 操作 notebook](../../.runme/run/camera-wrist-operations.md)。
-
-## 验证覆盖与后续工作
-
-| 项目 | 当前依据 / 状态 | 尚需验证或实现 |
+| 消息 | 方向 | 业务内容 |
 | --- | --- | --- |
-| 协议、选点、跟踪、开始与恢复状态机 | 2026-10-12：[tests/](tests/) 中的 90 项离线测试在 `camera` 环境通过，Robot 6 项离线测试通过 | 本次未运行 Redis loopback、GPU 推理或真机；细节见 [腕部进展](../../.runme/Progress/camera-wrist-progress.md) |
-| 相机配置与采集时钟 | [gemini_config.py](gemini_config.py)、CaptureClock | 实机配置读回、曝光与主机反馈延迟测量 |
-| Robot 目标、限速、Hold 与停止 | [Robot 架构](../Robot/ARCHITECTURE.md) | 动态精度、跟随连续性、物理静止与净空验收 |
-| 外参独立验收 | 候选试验允许未独立验收的外参 | 独立真值、空间及动态误差记录 |
-| 接触与超声闭环交接 | 当前无力悬停路径之外的扩展 | 尚未实现自动交接与接触力闭环 |
+| `robot:wrist:observation:v1` | 相机 → Robot | 相机坐标表面点、外法向、采集时间、像素、质量及有效性 |
+| `robot:wrist:command:v1` | 相机 → Robot | begin / resume / pause / end / heartbeat |
+| `robot:wrist:state:v1` | Robot → 相机 | 会话、目标身份、请求回执、following / Hold、故障与定位诊断 |
 
-本文的 `.runme` 链接是纳入 Git 的本机操作记录；跨机器使用时应按实际环境调整路径和配置，架构与接口以源码、标定文件和模块文档为准。
+消息通过运行会话、进程来源、目标身份、boot、标定文件摘要、坐标系和递增序号约束归属；
+无效、过期、重复乱序或身份不匹配的数据不能借新心跳重新变为有效。
+`feature_inliers` 是兼容的支持点数字段，来源由 `tracking_method` / `feature_support_type` 区分：
+仿射内点、平移回退的有效前后向光流点，或初选 / 模型校正的纹理点。完整接收检查见 [Robot Redis 接收端](../Robot/src/redis_bridge.cpp)。
+
+| 业务约束 | 当前规则及结果 |
+| --- | --- |
+| 二维运动依据 | 至少 4 个有效特征；前后向误差 ≤3 px；仿射内点至少 4 个、比例 ≥50%、重投影门限 3 px，否则尝试平移回退 |
+| 目标像素 | 标准配置单帧位移 ≤15 px，并满足图内及补点要求；仿射尺度 / 行列式仅诊断 |
+| 深度与表面 | 目标深度有效，四邻接至少 2 个深度差 <30 mm；10 mm 邻域平面至少 10 个内点、比例 ≥50%，支撑不得退化 |
+| 残差诊断 | 平面 RMS、点到平面距离和三维帧间位移不按旧上限拒绝；这些数值仍记录 |
+| RGB-D 时间 | 彩深采集差 ≤20 ms；采集时间递增，连续跟踪帧间隔 ≤200 ms |
+| 观测与 Robot 状态 | 采集年龄 / 状态年龄 ≤200 ms；Robot 接收 envelope 年龄另要求 ≤500 ms |
+| 反馈插值 | 反馈须包围采集时刻，跨度 ≤100 ms；跟随时若仅缺曝光后的反馈，在观测和反馈仍满足时效门时保留会话并暂停下发新目标，补齐后继续跟随 |
+| 异步模型结果 | 普通纠偏源帧年龄 ≤500 ms 并有同源历史；选点重放检查最终观测 ≤200 ms，继续赶帧最多 2 秒 |
+| 请求存活 | 心跳约 100 ms，命令超过 500 ms 不再保持跟随授权；不替代观测时效 |
+
+## 全局点投影核验支线
+
+[投影核验入口](projection_preview.py)读取粗定位写入的 `robot:wrist:seed:v1`，校验会话、相机身份、有效期及双标定摘要，
+再按采集时刻把基座表面点反投影到腕部图像，比较理论位置 / 深度和当前观测。
+可附加本地跟踪，但只写诊断日志，不发布主链观测或运动请求。
+该支线 scope 为 `projection_preview_only`，不作为模型 / 手动跟随的目标接管来源。
+
+## 运行记录与交付边界
+
+定位异常按同机单调时间串联两侧记录：相机 JSONL 说明观测和请求为何变化；
+Robot 的 `runtime.csv.wrist.csv` 记录表面点、法向、目标、位姿匹配和规划结果；
+`runtime.csv` 与 `runtime.summary.json` 说明实测反馈、提交行为和首个停止原因。
+相机状态超时可能是 Robot 已故障的后果，自动暂停也可能记录为 `operator_paused`，需按事件顺序判定。
+
+当前[腕部 Robot 启动脚本](start_robot.sh)启用真实执行、候选外参、无力传感模式，并关闭累计位移 / 转角及 TCP 位置跟踪误差门。
+关节、规划、通信、周期和停止保护仍由 Robot 处理。当前[手眼外参](gemini305_to_rm75_armtip.json)的独立验证记录仍为 false；
+程序接受观测、回显目标或规划通过，均不代表实际定位精度、悬停间距及工具净空已验收。
+
+启动和人工操作见[腕部操作](../../.runme/run/camera-wrist-operations.md)，
+标定见[标定操作](../../.runme/run/calibration_camera.md)，
+实际运行、验证及待办见[腕部进展](../../.runme/Progress/camera-wrist-progress.md)，
+控制器职责见[Robot 架构](../Robot/ARCHITECTURE.md)。

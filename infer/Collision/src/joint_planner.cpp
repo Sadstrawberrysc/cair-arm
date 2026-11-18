@@ -139,7 +139,11 @@ PlanResult PlanJointPath(const RobotModel& model, const CollisionChecker& checke
             if (joint == model.Joints().end() || joint->type != JointType::kRevolute ||
                 !std::isfinite(joint->lower) || !std::isfinite(joint->upper) || joint->lower >= joint->upper)
                 throw std::invalid_argument("Planner requires finite bounded revolute joints (rad)");
-            bounds.setLow(i, joint->lower); bounds.setHigh(i, joint->upper);
+            const double low=joint->lower+options.collision.joint_limit_margin_rad;
+            const double high=joint->upper-options.collision.joint_limit_margin_rad;
+            if (!std::isfinite(low) || !std::isfinite(high) || low>=high)
+                throw std::invalid_argument("Invalid joint limit margin");
+            bounds.setLow(i, low); bounds.setHigh(i, high);
         }
         space->setBounds(bounds);
         space->setStateSamplerAllocator([&](const ob::StateSpace* s) {

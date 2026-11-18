@@ -277,7 +277,7 @@ void RedisBridge::NotifyPublisherLocked() {
     } while (written < 0 && errno == EINTR);
     // EAGAIN means the event counter is already saturated, which is still a
     // pending notification. Other errors are handled by the publisher's
-    // bounded poll/retry path rather than the 10 ms producer path.
+    // bounded poll/retry path rather than the 5 ms producer path.
 }
 
 void RedisBridge::PublishSensor(const RedisSensorMessage& message) {
@@ -285,7 +285,7 @@ void RedisBridge::PublishSensor(const RedisSensorMessage& message) {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     if (!running_.load()) return;
     // Sensor telemetry is latest-value data. Replacing an unpublished sample
-    // prevents backpressure and keeps JSON serialization out of the 10 ms
+    // prevents backpressure and keeps JSON serialization out of the 5 ms
     // control path.
     pending_sensor_message_ = message;
     has_pending_sensor_message_ = true;
@@ -912,7 +912,7 @@ bool RedisBridge::ParseWristPacket(const std::string& payload, bool observation,
             const double rms=q.at("plane_rms_m").get<double>();
             const double ratio=q.at("plane_inlier_ratio").get<double>();
             if (!std::isfinite(rms) || rms<0 || !std::isfinite(ratio) || ratio<.5 || ratio>1.
-                || q.at("surface_points").get<int>()<10 || q.at("feature_inliers").get<int>()<6)
+                || q.at("surface_points").get<int>()<10 || q.at("feature_inliers").get<int>()<4)
                 throw std::runtime_error("wrist quality rejected");
         } else {
             out.action=j.at("action").get<std::string>();

@@ -122,14 +122,14 @@ int main() {
     config.wrist_candidate_trial=false;
     ok &= Check(!ValidateRobotRuntimeConfig(config,&error), "TCP position tracking error override forbidden outside candidate trial");
     RobotRuntimeConfig polling;
-    ok &= Check(polling.StatePollPeriodMs()==40, "ordinary robot polling remains 40 ms");
+    ok &= Check(polling.StatePollPeriodMs()==5 && polling.period_ms * polling.publish_every == 50, "200 Hz control and feedback, 20 Hz Redis telemetry");
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==25.0, "ordinary tracking error remains 25 mm");
     ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==0.0,
                 "ordinary planner keeps its existing joint speed envelope");
     polling.wrist_follow_calibration="wrist.json";
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==50.0, "wrist tracking error uses 50 mm");
-    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==4.0,
-                "wrist follow caps each planned joint at 4 deg/s");
-    ok &= Check(polling.StatePollPeriodMs()==10, "wrist polling uses requested 10 ms period");
+    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==3.0,
+                "wrist follow caps each planned joint at 3 deg/s");
+    ok &= Check(polling.StatePollPeriodMs()==5, "wrist feedback is requested at 200 Hz");
     return ok ? 0 : 1;
 }

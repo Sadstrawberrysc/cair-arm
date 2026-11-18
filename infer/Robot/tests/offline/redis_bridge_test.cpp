@@ -130,12 +130,12 @@ int main() {
     WristPacket packet; std::string wrist_error;
     auto parse_wrist=[&](){return RedisBridge::ParseWristPacket(wp.dump(),true,"run","hash","boot",1000000000LL,packet,wrist_error);};
     ok &= Check(parse_wrist(), "wrist valid optical observation accepted");
-    wp["quality"]["surface_points"]=10; wp["quality"]["feature_inliers"]=6;
+    wp["quality"]["surface_points"]=10; wp["quality"]["feature_inliers"]=4;
     wp["quality"]["plane_inlier_ratio"]=.5;
-    ok &= Check(parse_wrist(), "wrist accepts 6 features, 10 surface points and 50 percent consensus");
-    wp["quality"]["feature_inliers"]=5;
-    ok &= Check(!parse_wrist(), "wrist rejects fewer than 6 features");
-    wp["quality"]["feature_inliers"]=6; wp["quality"]["surface_points"]=9;
+    ok &= Check(parse_wrist(), "wrist accepts 4 features, 10 surface points and 50 percent consensus");
+    wp["quality"]["feature_inliers"]=3;
+    ok &= Check(!parse_wrist(), "wrist rejects fewer than 4 features");
+    wp["quality"]["feature_inliers"]=4; wp["quality"]["surface_points"]=9;
     ok &= Check(!parse_wrist(), "wrist rejects fewer than 10 surface points");
     wp["quality"]["surface_points"]=10;
     wp["capture_monotonic_ns"]=700000000LL;

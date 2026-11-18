@@ -184,8 +184,12 @@ int main() {
                 && std::abs(ti(0,3)-.01)<1e-12 && span==20, "wrist camera pose interpolation");
     ok &= Check(!CalibratedFrameChain::InterpolateCamera(history,1030000000,ti,span),
                 "wrist history never extrapolates");
-    history.back().time_ns=1051000000;
-    ok &= Check(!CalibratedFrameChain::InterpolateCamera(history,1010000000,ti,span),
-                "wrist pose span above 50 ms rejected");
+    history.back().time_ns = 1'100'000'000;
+    ok &= Check(CalibratedFrameChain::InterpolateCamera(history, 1'050'000'000, ti, span)
+                && std::abs(ti(0,3)-.01)<1e-12 && span==100,
+                "wrist pose span of 100 ms is accepted");
+    ++history.back().time_ns;
+    ok &= Check(!CalibratedFrameChain::InterpolateCamera(history, 1'050'000'000, ti, span),
+                "wrist pose span above 100 ms is rejected");
     return ok ? 0 : 1;
 }

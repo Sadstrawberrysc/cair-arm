@@ -11,6 +11,8 @@
 
 namespace {
 
+constexpr std::int64_t kMaxWristPoseInterpolationSpanNs = 100'000'000;
+
 double WrappedAngleDifference(double lhs, double rhs) {
     return std::atan2(std::sin(lhs - rhs), std::cos(lhs - rhs));
 }
@@ -248,7 +250,8 @@ bool CalibratedFrameChain::InterpolateCamera(const std::deque<CameraSample>& his
     for (std::size_t i=1; i<history.size(); ++i) {
         const auto& a=history[i-1]; const auto& b=history[i];
         const auto span=b.time_ns-a.time_ns;
-        if (span<=0 || span>50000000 || time_ns<a.time_ns || time_ns>b.time_ns) continue;
+        if (span <= 0 || span > kMaxWristPoseInterpolationSpanNs
+            || time_ns < a.time_ns || time_ns > b.time_ns) continue;
         const double t=double(time_ns-a.time_ns)/double(span);
         pose=Eigen::Matrix4d::Identity();
         pose.topRightCorner<3,1>()=(1-t)*a.pose.topRightCorner<3,1>()+t*b.pose.topRightCorner<3,1>();

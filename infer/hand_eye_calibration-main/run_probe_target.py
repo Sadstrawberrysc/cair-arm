@@ -13,6 +13,8 @@ import numpy as np
 from transform_point import DEFAULT_CALIBRATION, load_transform, transform_point
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "infer/Camera_RT"))
+from camera_access import ensure_global_camera_free
 sys.path.insert(0, str(ROOT / "infer/Camera_wrist"))
 from wrist_projection import calibration, make_seed, SEED_KEY
 INITIAL_TOOL_Z_OFFSET_M = -0.100
@@ -83,6 +85,18 @@ def controller_euler(rotation):
 
 def run(args, root=ROOT, runner=subprocess.run):
     handoff = getattr(args, "wrist_handoff", False)
+    collision = getattr(args, "collision", False)
+    if collision and handoff:
+        raise ValueError("Collision 可调整终点姿态，暂不发布名义姿态的 wrist-handoff seed")
+    ensure_global_camera_free()
+    if collision:
+        command = ["bash", str(root / "infer/Collision/start_monitor.sh"), "--carotid",
+                   "--calibration", str(args.calibration)]
+        if not args.dry_run:
+            command.append("--execute")
+        print("模式：同一相机显示颈动脉图像和点云；红点为匹配目标，P规划" +
+              ("，只读预览。" if args.dry_run else "、E执行、空格停止；到位验收通过后自动关闭双窗口。"), flush=True)
+        return runner(command, cwd=str(root)).returncode
     redis_client = None
     hashes = None
     if handoff:
@@ -105,8 +119,7 @@ def run(args, root=ROOT, runner=subprocess.run):
         raise ValueError("缺少 Robot/build/rm75_force_calibration.json")
     previous = signature(snapshot)
     print("模式：初始位姿预览，检查几何臂展上界，不验证完整控制器逆解或可达性" if args.dry_run else
-          "模式：初始位姿 MoveJ_P，速度 {}；保存并退出数字人后自动执行。".format(args.velocity),
-          flush=True)
+          "模式：初始位姿 MoveJ_P，速度 {}；保存并退出数字人后自动执行。".format(args.velocity), flush=True)
     print("数字人窗口：按 s 保存本次采样点，按 q 退出后继续。", flush=True)
     result = runner([sys.executable, str(camera_dir / "cliff_demo.py")], cwd=str(camera_dir))
     if result.returncode != 0:
@@ -159,10 +172,11 @@ def run(args, root=ROOT, runner=subprocess.run):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__ + " 默认速度3，自动执行单次初始位姿 MoveJ_P。")
+    parser = argparse.ArgumentParser(description=__doc__ + " 默认速度6，自动执行单次初始位姿 MoveJ_P。")
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
-    parser.add_argument("--velocity", type=int, choices=range(1, 6), default=3)
+    parser.add_argument("--velocity", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--dry-run", action="store_true", help="只读取状态并预览目标，不检查可达性、不发送运动命令")
+    parser.add_argument("--collision", action="store_true", help="同时显示颈动脉及点云，匹配红点后按 P 规划、E 执行；dry-run 只读")
     parser.add_argument("--wrist-handoff", action="store_true", help="粗定位成功退出后发布60秒腕部投影种子；dry-run不发布")
     parser.add_argument("--wrist-calibration", type=Path, default=ROOT / "infer/Camera_wrist/gemini305_to_rm75_armtip.json")
     parser.add_argument("--wrist-serial", default="CV2L360000HZ")

@@ -1,4 +1,4 @@
-"""Single-frame detection: model -> native boxes -> unique center -> reply.
+"""Single-frame detection: model -> native boxes -> highest-confidence center -> reply.
 
 No credentials, sockets, GPU imports, depth geometry or Robot commands live here.
 The model is injected, so the same path can be exercised with an offline fake.
@@ -25,7 +25,7 @@ class DetectionPipeline:
             result = self.model.infer(image, confidence=self.config.inference_confidence)
             inference_ms = (time.monotonic_ns() - started_ns) / 1e6
             raw = response_to_boxes(result)
-            # Preview boxes remain available even if center selection is ambiguous.
+            # Preview boxes remain available even if no eligible center is found.
             response.update(inference_ms=inference_ms, detections=raw['predictions'],
                             image_size=[image.shape[1], image.shape[0]])
             point = scan_start_from_boxes(

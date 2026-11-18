@@ -4,7 +4,7 @@ import math
 
 def scan_start_from_boxes(response, width, height, *, class_name=None,
                           min_confidence=0.4, margin=0):
-    """Return the center pixel of one unambiguous detection.
+    """Return the highest-confidence eligible box center; first wins ties.
 
     Roboflow detection coordinates are expected as pixel center x/y and box
     width/height in the same original image supplied by the caller.
@@ -56,9 +56,9 @@ def scan_start_from_boxes(response, width, height, *, class_name=None,
         candidates.append(dict(scan_start=[float(pixel[0]), float(pixel[1])],
                                confidence=confidence, box_xyxy=[left, top, right, bottom],
                                class_name=item.get("class")))
-    if len(candidates) != 1:
-        raise ValueError("expected exactly one valid detection, got %d" % len(candidates))
-    return candidates[0]
+    if not candidates:
+        raise ValueError("expected at least one valid detection, got 0")
+    return max(candidates, key=lambda candidate: candidate['confidence'])
 
 
 def response_to_boxes(response):

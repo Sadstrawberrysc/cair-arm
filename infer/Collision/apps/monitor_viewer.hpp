@@ -16,6 +16,10 @@ class MonitorViewer {
         const uspilot::collision::JointPositions& captured_joints, const Eigen::Vector3d& tcp);
     void ClearGoalPreview();
     bool TakePlanningRequest();
+    bool TakeExecutionRequest();
+    bool TakeStopRequest();
+    void SetExecutionStatus(const std::string& status);
+    void SetMappedSurface(const std::optional<Eigen::Vector3d>& point, const std::string& detail);
     bool Draw(const uspilot::collision::MonitorFrame &frame, const uspilot::collision::MonitorResult &result);
 
   private:

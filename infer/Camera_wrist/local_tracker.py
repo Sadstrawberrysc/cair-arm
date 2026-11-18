@@ -8,15 +8,16 @@ from depth_diagnostics import (MIN_CONTINUOUS_NEIGHBORS, DepthNeighborhoodError,
 
 SURFACE_RADIUS_M = .010
 
+# Scale and determinant ranges are diagnostic references only; they do not reject flow.
 STANDARD = dict(depth_jump=.030, min_points=10, plane_band=.003, inlier_ratio=.5,
-                spread=.002, rms=.002, target_residual=.003, features=6,
-                fb_px=1., affine_ratio=.6, scale_low=.9, scale_high=1.1,
-                determinant_low=.81, determinant_high=1.21, affine_reproj_px=1.,
+                spread=.002, rms=.002, target_residual=.003, features=4,
+                fb_px=3., affine_ratio=.5, scale_low=.9, scale_high=1.1,
+                determinant_low=.81, determinant_high=1.21, affine_reproj_px=3.,
                 pixel_jump=15., position_jump=.01)
 RELAXED = dict(depth_jump=.030, min_points=10, plane_band=.003, inlier_ratio=.5,
-               spread=.0015, rms=.0035, target_residual=.0045, features=6,
-               fb_px=1.5, affine_ratio=.5, scale_low=.85, scale_high=1.15,
-               determinant_low=.72, determinant_high=1.32, affine_reproj_px=1.5,
+               spread=.0015, rms=.0035, target_residual=.0045, features=4,
+               fb_px=3., affine_ratio=.5, scale_low=.85, scale_high=1.15,
+               determinant_low=.72, determinant_high=1.32, affine_reproj_px=3.,
                pixel_jump=20., position_jump=.015)
 
 
@@ -136,7 +137,8 @@ class LocalTracker:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             features = self._features(gray, pixel)
             point, normal, quality = surface(depth, pixel, k, distortion, relaxed=self.relaxed)
-            quality['feature_inliers'] = int(len(features))
+            quality.update(feature_inliers=int(len(features)), tracking_method='initialization',
+                           feature_support_type='texture_features')
             self.gray, self.features = gray, features
             self.pixel, self.position = np.asarray(pixel, float), point
             self.timestamp, self.active, self.reason = timestamp, True, ''
@@ -159,7 +161,7 @@ class LocalTracker:
                     capture_monotonic_ns=self.timestamp, quality=quality)
 
     def track_image(self, image, timestamp):
-        """Compute checked 2D flow without changing the stored reference frame."""
+        """Prefer affine flow; fall back to median translation on the current LK pair."""
         self.debug = dict(capture_monotonic_ns=int(timestamp),
                           previous_capture_monotonic_ns=int(self.timestamp),
                           target_before_px=self.pixel.tolist(), feature_count=int(len(self.features)), stage='capture_time')
@@ -190,47 +192,89 @@ class LocalTracker:
         self.debug.update(forward_matches=int(status.sum()), backward_matches=int(reverse.sum()),
                           fb_median_px=float(np.median(fb[np.isfinite(fb)])) if np.isfinite(fb).any() else None)
         valid &= fb <= self.limits['fb_px']
+        valid &= np.isfinite(nxt.reshape(-1, 2)).all(axis=1)
         old, new = self.features[valid].reshape(-1, 2), nxt[valid].reshape(-1, 2)
         self.debug.update(fb_matches=int(len(old)), old_points=old.tolist(), new_points=new.tolist())
         self.debug['stage'] = 'forward_backward_check'
         if len(old) < self.limits['features']:
             raise ValueError('fewer than %d forward-backward features' % self.limits['features'])
         self.debug['stage'] = 'affine_consensus'
-        affine, mask = cv2.estimateAffine2D(old, new, method=cv2.RANSAC,
-                                                  ransacReprojThreshold=self.limits['affine_reproj_px'], maxIters=1000)
+        affine, mask = None, None
+        try:
+            affine, mask = cv2.estimateAffine2D(
+                old, new, method=cv2.RANSAC,
+                ransacReprojThreshold=self.limits['affine_reproj_px'], maxIters=1000)
+        except cv2.error as error:
+            self.debug['affine_estimation_error'] = str(error)
+        mask_valid = mask is not None and mask.size == len(old)
+        inliers = int(np.count_nonzero(mask)) if mask_valid else 0
+        inlier_ratio = inliers / len(old)
+        affine_valid = (affine is not None and affine.shape == (2, 3)
+                        and np.isfinite(affine).all())
         self.debug.update(affine=None if affine is None else affine.tolist(),
-                          inlier_mask=None if mask is None else mask.ravel().tolist(),
-                          affine_inliers=0 if mask is None else int(mask.sum()),
-                          affine_inlier_ratio=0. if mask is None else float(mask.mean()))
-        if (affine is None or mask is None or mask.sum() < self.limits['features']
-                or mask.mean() < self.limits['affine_ratio']):
-            raise ValueError('local affine consensus failed')
-        determinant = np.linalg.det(affine[:, :2])
-        scales = np.linalg.svd(affine[:, :2], compute_uv=False)
-        self.debug['affine_scales'] = scales.tolist()
-        self.debug['stage'] = 'affine_scale'
-        if (not self.limits['determinant_low'] <= determinant <= self.limits['determinant_high']
-                or scales.min() < self.limits['scale_low'] or scales.max() > self.limits['scale_high']):
-            raise ValueError('abnormal affine scale')
-        pixel = affine @ np.r_[self.pixel, 1.]
-        self.debug['stage'] = 'pixel_jump'
-        if np.linalg.norm(pixel-self.pixel) > self.limits['pixel_jump']:
-            raise ValueError('pixel jump exceeds %.0f px/frame' % self.limits['pixel_jump'])
-        self.debug['stage'] = 'feature_replenishment'
-        features = self._features(gray, pixel)
-        return gray, features, pixel, int(mask.sum())
+                          inlier_mask=mask.ravel().tolist() if mask_valid else None,
+                          affine_inliers=inliers, affine_inlier_ratio=inlier_ratio,
+                          affine_scale_gate_enabled=False)
+        if affine_valid:
+            determinant = float(np.linalg.det(affine[:, :2]))
+            self.debug.update(
+                affine_determinant=determinant,
+                affine_scale_reference_range=[self.limits['scale_low'], self.limits['scale_high']],
+                affine_determinant_reference_range=[self.limits['determinant_low'], self.limits['determinant_high']],
+                affine_reference_exceeded=[])
+            if not self.limits['determinant_low'] <= determinant <= self.limits['determinant_high']:
+                self.debug['affine_reference_exceeded'].append('determinant')
+            # Singular values are diagnostic only; they never reject a candidate.
+            try:
+                scales = np.linalg.svd(affine[:, :2], compute_uv=False)
+            except np.linalg.LinAlgError as error:
+                self.debug.update(affine_scales=None, affine_scale_diagnostic_error=str(error))
+            else:
+                self.debug['affine_scales'] = scales.tolist()
+                if scales.min() < self.limits['scale_low'] or scales.max() > self.limits['scale_high']:
+                    self.debug['affine_reference_exceeded'].append('scale')
+        candidates = []
+        if (affine_valid and inliers >= self.limits['features']
+                and inlier_ratio >= self.limits['affine_ratio']):
+            candidates.append(('affine', affine @ np.r_[self.pixel, 1.], inliers))
+        else:
+            self.debug['fallback_reason'] = ('invalid affine transform' if not affine_valid
+                                             else 'local affine consensus failed')
+        displacement = np.median(new-old, axis=0)
+        candidates.append(('translation', self.pixel+displacement, len(old)))
+        for method, pixel, support in candidates:
+            self.debug.update(tracking_method=method, tracking_feature_count=support,
+                              tracking_feature_support=('affine_inliers' if method == 'affine'
+                                                        else 'forward_backward_features'))
+            if method == 'translation':
+                self.debug['translation_displacement_px'] = displacement.tolist()
+            try:
+                self.debug['stage'] = 'pixel_jump'
+                if np.linalg.norm(pixel-self.pixel) > self.limits['pixel_jump']:
+                    raise ValueError('pixel jump exceeds %.0f px/frame' % self.limits['pixel_jump'])
+                self.debug['stage'] = 'feature_replenishment'
+                features = self._features(gray, pixel)
+            except (ValueError, cv2.error) as error:
+                if method == 'affine':
+                    self.debug['fallback_reason'] = str(error)
+                    continue
+                raise
+            self.debug['target_after_px'] = pixel.tolist()
+            return gray, features, pixel, support
 
     def update(self, image, depth, k, distortion, timestamp):
         if not self.active:
             return dict(valid=False, reason=self.reason)
         try:
-            gray, features, pixel, inliers = self.track_image(image, timestamp)
+            gray, features, pixel, support = self.track_image(image, timestamp)
             self.debug['stage'] = 'surface_plane'
             point, normal, quality = surface(depth, pixel, k, distortion, relaxed=self.relaxed)
             quality.update(position_jump_m=float(np.linalg.norm(point-self.position)),
                            position_jump_gate_enabled=False,
                            position_jump_reference_m=self.limits['position_jump'])
-            quality.update(feature_inliers=inliers, forward_backward_limit_px=self.limits['fb_px'])
+            quality.update(feature_inliers=support, forward_backward_limit_px=self.limits['fb_px'],
+                           tracking_method=self.debug['tracking_method'],
+                           feature_support_type=self.debug['tracking_feature_support'])
             self.gray, self.features, self.pixel = gray, features, pixel
             self.position, self.timestamp = point, timestamp
             self.debug['stage'] = 'accepted'
@@ -268,7 +312,8 @@ class LocalTracker:
         except (ValueError, cv2.error) as error:
             return None, str(error)
         self.pixel, self.position, self.features = candidate, point, features
-        quality['feature_inliers'] = int(len(features))
+        quality.update(feature_inliers=int(len(features)), tracking_method='model_correction',
+                       feature_support_type='texture_features')
         return self.result(point, normal, quality), None
 
 

@@ -4,6 +4,7 @@
 
 namespace uspilot::collision {
 struct PoseIkOptions {
+    double joint_limit_margin_rad = 0;
     std::size_t attempts = 8, iterations = 80;
     double timeout_s = 0.1;
     double position_tolerance_m = 0.001, rotation_tolerance_rad = 0.01;

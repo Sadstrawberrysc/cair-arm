@@ -9,7 +9,7 @@
 | 阅读入口（相对 `infer/Robot/`） | 要理解的内容 |
 | --- | --- |
 | [CMakeLists.txt](../infer/Robot/CMakeLists.txt) | 生产库、维护工具与离线测试的依赖 |
-| [src/main_rm75.cpp](../infer/Robot/src/main_rm75.cpp) | 生命周期、10 ms 快照循环、安全监督和停止路径 |
+| [src/main_rm75.cpp](../infer/Robot/src/main_rm75.cpp) | 生命周期、5 ms 快照循环、安全监督和停止路径 |
 | [include/rm75_runtime_config.hpp](../infer/Robot/include/rm75_runtime_config.hpp)、[实现](../infer/Robot/src/rm75_runtime_config.cpp) | `RobotRuntimeConfig`、`MakeImplicitRm75ProductionConfig` 和有效配置 |
 | [include/rm75_control.hpp](../infer/Robot/include/rm75_control.hpp) | 控制、planner 与安全参数结构体 |
 

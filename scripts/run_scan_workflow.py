@@ -75,7 +75,7 @@ class Workflow:
 
     def run(self, commands):
         try:
-            global_camera = self.start('全局定位：窗口按 s 保存、q 退出，或 Esc 保存并退出',
+            global_camera = self.start(commands.get('global_label', '全局定位：窗口按 s 保存、q 退出，或 Esc 保存并退出'),
                                        commands['global'])
             self.wait('全局定位', global_camera)
             camera = self.start('腕部相机：定位完成后按 q，随后自动切换超声', commands['wrist_camera'])
@@ -92,14 +92,17 @@ class Workflow:
             self.cleanup()
 
 
-def commands():
+def commands(collision=False):
     # exec keeps the Python process as the session leader, including MoveJ children.
-    def python_in(env, script, directory=ROOT):
-        return ['bash', '-c', 'source "$1" && conda activate "$2" && cd "$4" && exec python -u "$3"',
+    def python_in(env, script, directory=ROOT, extra_args=()):
+        return ['bash', '-c', 'source "$1" && conda activate "$2" && cd "$4" && exec python -u "$3" "${@:5}"',
                 'scan-workflow', str(CONDA / 'etc/profile.d/conda.sh'), env,
-                str(ROOT / script), str(directory)]
+                str(ROOT / script), str(directory), *extra_args]
     return {
-        'global': python_in('camera', 'infer/hand_eye_calibration-main/run_probe_target.py'),
+        'global_label': ('全局定位：确认点云红点后 P 规划、E 执行；到位验收通过后自动关闭窗口并交接腕部'
+                         if collision else '全局定位：窗口按 s 保存、q 退出，或 Esc 保存并退出'),
+        'global': python_in('camera', 'infer/hand_eye_calibration-main/run_probe_target.py',
+                            extra_args=('--collision',) if collision else ()),
         'wrist_camera': ['bash', str(ROOT / 'infer/Camera_wrist/start_camera.sh')],
         'wrist_robot': ['bash', str(ROOT / 'infer/Camera_wrist/start_robot.sh')],
         'robot': ['bash', '-c', 'cd "$1" && exec ./main_rm75', 'scan-workflow',
@@ -154,6 +157,7 @@ def ensure_redis():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='只检查本机入口与已有进程，不启动设备或 Redis')
+    parser.add_argument('--collision', action='store_true', help='第一步使用相机/FCL/OMPL与 MoveJ，到位验收后自动交接腕部')
     args = parser.parse_args()
     # SIGTERM follows the same cleanup path as terminal Ctrl+C.
     def interrupted(_signum, _frame):
@@ -166,12 +170,14 @@ def main():
             except BlockingIOError:
                 raise WorkflowError('已有一键扫描流程正在运行')
             preflight()
+            if args.collision and not os.access(ROOT / 'infer/Collision/build-monitor/collision_monitor', os.X_OK):
+                raise WorkflowError('请先构建 Collision collision_monitor')
             if args.check:
                 print('本机入口与进程检查通过；未启动 Redis、相机或机械臂，未验证设备与标定精度。')
                 return 0
             print('真实运动流程：全局采样 → 腕部跟随 → 超声扫描。Ctrl+C 中止整条流程。', flush=True)
             ensure_redis()
-            Workflow().run(commands())
+            Workflow().run(commands(collision=args.collision))
             return 0
     except KeyboardInterrupt:
         print('\n[流程] 已请求中止，未继续下一阶段。', file=sys.stderr)

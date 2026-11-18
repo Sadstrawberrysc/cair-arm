@@ -29,6 +29,10 @@ struct MonitorViewer::Impl {
     bool goal_visible = false;
     std::string planning_status;
     bool plan_requested = false;
+    bool execute_requested = false, stop_requested = false, has_plan_result = false;
+    std::string execution_status;
+    std::optional<Eigen::Vector3d> mapped_surface, goal_mapped_surface;
+    std::string mapped_detail, goal_mapped_detail;
     GLFWwindow *window = nullptr;
     double yaw = -.8, pitch = .3, distance = 2.6, last_x = 0, last_y = 0;
     bool dragging = false;
@@ -64,6 +68,10 @@ MonitorViewer::MonitorViewer(c::RobotModel model, const c::MeshDirectories &dire
     glfwSetKeyCallback(p.window, [](GLFWwindow* w, int key, int, int action, int) {
         if (key == GLFW_KEY_P && action == GLFW_PRESS)
             static_cast<Impl*>(glfwGetWindowUserPointer(w))->plan_requested = true;
+        if (key == GLFW_KEY_E && action == GLFW_PRESS)
+            static_cast<Impl*>(glfwGetWindowUserPointer(w))->execute_requested = true;
+        if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+            static_cast<Impl*>(glfwGetWindowUserPointer(w))->stop_requested = true;
         if (key == GLFW_KEY_G && action == GLFW_PRESS) {
             auto* p = static_cast<Impl*>(glfwGetWindowUserPointer(w));
             p->goal_visible = !p->goal_visible;
@@ -98,6 +106,8 @@ void MonitorViewer::SetGoalPreview(std::vector<c::CollisionBodyPreview> bodies,
     p.captured_joints = captured_joints;
     p.goal_tcp = tcp;
     p.goal_visible = true;
+    p.goal_mapped_surface=p.mapped_surface;
+    p.goal_mapped_detail=p.mapped_detail;
 }
 void MonitorViewer::ClearGoalPreview() {
     impl_->goal_bodies.clear();
@@ -107,6 +117,16 @@ void MonitorViewer::ClearGoalPreview() {
     impl_->goal_visible = false;
 }
 void MonitorViewer::SetPlanningStatus(const std::string& status) { impl_->planning_status = status; }
+void MonitorViewer::SetExecutionStatus(const std::string& status) { impl_->execution_status=status; }
+void MonitorViewer::SetMappedSurface(const std::optional<Eigen::Vector3d>& point, const std::string& detail) {
+    impl_->mapped_surface=point; impl_->mapped_detail=detail;
+}
+bool MonitorViewer::TakeExecutionRequest() {
+    const bool value=impl_->execute_requested; impl_->execute_requested=false; return value;
+}
+bool MonitorViewer::TakeStopRequest() {
+    const bool value=impl_->stop_requested; impl_->stop_requested=false; return value;
+}
 bool MonitorViewer::TakePlanningRequest() {
     const bool requested = impl_->plan_requested;
     impl_->plan_requested = false;
@@ -117,6 +137,7 @@ void MonitorViewer::SetPlannedPath(const std::vector<c::JointPositions>& path,
         const std::string& tip_link, const Eigen::Isometry3d& tip_from_tcp) {
     auto& p = *impl_;
     p.path_points.clear();
+    p.has_plan_result=true;
     p.path_stale = false;
     if (path.empty()) return;
     auto tip = tip_link;
@@ -197,7 +218,7 @@ bool MonitorViewer::Draw(const c::MonitorFrame &frame, const c::MonitorResult &r
     if (glfwWindowShouldClose(p.window) || glfwGetKey(p.window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         return false;
     const double unavailable = std::numeric_limits<double>::infinity();
-    std::string title = "READ ONLY | env=" + Distance(result.input_valid ? result.check.minimum_environment_distance_m : unavailable) +
+    std::string title = std::string(p.execution_status.empty() ? "READ ONLY | env=" : "SCENE SUPERVISION OFF | env=") + Distance(result.input_valid ? result.check.minimum_environment_distance_m : unavailable) +
                         " self=" + Distance(result.input_valid ? result.check.minimum_self_distance_m : unavailable) + " | " +
                         c::CheckStatusName(result.check.status) + " " + result.check.detail +
                         " | left drag: orbit, wheel: zoom, Esc: exit";
@@ -214,8 +235,12 @@ bool MonitorViewer::Draw(const c::MonitorFrame &frame, const c::MonitorResult &r
         if (!p.goal_check.violations.empty()) title += " | " +
             p.goal_check.violations.front().first_body + " distance=" + Distance(p.goal_check.violations.front().distance_m);
     } else title += " | G: goal snapshot";
-    if (p.path_points.empty() && !p.planning_status.empty() && !preview)
+    if (p.path_points.empty() && p.has_plan_result && !p.planning_status.empty() && !preview)
         title = "NO PATH | " + p.planning_status + " | " + title;
+    if (!p.execution_status.empty()) title="EXECUTE MODE | "+p.execution_status+" | "+title;
+    const auto& mapped=preview ? p.goal_mapped_surface : p.mapped_surface;
+    const auto& mapped_detail=preview ? p.goal_mapped_detail : p.mapped_detail;
+    if (!mapped_detail.empty()) title+=" | red=matched surface | "+mapped_detail;
     if (!p.path_points.empty()) title += p.path_stale ? " | TCP curve: STALE snapshot" : " | TCP curve: planned snapshot";
     glfwSetWindowTitle(p.window, title.c_str());
     int width, height;
@@ -450,6 +475,13 @@ bool MonitorViewer::Draw(const c::MonitorFrame &frame, const c::MonitorResult &r
         glColor3f(.2f, 1.f, .2f); glVertex3dv(p.path_points.front().data());
         glColor3f(1.f, .2f, .8f); glVertex3dv(p.path_points.back().data());
         glEnd();
+        glEnable(GL_DEPTH_TEST);
+    }
+    if (mapped) {
+        glDisable(GL_DEPTH_TEST);
+        glPointSize(12);
+        glColor3f(1.f,0.f,0.f);
+        glBegin(GL_POINTS); glVertex3dv(mapped->data()); glEnd();
         glEnable(GL_DEPTH_TEST);
     }
     glfwSwapBuffers(p.window);

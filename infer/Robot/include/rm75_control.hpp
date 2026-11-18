@@ -9,7 +9,7 @@
 
 #include <realman_kinematics.hpp>
 
-// 控制状态机：由 Rm75ControlLaw::Step 在每个 10 ms 周期更新。
+// 控制状态机：由 Rm75ControlLaw::Step 在每个 5 ms 周期更新。
 enum class Rm75SupervisorState {
     // 初始化/仅观测/已握手但静止。
     kInitializing,
@@ -51,11 +51,13 @@ struct ControlIntent {
     std::uint64_t sequence = 0;
 };
 
+inline constexpr int kRm75ControlPeriodMs = 5;
+
 struct Rm75ControlConfig {
     // RM75 生产闭环的控制参数集中在本结构中。main_rm75 只注入本次
     // 标定得到的 Tool/TCP 坐标关系，不再逐项覆盖这些算法参数。
     // ===== 1. 控制周期、接触门与 wrench 安全门 =====
-    double cycle_s = 0.010;                 // 主控制周期（s）
+    double cycle_s = kRm75ControlPeriodMs / 1000.0;                 // 主控制周期（s）
     // 目标 Tool-Z 力（N）；负号表示压向组织。
     double desired_force_n = -2.0;
     // |Fz| 达到该值后锁存“已接触”（N）。
@@ -140,9 +142,9 @@ struct Rm75ControlConfig {
     // 比例速度律：v_y = direction × gain × y；每周期位移为 v_y × cycle_s。
     // 比例律在误差较大时移动较快，并在接近中心时自然减速。
     double model_y_velocity_gain_per_s = 1.0;
-    // 独立限制 Tool-Y 速度：10 ms 周期下 0.5 mm/周期等效 5 cm/s，
+    // 独立限制 Tool-Y 速度：5 ms 周期下 0.25 mm/周期等效 5 cm/s，
     // 避免视觉异常值在提高增益后形成过大的单周期横移。
-    double maximum_model_y_step_m = 0.0005; // 单周期 Tool-Y 最大步长（m）
+    double maximum_model_y_step_m = 0.00025; // 单周期 Tool-Y 最大步长（m）
     // 按 m 进入 Scan phase 后的 Tool-Y 速度缩放。接近与 force_settle 阶段
     // 保持完整居中速度；扫描时降速，避免横向修正抢占 Tool-X 扫描轨迹。
     double scan_y_scale = 0.8;
@@ -311,15 +313,15 @@ const char* Rm75PlanErrorString(Rm75PlanError error);
 
 struct Rm75ServoPlannerConfig {
     // 关节规划参数属于 ServoJ/IK 模块；main_rm75 不再覆盖这些值。
-    int period_ms = 10; // ServoJ 规划周期（ms）
-    double damping = 0.001; // 阻尼最小二乘 IK 的 λ
+    int period_ms = kRm75ControlPeriodMs; // ServoJ 规划周期（ms）
+    double damping = 0.05; // 阻尼最小二乘 IK 中直接乘以单位矩阵的系数
     double joint_limit_warning_deg = 10.0; // 距关节限位该角度内记录预警
     double joint_limit_stop_deg = 3.0; // 距关节限位该角度内拒绝规划
     double singularity_warning_deg = 5.0; // 奇异性预警角度裕量
     double minimum_task_singular_value = 1e-5; // Jacobian 最小奇异值门
-    // 每个 10 ms 周期允许使用官方最大关节速度的 100%。
+    // 每个 5 ms 周期允许使用官方最大关节速度的 100%。
     // 速度比例乘周期不得超过最小下发间隔。
-    double minimum_dispatch_gap_ms = 10.0; // 相邻 ServoJ 下发的最小时间间隔
+    double minimum_dispatch_gap_ms = kRm75ControlPeriodMs; // 相邻 ServoJ 下发的最小时间间隔
     double joint_speed_scale = 1.0; // 官方最大关节速度比例
     double max_joint_speed_deg_s = 0.0; // 0 表示不额外限制每关节速度
     double max_joint_accel_deg_s2 = 90.0; // 相邻周期关节速度变化上限
@@ -388,14 +390,17 @@ private:
 // Wrist commissioning is independent of ultrasound motion states.
 struct WristFollowInput {
     bool fresh = false, external_hold = false;
-    std::string reject_reason, target_id, request_token, action;
+    bool awaiting_pose_feedback = false;
+    std::string reject_reason, producer_id, target_id, request_token, action;
+    std::int64_t capture_ns = 0; // Original observation capture time, not control-loop time.
     Eigen::Vector3d surface_base = Eigen::Vector3d::Zero();
     Eigen::Vector3d normal_base = Eigen::Vector3d::UnitZ();
     Eigen::Matrix4d actual_tcp = Eigen::Matrix4d::Identity();
-    double cycle_s = .01;
+    double cycle_s = kRm75ControlPeriodMs / 1000.0;
 };
 struct WristFollowOutput {
     bool following = false, reference_reset = false;
+    bool waiting_for_pose = false, motion_requested = false;
     std::string reason;
     Eigen::Matrix4d tcp_reference = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d tcp_goal = Eigen::Matrix4d::Identity();
@@ -403,6 +408,11 @@ struct WristFollowOutput {
 };
 class WristFollowController {
 public:
+    static constexpr double kPositionStartErrorM = .005;
+    static constexpr double kPositionStopErrorM = .002;
+    static constexpr double kPositionSpeedMPerS = .003;
+    static constexpr double kAngularSpeedDegPerS = 3.0;
+
     WristFollowOutput Step(const WristFollowInput& input);
     void Hold(const std::string& reason);
     void Commit(const Eigen::Matrix4d& reference) { reference_ = reference; }
@@ -411,10 +421,10 @@ public:
     const std::string& RequestToken() const { return token_; }
     bool ResumeRequired() const { return ever_started_; }
 private:
-    bool following_ = false, ever_started_ = false;
-    // Experimental orientation-only deadband; raw surface observations stay intact.
-    static constexpr double kOrientationDeadbandRad = 0.08726646259971647;
+    bool following_ = false, ever_started_ = false, tracking_position_ = false;
+    static constexpr double kOrientationDeadbandRad = 0.2617993877991494; // 15 degrees.
     Eigen::Matrix3d orientation_goal_ = Eigen::Matrix3d::Identity();
-    std::string target_, token_, reason_ = "waiting_for_click_and_begin";
+    std::int64_t last_capture_ns_ = 0;
+    std::string producer_, target_, token_, reason_ = "waiting_for_click_and_begin";
     Eigen::Matrix4d reference_ = Eigen::Matrix4d::Identity();
 };

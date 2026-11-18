@@ -49,9 +49,9 @@ struct RobotRuntimeConfig {
     std::string probe_model_path = "../model/Lprobe-IFS.STL";
     std::string redis_host = "127.0.0.1";
     int redis_port = 7777;
-    int period_ms = 10;
+    int period_ms = kRm75ControlPeriodMs;
     int duration_s = 0;
-    int publish_every = 5;
+    int publish_every = 50 / kRm75ControlPeriodMs;
     int execute_warmup_s = 2;
     int tare_no_contact_s = 0;
     std::string runtime_log_path;
@@ -66,9 +66,7 @@ struct RobotRuntimeConfig {
     // verified operation without the provisional commissioning override.
     bool implicit_commissioning_profile = false;
 
-    // Wrist capture interpolation allows at most 50 ms between feedback samples.
-    // Keep headroom for transport/scheduling; ordinary ultrasound polling is unchanged.
-    int StatePollPeriodMs() const { return wrist_follow_calibration.empty() ? 40 : 10; }
+    int StatePollPeriodMs() const { return period_ms; }
 
     Rm75RuntimeSafetyConfig EffectiveSafety() const {
         auto result = safety;
@@ -81,7 +79,8 @@ struct RobotRuntimeConfig {
 
     Rm75ServoPlannerConfig EffectivePlanner() const {
         auto result = planner;
-        if (!wrist_follow_calibration.empty()) result.max_joint_speed_deg_s = 4.0;
+        if (!wrist_follow_calibration.empty())
+            result.max_joint_speed_deg_s = WristFollowController::kAngularSpeedDegPerS;
         return result;
     }
 

@@ -170,7 +170,8 @@ std::pair<std::string, std::string> Ordered(std::string a, std::string b) {
 }
 
 void ValidateOptions(const CheckOptions& o) {
-    Require(std::isfinite(o.clearance_m) && o.clearance_m >= 0
+    Require(std::isfinite(o.joint_limit_margin_rad) && o.joint_limit_margin_rad >= 0
+        && std::isfinite(o.clearance_m) && o.clearance_m >= 0
         && std::isfinite(o.numerical_guard_m) && o.numerical_guard_m >= 1e-8
         && o.max_scene_age_ns >= 0 && o.max_state_checks > 0 && o.max_subdivision_depth <= 60,
         "Invalid check options");
@@ -367,6 +368,11 @@ StateCheck CollisionChecker::CheckState(const JointPositions& q, const Collision
         Require(!(scene.known_space && scene.observation), "Cannot combine manual known space and camera observation");
         if (scene.observation) Require(bool(scene.observation->tree), "Missing observation tree");
         const auto poses = impl_->model.Forward(q);
+        for (const auto& joint : impl_->model.Joints())
+            if (joint.type == JointType::kRevolute)
+                Require(q.at(joint.name) >= joint.lower + options.joint_limit_margin_rad &&
+                        q.at(joint.name) <= joint.upper - options.joint_limit_margin_rad,
+                        "joint_limit_margin: " + joint.name);
         std::vector<PlacedShape> robot, obstacles;
         result.workspace_clearance_m = !options.allow_unknown_space &&
             (scene.known_space || scene.observation) ? kInfinity : -kInfinity;

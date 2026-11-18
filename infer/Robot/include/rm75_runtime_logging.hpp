@@ -191,7 +191,7 @@ struct RuntimeControlSummary {
 };
 
 struct RuntimeTimingSummary {
-    int period_ms = 10;
+    int period_ms = kRm75ControlPeriodMs;
     std::uint64_t cycles = 0;
     std::uint64_t missed_periods = 0;
     std::uint64_t periods_over_22ms = 0;

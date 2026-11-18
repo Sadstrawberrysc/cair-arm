@@ -56,11 +56,16 @@ class ModelWorkerTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parse_args(['--socket-fd', '4', '--model-id', 'test/model', option, value])
 
-    def test_pipeline_retains_preview_when_selection_is_ambiguous(self):
-        self.model.infer.return_value = native_response(2)
+    def test_pipeline_selects_highest_confidence_and_retains_preview(self):
+        output = native_response(2)
+        output[0].predictions[0].confidence = .8
+        output[0].predictions[1].confidence = .95
+        output[0].predictions[1].x = 24
+        self.model.infer.return_value = output
         result = self.pipeline.process(self.image, 123)
-        self.assertFalse(result['valid'])
-        self.assertIn('exactly one', result['reason'])
+        self.assertTrue(result['valid'])
+        self.assertEqual(result['prediction']['scan_start'], [24., 16.])
+        self.assertEqual(result['prediction']['confidence'], .95)
         self.assertEqual(len(result['detections']), 2)
         self.assertEqual(result['capture_monotonic_ns'], 123)
         self.assertEqual(result['image_size'], [32, 32])

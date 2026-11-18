@@ -37,7 +37,8 @@ PoseIkResult SolvePoseIk(const RobotModel& model, const JointPositions& seed,
     const std::string& tip_link, const Eigen::Isometry3d& tip_from_tcp,
     const Eigen::Isometry3d& target, const PoseIkOptions& options, const std::function<bool()>& cancelled) {
     Rigid(target); Rigid(tip_from_tcp);
-    if (!options.attempts || options.attempts > 32 || !options.iterations || options.iterations > 500 ||
+    if (!std::isfinite(options.joint_limit_margin_rad) || options.joint_limit_margin_rad < 0 ||
+        !options.attempts || options.attempts > 32 || !options.iterations || options.iterations > 500 ||
         !std::isfinite(options.timeout_s) || options.timeout_s <= 0 || options.timeout_s > 30 ||
         !std::isfinite(options.position_tolerance_m) || options.position_tolerance_m <= 0 || options.position_tolerance_m > .01 ||
         !std::isfinite(options.rotation_tolerance_rad) || options.rotation_tolerance_rad <= 0 || options.rotation_tolerance_rad > .1)
@@ -64,7 +65,9 @@ PoseIkResult SolvePoseIk(const RobotModel& model, const JointPositions& seed,
         const auto joint = std::find_if(model.Joints().begin(), model.Joints().end(), [&](const Joint& j) { return j.name == name; });
         if (joint == model.Joints().end() || joint->type != JointType::kRevolute || joint->lower >= joint->upper)
             throw std::invalid_argument("IK supports bounded revolute joints only");
-        lower.push_back(joint->lower); upper.push_back(joint->upper);
+        lower.push_back(joint->lower+options.joint_limit_margin_rad);
+        upper.push_back(joint->upper-options.joint_limit_margin_rad);
+        if (lower.back()>=upper.back()) throw std::invalid_argument("IK joint margin closes joint range");
     }
     auto tcp = [&](const JointPositions& q) { return model.Forward(q).at(tip_link) * tip_from_tcp; };
     const auto begin = Clock::now();
@@ -90,6 +93,7 @@ PoseIkResult SolvePoseIk(const RobotModel& model, const JointPositions& seed,
       for (std::size_t attempt = 0; attempt < options.attempts && !pose_stop(); ++attempt) {
         ++result.attempts;
         auto q = seed;
+        for (std::size_t j=0; j<names.size(); ++j) q[names[j]]=std::clamp(q.at(names[j]),lower[j],upper[j]);
         if (attempt) for (std::size_t j = 0; j < names.size(); ++j)
             q[names[j]] = std::clamp(seed.at(names[j]) + (.3 + .15 * attempt) * normal(random), lower[j], upper[j]);
         for (std::size_t iteration = 0; iteration < options.iterations && !pose_stop(); ++iteration) {
@@ -186,7 +190,9 @@ PosePlanResult PlanPosePath(const RobotModel& model, const CollisionChecker& che
         } else result.start_check.detail = "skipped_start_precheck";
         if (!planning.skip_start_precheck && !result.start_check.Valid()) { result.status = "invalid_start"; result.detail = result.start_check.detail; }
         else {
-            out.ik = SolvePoseIk(model, start, tip_link, tip_from_tcp, target, ik, stop);
+            auto bounded_ik=ik;
+            bounded_ik.joint_limit_margin_rad=planning.collision.joint_limit_margin_rad;
+            out.ik = SolvePoseIk(model, start, tip_link, tip_from_tcp, target, bounded_ik, stop);
             result.status = "ik_no_solution"; result.detail = "No IK candidate within the configured budget; not proof of unreachability";
             out.candidate_checks.resize(out.ik.candidates.size());
             out.candidate_searches.resize(out.ik.candidates.size());

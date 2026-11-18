@@ -1,7 +1,7 @@
 # 腕部模型服务 detector 架构
 
 原 `infer/Carotid_begin/` 模型代码已并入
-`Camera_wrist/detector/`；本子包负责模型加载和单帧检测，以唯一合格检测框中心返回
+`Camera_wrist/detector/`；本子包负责模型加载和单帧检测，以合格检测框中置信度最高者的中心返回
 初始扫描点 P0 的二维候选。RGB-D 采集、光流、深度几何、融合和跟随会话由腕部主模块管理，
 整体流程及 Robot 协议见 [Camera_wrist 架构](../ARCHITECTURE.md)。
 
@@ -21,7 +21,7 @@
 | [config.py](config.py) · `DEFAULT_MODEL_ID`、`ModelConfig` | 默认模型 ID、不可变配置及 ID/类别/置信度/边距校验 | 非法配置在凭据读取和模型加载前拒绝 |
 | [credentials.py](credentials.py) · `get_api_key` | 优先读环境变量，再读本机私有凭据 | 密钥不进入帧协议、Redis 或日志 |
 | [gpu_model.py](gpu_model.py) · `load_cuda_model` | 加载 Roboflow 模型并检查 provider 和实际模型会话 | 必须包含 `CUDAExecutionProvider` |
-| [detection.py](detection.py) | 原生响应转原图框，选择唯一合格框中心 | 输出二维 `scan_start`，不做深度反投影 |
+| [detection.py](detection.py) | 原生响应转原图框，选择置信度最高的合格框中心 | 输出二维 `scan_start`，不做深度反投影 |
 | [pipeline.py](pipeline.py) · `DetectionPipeline.process` | 注入模型、推理、框转换、选点和响应组装 | 不管理凭据、socket、深度几何或 Robot 请求 |
 | [protocol.py](protocol.py) | RGB-D 校验、NPZ 编解码、受长度约束的 JSON 发送 | 保留源时间，禁用 pickle 和非有限 JSON 数值 |
 | [worker.py](worker.py) · `main`、`serve` | CLI、加载模型、ready 握手、常驻顺序服务 | 仅响应相机，关闭时释放 socket |
@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | 类别 | 精确匹配 `carotid` | 相机 `--model-class` |
 | 模型出框 / 选点置信度 | 均为 0.4 | 相机 `--model-confidence` 修改选点阈值；当前调用固定推理阈值 0.4 |
-| 唯一性 | 类别和置信度过滤后恰好 1 个候选；多框不取最高分 | `scan_start_from_boxes` |
+| 候选选择 | 类别和置信度过滤后选择最高分框中心；同分保留模型输出中靠前者，无候选拒绝 | `scan_start_from_boxes` |
 | 坐标 | 响应图像尺寸与输入一致；正框尺寸，合格框不越原图 | `detection.py` |
 | P0 与边距 | 检测框中心，默认额外边距 0 px | `ModelConfig.margin`；跟踪器另检查纹理/深度 |
 | worker Python | 本机 `ultralytics` 环境 | 相机 `--detector-python` |
@@ -75,7 +75,9 @@ Robot Redis 公共协议不随目录迁移改变。
 | 逐帧结果 | UTF-8 JSON，65536 字节 | `valid`、原始 `capture_monotonic_ns`；相机复核源时间与请求一致 |
 | 有效候选 | 同上 | `prediction` 含 `scan_start:[x,y]`、`confidence`、`box_xyxy`、`class_name` |
 | 检测拒绝 | 同上 | `valid:false`、`reason`；正常拒绝后继续接收下一帧 |
-| 预览信息 | 框转换成功后才存在 | `detections`、`image_size:[W,H]`、`inference_ms`；无合格框或多候选也可带这些字段 |
+| 检测诊断 | 框转换成功后才存在 | `detections`、`image_size:[W,H]`、`inference_ms`；保留全部检测框，无合格框时也可带这些字段 |
+
+腕部窗口只绘制近期有效结果中 `prediction.box_xyxy` 指定的检测框。
 
 深度随请求传输，协议只检查类型和形状，`DetectionPipeline` 只消费 BGR。
 有效深度、局部表面和法向由相机端计算。`inference_ms` 仅计 `model.infer`，
@@ -86,7 +88,7 @@ Robot Redis 公共协议不随目录迁移改变。
 | 条件 | 模型服务 / 相机行为 |
 | --- | --- |
 | 配置、凭据、模型加载或 ready 失败 | 相机启动失败；`ModelSelector` 关闭 socket 并终止子进程 |
-| 无目标、多候选、非法框或管线捕获的 `ValueError/TypeError/KeyError` | 拒绝当前帧，worker 继续接收 |
+| 无合格目标、非法框或管线捕获的 `ValueError/TypeError/KeyError` | 拒绝当前帧，worker 继续接收 |
 | 截断、非法帧、未捕获运行异常或发送错误 | worker 结束，后台线程将交换错误交给相机主循环 |
 | 完整消息边界上相机关闭 socket | worker 正常结束 |
 | 选点中的交换错误 | 拒绝本次选点，不建立新目标或开始请求 |

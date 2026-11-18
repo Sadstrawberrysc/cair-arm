@@ -41,14 +41,14 @@ class DetectionProtocolTests(unittest.TestCase):
                                       class_name='carotid', min_confidence=.5)
         self.assertEqual(point['scan_start'], [7., 64.])
 
-    def test_size_ambiguity_and_confidence_are_checked(self):
+    def test_size_confidence_and_highest_score_selection(self):
         raw = self.raw([self.box()])
         with self.assertRaisesRegex(ValueError, 'dimensions differ'):
             scan_start_from_boxes(raw, 640, 480, class_name='carotid')
-        with self.assertRaisesRegex(ValueError, 'exactly one'):
-            scan_start_from_boxes(self.raw([self.box(), self.box(x=80)]),
-                                  128, 128, class_name='carotid')
-        with self.assertRaisesRegex(ValueError, 'exactly one'):
+        point = scan_start_from_boxes(self.raw([self.box(confidence=.6), self.box(x=80)]),
+                                      128, 128, class_name='carotid')
+        self.assertEqual(point['scan_start'], [80., 64.])
+        with self.assertRaisesRegex(ValueError, 'at least one'):
             scan_start_from_boxes(self.raw([self.box(confidence=.4)]),
                                   128, 128, class_name='carotid', min_confidence=.5)
 

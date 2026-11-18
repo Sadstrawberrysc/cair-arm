@@ -26,7 +26,7 @@ Robot 装配七轴反馈、KWR57 力觉（兼容 Haptron）、标定、接触估
 读取 `rm75_force_calibration.json`，标定身份为用户赋予的 `KWR57`（不是设备读回的序列号），
 Probe 模型为其相邻 `../model/Lprobe-IFS.STL`。2026-11-09 已接入本次稳健拟合的新标定，
 源码配置为 `config/force_calibration.kwr57.json`；首次配置空 build 时复制到默认部署位置，已有部署文件不覆盖。
-控制周期 10 ms、启动悬空 tare 3 s（涵盖无接触预检）、duration=0。
+控制周期 5 ms（200 Hz）、启动悬空 tare 3 s（涵盖无接触预检）、duration=0。
 正式标定模式在 tare 前检查最大合力/合力矩 4 N / 0.1 N·m（按用户要求调整）、
 最大偏离窗口均值 1 N / 0.02 N·m（力门按用户要求调整）及原静止/健康门；通过后仅扣除本次运行的固定偏置。
 新标定在 641 条已有数据中保留 254 点，剔除比例 60.4%，保留点残差不是独立实机精度验收。
@@ -64,7 +64,7 @@ flowchart TB
 
 | 模块 / 源码 | 公共接口 | 职责与依赖 |
 | --- | --- | --- |
-| [realman_transport](src/realman_command.cpp) | `RMCommand`、`RMStateReader`、`RMResult`、`BestEffortStopGuard` | 连接、JSON framing、反馈快照、异步 ServoJ 与确认 Stop；Threads、nlohmann/json |
+| [realman_transport](src/realman_command.cpp) | `RMCommand`、`RMStateReader`、`RMResult`、`BestEffortStopGuard` | 连接、JSON framing、反馈快照、异步 ServoJ／MoveJ 与确认 Stop；Threads、nlohmann/json |
 | [robot_sensor](src/force_sensor.cpp)、[contact_sensing](src/contact_sensing.cpp) | `ForceSensorReader`、`ForceCalibration`、`ContactLocation` | KWR57 / Modbus / legacy parser、SI 样本、重力 / tare 补偿、STL 接触估计；Threads、OpenSSL、Eigen |
 | [rm75_motion](src/rm75_control.cpp)、[kinematics](src/realman_kinematics.cpp) | `Rm75ControlLaw`、`WristFollowController`、`Rm75ServoPlanner`、`RMKinematics` | 控制状态与参考；planner 负责 IK / 安全规划，kinematics 提供七轴 FK / 6×7 Jacobian；Eigen |
 | [rm75_runtime_config](src/rm75_runtime_config.cpp) | `RobotRuntimeConfig`、profile 工厂、校验 | 配置装配及 `EffectiveSafety()` / `EffectivePlanner()`；依赖 motion |
@@ -118,10 +118,10 @@ v1 文件读取时按 `R_S_T = I` 升级；v2 必须提供新字段，写出统�
 | Redis 状态输出 | 默认最多 32 条，满时丢最旧 | 状态事件可能被丢弃 |
 | Redis sensor / wrist 遥测 | 单个待发布最新快照覆盖 | 限制背压，序列化在 publisher 中执行 |
 | CSV 周期记录 | 8192 行队列，满时丢最旧并计 `DroppedRows()` | CSV 可能缺周期；summary 记录丢行数 |
-| 控制周期 | Execute / 腕部要求 10 ms；非执行允许 10～100 ms | 请求周期不是实际反馈周期保证 |
-| Robot 状态查询 | 普通超声 40 ms，腕部跟随 10 ms | 时间戳来自主机反馈接收，不是控制器采样时刻 |
+| 控制周期 | 默认 5 ms，Execute / 腕部也支持显式 10 ms；其他模式允许 5～100 ms | 请求周期不是实际反馈周期保证 |
+| Robot 状态查询 | 随控制周期，默认 5 ms | 时间戳来自主机反馈接收，不是控制器采样时刻 |
 | 陈旧默认值 | sensor 50 ms、Robot 200 ms、超声命令 500 ms | 来自 [runtime_config.hpp](include/rm75_runtime_config.hpp)，不是设备性能承诺 |
-| 腕部观测 / 插值 | 采集年龄 ≤200 ms；相邻位姿跨度 ≤50 ms，不外推 | 心跳不刷新采集时间；不匹配则 Hold |
+| 腕部观测 / 插值 | 采集年龄 ≤200 ms；相邻位姿跨度 ≤100 ms，不外推 | 跟随中仅缺曝光后位姿时冻结参考并保留会话，由观测和反馈的时效门约束等待；其他匹配失败或保护触发则 Hold |
 
 ## 超声控制状态与力觉优先级
 
@@ -211,6 +211,9 @@ sensor v1 使用 N / N·m / m，接触 frame 为 `probe_tcp_tool`（TCP 相对�
 腕部协议除 envelope 年龄 / 序号外，还检查 runtime session、boot、标定原始字节 SHA-256、
 producer、target、frame / 单位、采集时间与几何质量。新目标只在 Hold 接管，
 解除 Hold 需要有效新目标及对应显式请求，普通心跳不能恢复。
+腕部观测至少需要 4 个特征支持点；相机仿射失败时可用本帧有效光流位移中位数做平移回退，
+`feature_inliers` 在回退时为有效前后向光流点数，来源由 quality 的 tracking_method / feature_support_type 标明。
+表面点至少 10 个、平面内点比例至少 50% 和原始采集时效 / 位姿匹配检查继续生效。
 完整字段、开始 / 暂停 / 重选时序见 [Camera_wrist 架构](../Camera_wrist/ARCHITECTURE.md)。
 
 ## 腕部参考与保护
@@ -223,10 +226,17 @@ p_tcp_goal     = p_surface_base + 0.050 × n_out_base
 Tool-Z 候选    = -n_out_base
 ```
 
-Tool-X 由上一参考 X 轴在切平面的投影生成，退化则 Hold。完整目标旋转变化超过 5°才更新，
-否则保持上次接受的姿态；位置偏置仍使用有效原始法向。开始 / 恢复从实测 TCP 与关节重建参考，
-后续有效计划成功提交后才 Commit。TCP 位置参考限速 **4 mm/s**、姿态参考限速 **4°/s**；
-`EffectivePlanner()` 另把腕部每关节命令步长上限设为 **4°/s**，普通超声不追加此腕部上限。
+在采集时刻完成位姿匹配后，TCP 目标和实际间距直接使用当前表面点和法向。Robot 检查采集时间顺序，
+同一观测可用于多个控制周期。`runtime.csv.wrist.csv` 记录表面点、法向和 TCP 目标，旧滤波列保留为空或零供现有工具读取。
+
+Tool-X 由上一参考 X 轴在切平面的投影生成，退化则 Hold。完整目标旋转变化超过 15°才更新，
+否则保持上次接受的姿态。开始 / 恢复从实测 TCP 与关节重建参考，
+后续有效计划成功提交后才 Commit。TCP 位置参考限速 **3 mm/s**、姿态参考限速 **3°/s**；
+`EffectivePlanner()` 另把腕部每关节命令步长上限设为 **3°/s**，普通超声沿用其规划配置。
+50 mm 偏置施加于当前估计的表面位置。
+腕部位置误差取当前 TCP 目标与已提交的笛卡尔参考之间的三维距离。平移在误差大于 **5 mm** 时启动，
+进入 **2 mm** 时停止。平移和姿态参考都静止时，Robot 保持最近关节目标并保留跟随会话，日志标记
+`wrist_reference_in_deadband`。
 参考 / 命令限速不是实体 TCP 或关节实际速度的验收保证，50 mm 也不是全夹板净空保证。
 
 当前 [腕部启动脚本](../Camera_wrist/start_robot.sh) 显式使用 Execute、no-force、candidate-trial，
@@ -251,11 +261,28 @@ Stop 回执成功不等于实体已静止；超时 / 不健康反馈产生失败
 `stop_not_physically_confirmed` 类错误。`BestEffortStopGuard` 在提前退出时补发有界 Stop，
 自身不证明物理静止。上述算法已实现，实体停止性能仍需现场验收。
 
+## Collision 关节路径执行
+
+[RMJointPathExecutor](include/joint_path_executor.hpp) 是可选粗定位会话，由 Collision 显式执行模式使用，
+与 main_rm75 的力控／腕部状态机分开。保留 OMPL 原始关节路点，逐段 MoveJ，
+r=0、trajectory_connect=0，不插入 2° 运动路点；默认速度比例 6%，由 monitor.example.json 配置。
+通过 TryStartMoveJ 提交单个运动，RMStateReader 仍是唯一 I/O 接收者并持续查询反馈、处理 Stop；
+接受回执不等于到位，控制器完成事件与新反馈的实际到位均满足后才发送下一段。
+反馈投影到活动关节线段，偏离投影超过 5° 停止，而不是把离目标超过 5° 当作跟踪故障。
+Collision 在按 E 后固定当前快照，一次性复查完整路径，通过才启动执行；运动中场景监督已取消。
+执行器不再等待相机许可或场景续期，保留机器人反馈时效、控制器错误、路径偏差、限位和取消停止。
+在途 MoveJ 中断／协议失败后锁住后续 MoveJ，需要重启会话，防止无请求 ID 的迟到到位事件串入新运动。
+停止诊断冻结触发时的关节误差、反馈年龄及执行阶段，随最终结果输出一次。
+检查至少 3° 限位裕量、反馈时效和路径偏差，机器人故障、取消或整个会话退出时请求 Stop 并确认静止。
+执行器、main_rm75 Execute 和 arm_probe_pose Execute 通过 [本机运动锁](include/motion_ownership.hpp)
+互斥；这不约束其他主机或未接入锁的工具。
+窗口及全局采点接入见 [Collision 执行说明](../Collision/EXECUTION.md)，尚待真实跟踪／制动验收。
+
 ## 颈动脉单点维护流程
 
 当前粗定位串联入口是 [run_probe_target.py](../hand_eye_calibration-main/run_probe_target.py)：
-读取全局相机本次快照，外参转换首点 / 法向 / 切向，生成短轴姿态，沿 Tool -Z 后退 100 mm，
-再调用 `arm_probe_pose --target-pose-m-rad ... --controller-movej-p`。
+读取全局相机本次快照，外参转换首点 / 法向 / 切向，生成短轴姿态，沿 Tool -Z 后退 100 mm，与 Collision 一致，
+再调用 `arm_probe_pose --target-pose-m-rad ... --controller-movej-p`，默认速度参数为 6。
 默认脚本会传执行参数，`--dry-run` 只预览；成功且启用 handoff 的真实定位才发布投影 seed。
 seed 的表面点不含后退偏置，不能拿定位 TCP 点当表面点。
 
@@ -306,7 +333,7 @@ CSV / summary 为准，后续离线回放可复用无 I/O 控制与规划模块�
 ## KWR57 协议边界
 
 默认协议改为 `kwr57-rs422`、460800/8N1、关闭流控。启动发送 `48 AA 0D 0A`，
-退出时有界尝试发送 `43 AA 0D 0A`；500 Hz 数据只更新最新快照，控制周期仍为 10 ms。
+退出时有界尝试发送 `43 AA 0D 0A`；500 Hz 数据只更新最新快照，控制周期为 5 ms。
 解析器按 28 字节检查 `48/49 AA` 帧头、固定位置 CRLF、有限数值，支持拆包、粘包及噪声重同步；
 缓存最多 28 字节。六个小端 float32 按手册 kgf/kgf·m 解释，均乘 9.80665 转为 SI。
 

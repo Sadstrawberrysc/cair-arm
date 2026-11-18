@@ -4,6 +4,8 @@
 #ifdef COLLISION_HAS_PLANNING
 #include "collision/joint_planner.hpp"
 #include "coarse_target.hpp"
+#include "coarse_execution.hpp"
+#include "live_carotid.hpp"
 #include <ompl/util/Console.h>
 #endif
 #ifdef COLLISION_HAS_REALSENSE
@@ -138,12 +140,18 @@ Json StateDiagnostic(const c::StateCheck& check) {
 c::PlanResult PlanCameraFrame(const c::RobotModel& model, const c::CollisionChecker& checker,
     const c::MonitorFrame& frame, const c::MonitorResult& observation, const c::MonitorOptions& monitor,
     const std::filesystem::path& goal_path, const c::CameraCalibration& calibration,
-    bool live, std::int64_t replay_now, Json& target_report) {
+    bool live, std::int64_t replay_now, Json& target_report,
+    const std::optional<c::app::LiveCarotidTarget>& mapped_target=std::nullopt, bool require_mapped_target=false) {
     c::PlanResult result;
     result.model_id = checker.ModelId(); result.scene_id = observation.check.scene_id;
     result.calibration_id = observation.check.calibration_id; result.captured_at_ns = frame.captured_at_ns;
     result.checked_at_ns = live ? c::MonitorSteadyNowNs() : replay_now;
     try {
+        if (require_mapped_target && !mapped_target) {
+            result.status="target_not_available";
+            result.detail="Wait for a fresh red mapped carotid point before pressing P";
+            return result;
+        }
         if (!observation.input_valid) {
             result.detail = observation.check.detail;
             return result;
@@ -152,6 +160,8 @@ c::PlanResult PlanCameraFrame(const c::RobotModel& model, const c::CollisionChec
         Keys(goal_file, {"schema_version", "goal_joint_positions_rad", "coarse_target", "planning_options"});
         if (goal_file.at("schema_version") != 1) throw std::invalid_argument("Unknown goal schema");
         const bool coarse = goal_file.contains("coarse_target");
+        if (require_mapped_target && !coarse)
+            throw std::invalid_argument("Shared carotid mode requires coarse_target, not fixed goal joints");
         if (coarse == goal_file.contains("goal_joint_positions_rad"))
             throw std::invalid_argument("Specify exactly one of coarse_target and goal_joint_positions_rad");
         c::JointPositions goal;
@@ -192,7 +202,7 @@ c::PlanResult PlanCameraFrame(const c::RobotModel& model, const c::CollisionChec
             result = c::PlanJointPath(model, checker, frame.joints, goal, observation.scene, now, options,
                 [&] { return stopped != 0 || expired(); });
         } else {
-            const auto prepared = c::app::LoadCoarseTarget(goal_file.at("coarse_target"), goal_path, calibration);
+            const auto prepared = c::app::LoadCoarseTarget(goal_file.at("coarse_target"), goal_path, calibration, mapped_target);
             target_report = prepared.metadata;
             if (monitor.robot_occlusion_filter) {
                 const Eigen::Vector3d camera_origin = calibration.base_from_color * frame.ray_origin_color_m;
@@ -279,10 +289,11 @@ c::PlanResult PlanCameraFrame(const c::RobotModel& model, const c::CollisionChec
 } // namespace
 int main(int argc, char **argv) {
     try {
-        std::filesystem::path urdf, calibration_path, config_path, replay_path, record_path, goal_path;
+        std::filesystem::path urdf, calibration_path, config_path, replay_path, record_path, goal_path, shared_frame_directory;
         std::string robot_ip;
         int robot_port = 8080, stride = 8;
-        bool live = false, headless = false, drop = false, plan_once = false, verbose = false;
+        bool live = false, headless = false, drop = false, plan_once = false, verbose = false, execute = false;
+        bool single_plan_done=false, execute_requested=false, execution_once_started=false;
         std::string last_monitor_message;
         std::size_t max_frames = 0;
         c::MeshDirectories directories;
@@ -309,19 +320,22 @@ int main(int argc, char **argv) {
             }
             if (arg == "--help") {
                 std::cout
-                    << "Read-only collision monitor; never sends motion or stop commands.\n"
+                    << "Read-only by default. --execute explicitly enables Robot joint-path execution.\n"
                        "collision_monitor --urdf FILE --calibration FILE --config FILE [--mesh-dir DIR]\n"
                        "  (--replay JSONL | --live --robot-ip IP [--robot-port 8080])\n"
                        "  [--headless] [--max-frames N] [--pixel-stride 8] [--record NEW_JSONL]\n"
                        "  [--drop-zero-area-triangles] [--sdk-info]\n"
-                       "  [--goal JSON] [--plan-once] [--verbose] (planning requires planning build)\n"
+                       "  [--goal JSON] [--plan-once] [--verbose] [--execute]\n"
+                       "  [--shared-frames DIR] (internal single-camera RGB/depth and live carotid bridge)\n"
+                       "--execute: live only; P plans, E executes, Space stops; exits after verified arrival.\n"
+                       "Headless requires --plan-once. Execution uses MoveJ with scene supervision disabled.\n"
+                       "--execute --plan-once: plan once, then execute and exit.\n"
                        "Default output: monitor status changes and compact planning results.\n"
                        "--verbose: print every frame and full planning JSON, including paths and IK candidates.\n"
                        "With --goal: press P to plan using the current camera snapshot.\n"
                        "Goal JSON accepts joint angles or coarse_target (carotid file + calibrated probe TCP).\n"
                        "--plan-once: plan on the first valid frame, then exit; requires --goal.\n"
-                       "Replay performs no device/network access. Live is standalone state-only "
-                       "diagnostics.\n"
+                       "Replay performs no device/network access. Live is read-only unless --execute.\n"
                        "Viewer: left drag orbit, wheel zoom, Esc exit; red environment risk, amber self "
                        "pairs, grey robot points, orange density outliers.\n"
                        "Exit 0: input frames processed (not a clearance approval); 1: source/input failure; "
@@ -338,13 +352,14 @@ int main(int argc, char **argv) {
             }
             if (arg == "--plan-once") { plan_once = true; continue; }
             if (arg == "--verbose") { verbose = true; continue; }
+            if (arg == "--execute") { execute = true; continue; }
             if (arg == "--drop-zero-area-triangles") {
                 drop = true;
                 continue;
             }
             if (arg != "--urdf" && arg != "--calibration" && arg != "--config" && arg != "--replay" &&
                 arg != "--record" && arg != "--mesh-dir" && arg != "--robot-ip" && arg != "--robot-port" &&
-                arg != "--max-frames" && arg != "--pixel-stride" && arg != "--goal")
+                arg != "--max-frames" && arg != "--pixel-stride" && arg != "--goal" && arg != "--shared-frames")
                 throw std::invalid_argument("Unknown option: " + arg);
             if (++i >= argc)
                 throw std::invalid_argument("Missing option value");
@@ -361,6 +376,7 @@ int main(int argc, char **argv) {
                 record_path = value;
             else if (arg == "--goal")
                 goal_path = value;
+            else if (arg == "--shared-frames") shared_frame_directory=std::filesystem::canonical(value);
             else if (arg == "--mesh-dir")
                 directories["package://rm_description/meshes/rm_75_arm/"] = std::filesystem::canonical(value);
             else if (arg == "--robot-ip")
@@ -388,14 +404,22 @@ int main(int argc, char **argv) {
         if (!live && !robot_ip.empty())
             throw std::invalid_argument("Robot address is not accepted in replay mode");
         if (plan_once && goal_path.empty()) throw std::invalid_argument("--plan-once requires --goal JSON");
+        if (!shared_frame_directory.empty() && (!live || goal_path.empty() || headless ||
+            !std::filesystem::is_directory(shared_frame_directory)))
+            throw std::invalid_argument("Shared carotid mode requires live camera, goal and point-cloud viewer");
+        if (execute && (!live || goal_path.empty() || (headless && !plan_once)))
+            throw std::invalid_argument("--execute requires live planning; headless execution also requires --plan-once");
         if (!goal_path.empty() && !std::filesystem::is_regular_file(goal_path))
             throw std::invalid_argument("Goal file missing: " + goal_path.string());
+        if (!shared_frame_directory.empty() && !Load(goal_path).contains("coarse_target"))
+            throw std::invalid_argument("Shared carotid mode requires a coarse_target goal");
 #ifndef COLLISION_HAS_PLANNING
+        if (execute) throw std::invalid_argument("Execution requires planning build");
         if (!goal_path.empty()) throw std::invalid_argument("Enable BUILD_COLLISION_PLANNING to use --goal");
 #else
         ompl::msg::setLogLevel(ompl::msg::LOG_NONE);
 #endif
-        if (plan_once && !max_frames) max_frames = 30; // Bounded startup wait for trustworthy feedback/time.
+        if (plan_once && !max_frames && shared_frame_directory.empty()) max_frames = 30;
 #ifndef COLLISION_HAS_REALSENSE
         if (live)
             throw std::runtime_error(
@@ -406,10 +430,13 @@ int main(int argc, char **argv) {
         Keys(config,
              {"schema_version", "region_min_m", "region_max_m", "voxel_m", "min_depth_m", "max_depth_m",
               "mask_padding_m", "robot_occlusion_filter", "outlier_radius_m", "outlier_min_neighbors", "endpoint_padding_voxels", "max_points", "max_voxels",
-              "max_feedback_offset_ns", "max_frame_age_ns", "clearance_m", "self_collision_exclusions"});
+              "max_feedback_offset_ns", "max_frame_age_ns", "clearance_m", "joint_limit_margin_deg", "self_collision_exclusions", "movej_velocity_percent"});
         if (config.at("schema_version") != 1)
             throw std::invalid_argument("Unknown monitor schema");
         c::MonitorOptions options;
+        const auto movej_velocity_percent=config.contains("movej_velocity_percent") ? Time(config.at("movej_velocity_percent")) : 6;
+        if (movej_velocity_percent<1 || movej_velocity_percent>100)
+            throw std::invalid_argument("movej_velocity_percent must be an integer in [1,100]");
         options.region = {Vector(config.at("region_min_m")), Vector(config.at("region_max_m"))};
         if (config.contains("voxel_m"))
             options.voxel_m = Number(config.at("voxel_m"));
@@ -427,6 +454,9 @@ int main(int argc, char **argv) {
             options.outlier_min_neighbors = Time(config.at("outlier_min_neighbors"));
         if (config.contains("clearance_m"))
             options.collision.clearance_m = Number(config.at("clearance_m"));
+        if (config.contains("joint_limit_margin_deg"))
+            options.collision.joint_limit_margin_rad=Number(config.at("joint_limit_margin_deg"))*std::acos(-1.)/180;
+        if (execute) options.collision.joint_limit_margin_rad=std::max(options.collision.joint_limit_margin_rad,3*std::acos(-1.)/180);
         if (config.contains("max_points"))
             options.max_points = Time(config.at("max_points"));
         if (config.contains("max_voxels"))
@@ -475,10 +505,19 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Viewer not compiled; use --headless");
 #endif
 #ifdef COLLISION_HAS_REALSENSE
+#ifdef COLLISION_HAS_PLANNING
+        std::unique_ptr<c::app::CoarseExecution> execution;
+        if (execute) execution=std::make_unique<c::app::CoarseExecution>(model,checker,
+            RMConnectionConfig{robot_ip,robot_port},options.collision,static_cast<int>(movej_velocity_percent));
+#endif
         std::unique_ptr<c::LiveMonitorSource> source;
-        if (live)
-            source = std::make_unique<c::LiveMonitorSource>(
-                c::LiveSourceOptions{robot_ip, robot_port, calibration.serial, stride});
+        if (live) {
+            c::LiveSourceOptions input{robot_ip,robot_port,calibration.serial,stride,{},shared_frame_directory,calibration.sha256};
+#ifdef COLLISION_HAS_PLANNING
+            if (execution) input.feedback=[&] { return execution->Feedback(); };
+#endif
+            source=std::make_unique<c::LiveMonitorSource>(input);
+        }
 #endif
         std::signal(SIGINT, Signal);
         std::signal(SIGTERM, Signal);
@@ -487,7 +526,7 @@ int main(int argc, char **argv) {
 #ifdef COLLISION_HAS_VIEWER
         std::int64_t displayed_plan_capture = -1;
 #endif
-        while (!stopped && (!max_frames || processed < max_frames)) {
+        while (!stopped && (!max_frames || processed < max_frames || (execute && single_plan_done))) {
             c::MonitorFrame frame;
             std::int64_t now;
             if (!live) {
@@ -521,6 +560,48 @@ int main(int argc, char **argv) {
             last_input_detail = result.check.detail;
             if (result.input_valid)
                 ++valid_inputs;
+#ifdef COLLISION_HAS_PLANNING
+            std::optional<c::app::LiveCarotidTarget> mapped_target;
+            if (!shared_frame_directory.empty()) {
+                std::string detail;
+                mapped_target=c::app::MapLiveCarotid(shared_frame_directory,frame,result,options,calibration,detail);
+#ifdef COLLISION_HAS_VIEWER
+                if (viewer) viewer->SetMappedSurface(mapped_target ?
+                    std::optional<Eigen::Vector3d>(mapped_target->matched_base_m) : std::nullopt,detail);
+#endif
+            }
+#endif
+#if defined(COLLISION_HAS_REALSENSE) && defined(COLLISION_HAS_PLANNING)
+            if (execution) {
+                if (execute_requested) {
+                    execute_requested=false;
+                    try {
+                        execution->Start(result,[&] { return stopped!=0; });
+                        execution_once_started=true;
+#ifdef COLLISION_HAS_VIEWER
+                        if (viewer) viewer->ClearGoalPreview();
+#endif
+                    } catch (const std::exception& e) {
+                        std::cout << Json({{"event","execution_rejected"},{"detail",e.what()}}).dump() << std::endl;
+                        if (plan_once) return 2;
+                    }
+                }
+                execution->Update();
+                auto state=execution->Status();
+                if (execution_once_started && !state.active) {
+                    // The worker can finish between Update() and Status().
+                    // Finalize FK/feedback verification before deciding the
+                    // exit code that permits the wrist handoff.
+                    execution->Update();
+                    state=execution->Status();
+                    if (!stopped && state.phase=="completed" && state.stationary_confirmed) return 0;
+                    if (plan_once) return 2;
+                }
+#ifdef COLLISION_HAS_VIEWER
+                if (viewer) viewer->SetExecutionStatus(state.phase+" | E: execute, Space: stop");
+#endif
+            }
+#endif
             Json violations = Json::array();
             for (const auto &p : result.check.violations)
                 violations.push_back({{"robot_body", p.first_body},
@@ -529,8 +610,8 @@ int main(int argc, char **argv) {
                                       {"intersecting", p.intersecting},
                                       {"distance_m", p.distance_m}});
             Json output = {
-                {"mode", live ? "live_read_only_monitor" : "replay_read_only_monitor"},
-                {"robot_motion_enabled", false},
+                {"mode", execute ? "live_supervised_execution" : (live ? "live_read_only_monitor" : "replay_read_only_monitor")},
+                {"robot_motion_enabled", execute},
                 {"ready_for_motion_planning", false},
                 {"sequence", frame.sequence},
                 {"model_id", checker.ModelId()},
@@ -592,22 +673,37 @@ int main(int argc, char **argv) {
             }
             if (viewer && !viewer->Draw(frame, result))
                 break;
+#if defined(COLLISION_HAS_REALSENSE) && defined(COLLISION_HAS_PLANNING)
+            if (viewer && execution) {
+                const bool stop_requested=viewer->TakeStopRequest();
+                if (stop_requested) { execute_requested=false; execution->Cancel("operator_stop"); }
+                if (viewer->TakeExecutionRequest() && !stop_requested && !execution->Status().active) execute_requested=true;
+            }
+#endif
 #endif
 #ifdef COLLISION_HAS_PLANNING
-            bool requested = plan_once && result.input_valid;
+            bool requested = plan_once && !single_plan_done && result.input_valid &&
+                (shared_frame_directory.empty() || mapped_target.has_value());
 #ifdef COLLISION_HAS_VIEWER
             if (viewer && viewer->TakePlanningRequest() && !goal_path.empty()) requested = true;
 #endif
+#ifdef COLLISION_HAS_REALSENSE
+            if (execution && execution->Status().active) requested=false;
+#endif
             if (requested) {
                 Json target_report;
-                const auto plan = PlanCameraFrame(model, checker, frame, result, options, goal_path, calibration, live, now, target_report);
+                const auto plan = PlanCameraFrame(model, checker, frame, result, options, goal_path, calibration, live, now,
+                    target_report,mapped_target,!shared_frame_directory.empty());
+#ifdef COLLISION_HAS_REALSENSE
+                if (execution) execution->SetPlan(plan,target_report);
+#endif
                 const auto completed = live ? c::MonitorSteadyNowNs() : now;
                 Json report = {{"event", "camera_plan"}, {"mode", live ? "live_camera_joint_planning" : "replay_camera_joint_planning"},
                     {"point_filter", {{"outlier_radius_m", options.outlier_radius_m},
                         {"outlier_min_neighbors", options.outlier_min_neighbors}, {"outlier_points", result.outlier_points},
                         {"robot_occlusion_filter", options.robot_occlusion_filter},
                         {"occluded_points", result.occluded_points}, {"occluded_voxels", result.occluded_voxels}}},
-                    {"robot_motion_enabled", false}, {"ready_for_execution", false},
+                    {"robot_motion_enabled", execute}, {"ready_for_execution", false},
                     {"unknown_space_allowed", plan.unknown_space_allowed},
                     {"status", plan.status}, {"detail", plan.detail}, {"exact", plan.Exact()},
                     {"model_id", plan.model_id}, {"scene_id", plan.scene_id}, {"calibration_id", plan.calibration_id},
@@ -629,6 +725,7 @@ int main(int argc, char **argv) {
                         {"ready_for_execution", false},
                         {"unknown_space_allowed", plan.unknown_space_allowed},
                         {"waypoint_count", plan.waypoints.size()}};
+                    if (execute) summary["execution_enabled"]=true;
                     if (!plan.Exact()) {
                         summary["detail"] = plan.detail;
                         auto failure = CompactFailure(plan.goal_check);
@@ -659,12 +756,22 @@ int main(int argc, char **argv) {
                     displayed_plan_capture = plan.Exact() ? frame.captured_at_ns : -1;
                 }
 #endif
-                if (plan_once) return plan.Exact() ? 0 : 2;
+                if (plan_once) {
+                    if (!execute || !plan.Exact()) return plan.Exact() ? 0 : 2;
+                    single_plan_done=true; execute_requested=true;
+                }
             }
 #endif
             if (!live && !headless)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+#if defined(COLLISION_HAS_REALSENSE) && defined(COLLISION_HAS_PLANNING)
+        if (execution) {
+            execution->Shutdown();
+            const auto status=execution->Status();
+            return !stopped && status.phase=="completed" && status.stationary_confirmed ? 0 : 2;
+        }
+#endif
         if (!processed && !stopped)
             throw std::runtime_error("Source has no frames");
         if (plan_once) {

@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory() as directory:
         ('0,0,1.051,0,0,0', 0, ['--inspect-transform-only']),
         # TCP within the tip's spherical bound, but orientation makes wrist unreachable.
         ('0,0,.7,3.141592653589793,0,0', 4, ['--inspect-transform-only']),
-        ('0,0,.6,0,0,0', 0, ['--inspect-transform-only']),
+        ('0,0,.6,0,0,0', 0, ['--inspect-transform-only', '--velocity', '6']),
     ]:
         result = subprocess.run(
             [binary, '--tool-calibration', str(path), '--target-pose-m-rad', pose,
@@ -39,4 +39,13 @@ with tempfile.TemporaryDirectory() as directory:
         assert 'maximum_wrist_radius_mm: 466.000000' in output, output
         if expected == 4:
             assert 'Target is geometrically unreachable' in output, output
-print('5 offline wrist-reach cases passed')
+    result = subprocess.run(
+        [binary, '--tool-calibration', str(path), '--target-pose-m-rad', '0,0,.6,0,0,0',
+         '--controller-movej-p', '--inspect-transform-only', '--velocity', '7'],
+        capture_output=True, text=True, timeout=5)
+    output = result.stdout + result.stderr
+    assert result.returncode == 2, output
+    assert 'velocity must be in 1..6' in output, output
+    assert 'Connecting to Realman' not in output, output
+    assert '"command":"movej_p"' not in output, output
+print('5 offline wrist-reach cases and velocity rejection passed')

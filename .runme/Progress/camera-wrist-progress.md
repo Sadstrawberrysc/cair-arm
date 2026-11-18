@@ -1,7 +1,90 @@
-# Camera_wrist 项目进展（Runme notebook）
+# Camera_wrist 项目进展
 
-> 本文件是纳入 Git 的 Runme notebook；当前架构见
-> [Camera_wrist/ARCHITECTURE.md](../../infer/Camera_wrist/ARCHITECTURE.md)。
+> 本文件记录进展、验证结果与待办；当前架构见
+> [Camera_wrist/ARCHITECTURE.md](../../infer/Camera_wrist/ARCHITECTURE.md)，操作见
+> [腕部手册](../run/camera-wrist-operations.md)。
+
+## 2026-11-13：时域深度参数调整为当前帧权重 0.6、变化比例 0.2
+
+按用户要求，TemporalFilter 的 weight 由 0.4 改为 0.6，diff_scale 由 0.1 改为 0.2。
+同步现行架构说明和既有配置预期；有效掩码、原始时间及历史重置逻辑沿用现有实现。
+未运行功能测试或启动设备，重启腕部相机后生效；下方初始参数记录保留历史值。
+
+## 2026-11-13：相机深度图加入 SDK 时域平滑
+
+按用户要求，在现有 SDK 空间滤波、FURTHEST 补洞之后增加 TemporalFilter，
+通过 public FilterFactory 创建，配置当前帧 weight=0.4、diff_scale=0.1，启动日志记录实际读回值。
+当前帧空间处理 / 补洞仍为 0 的像素在最终结果中保持无效，不允许 SDK 仅依靠历史生成有效深度。
+保留原始深度副本；各阶段核对尺寸、格式、尺度、原始采集时间。
+采集间断超过 200 ms、元数据变化或异常时清历史；SDK 预热无输出时跳过本帧并继续积累历史。
+frame_timing 新增时域耗时、重置原因和历史填补拒绝数量，观测标记时域处理；模型赶帧使用同一处理结果，不重复滤波。
+此滤波未做运动配准，Robot 的 100 ms XYZ 低通独立保留；实际移动滞后和稳定效果待实采确认。
+已同步既有 SDK 替身与配置预期，Python 语法和差异检查通过；按用户要求未运行功能测试或启动设备。
+重启腕部相机后加载新链路，无需为本次改动重编译 Robot。
+
+## 2026-11-13：腕部定位恢复原速度
+
+按用户要求，腕部 TCP 位置参考限速由 8 mm/s 恢复为 4 mm/s，
+姿态参考及每关节 ServoJ 命令限速由 8°/s 恢复为 4°/s（10 ms 每关节最多 0.04°）。
+第一步全局 MoveJ_P 继续使用速度参数 6；启动提示、现行文档及速度断言同步更新。
+`main_rm75` 编译通过，`motion_logic_test` 与 `runtime_config_test` 两项离线测试通过；
+未启动真实机械臂。重启 Robot 后加载恢复速度；下方速度翻倍记录保留为历史。
+
+## 2026-11-13：仿射优先、光流中位平移回退与四特征门限
+
+按用户要求，标准 / 宽松两配置统一为前后向误差 3 px、RANSAC 重投影门限 3 px、
+仿射内点比例 50%、最少有效特征数 4；Robot 接收端同步由 6 改为 4。
+当前帧优先使用仿射；估计失败 / 非有限 / 共识不足，或仿射候选像素 / 纹理不合格时，
+尝试 `pixel += median(new - old)` 平移回退。回退仍要求至少 4 对当前有效前后向光流，
+保持像素跳变、补点、深度 / 法向、原始采集时间与 Robot 状态检查，模型继续使用现有同源帧纠偏。
+质量及日志标明仿射 / 平移方法、真实支持点数和来源、回退原因；不将回退点冒记为仿射内点。
+RGB-D、模型赶帧及独立二维显示共享新逻辑。已同步既有四特征边界测试预期；按用户要求不运行测试。
+Python 语法检查及 `main_rm75` 编译通过；未运行功能测试，未启动相机或机械臂。
+相机和 Robot 均需重启加载；实际连续性改善仍待运行观测。
+
+## 2026-11-13：腕部姿态目标更新死区改为 15°
+
+按用户要求，将腕部姿态候选相对上次接受目标的更新死区由 5° 调为 15°：
+变化不超过 15° 时保持目标，超过才更新；begin / resume 继续重置接受目标。
+该门限作用于完整目标旋转；TCP 位置的 50 mm 偏置继续使用原始有效法向。
+同步当前架构和既有测试输入（14° 保持、16° 更新），按用户要求未运行测试；
+`main_rm75` 编译通过，未启动相机或机械臂；重启 Robot 进程后生效。
+
+## 2026-11-13：第二步定位速度翻倍
+
+按用户要求，腕部跟随 TCP 位置参考限速由 4 mm/s 调为 8 mm/s，
+姿态参考及每关节 ServoJ 命令限速由 4°/s 调为 8°/s；10 ms 周期每关节最多 0.08°。
+`main_rm75` 已重编译；9 项 Robot 离线测试及 8 项模拟交接 / 姿态测试通过，
+覆盖平移 / 姿态限速及恢复参考。未启动真实机械臂，尚未进行真机速度验收；下方速度记录保留历史值。
+
+## 2026-11-13：取消局部仿射缩放异常拒绝
+
+按用户要求取消 `abnormal affine scale`：仿射主方向尺度或行列式超出旧范围时继续跟踪，
+标准 / 宽松及共享该逻辑的二维显示、模型赶帧均生效。旧范围仅作参考，
+记录尺度、行列式、`affine_scale_gate_enabled=false` 与超参考项；SVD 诊断失败也不再中断有限仿射变换。
+保留变换矩阵有限性、前后向光流、特征数、RANSAC 共识、像素跳变、深度和时效检查。
+仅完成源码与差异核对，按用户要求未运行测试，未启动或重启相机 / 机械臂。
+源码修改不会自动更新旧进程或直接解除既有 Hold；重启相机加载后仍走既有选点 / 恢复流程，
+模型模式可通过 `b` 重选并请求跟随。
+
+## 2026-11-13：Robot 对 Base 表面位置做采集时间低通
+
+按用户确认方案，在 Robot 完成观测采集时刻的坐标转换后，仅对 Base 下表面位置 XYZ
+增加时间常数 0.10 s 的指数低通：`alpha = -expm1(-dt / 0.10)`，dt 取不同源 capture_ns 之差。
+同一 capture 在多个控制周期中只复用滤波结果；begin / resume 用当前原始点 seed，
+任意 Hold 清空历史，滤波状态与运动参考 Commit 独立。
+原始点继续用于实际法向间距和原有观测日志，滤波点仅用于 TCP 目标；
+法向 / 姿态、50 mm 偏置、4 mm/s 位置参考限速、光流 / 模型融合和原有时效检查保持原逻辑。
+`runtime.csv.wrist.csv` 在末尾追加位置滤波诊断，保留原有列及原始点语义。
+`main_rm75` 生产入口编译通过；按用户要求未运行测试，未启动相机或机械臂。
+重启 Robot 后加载滤波逻辑；相机窗口仍显示原始视觉结果，实际抖动改善仍待运行观测。
+
+## 2026-11-12：模型多框选点改取最高置信度
+
+模型检测在既有类别、置信度及坐标校验后，改为选取置信度最高的合格框中心；
+同分保留模型输出中靠前者，无合格框仍拒绝。初始选点、恢复选点和跟踪中的模型校正共用此规则。
+同步更新架构说明、拒绝原因及既有测试预期；按用户要求未运行测试，也未启动相机或机械臂。
+本次未修改光流、深度、法向、融合增益或 Robot 跟随参数；抖动改进仅提供方案，尚未实施。
 
 ## 2026-11-10：Robot offline 状态积压修复
 
@@ -101,9 +184,9 @@ SDK 采集改为单线程读取、只保留最新待处理帧，新增 frame_tim
 106 项纯离线测试通过，覆盖二维深度失效续追、颜色 / 过期隐藏、旧帧丢弃、采集错误、受检查恢复及原有回归。
 未打开相机、Redis 或机械臂；实际延迟改善和真机恢复效果待现场验证。
 
-## 当前入口与待验收
+## 当前状态与待验收
 
-- 默认相机模型模式，`--manual` 人工选点；始终连接 Redis。模型取得新鲜 Robot Hold 和完整 RGB-D 后自动选点，目标回传确认后请求跟随；`b` 重选并开始，`p` 取消自动意图，`q` 退出相机。
+- 相机默认模型模式，也支持人工选点；始终连接 Redis。模型取得新鲜 Robot Hold 和完整 RGB-D 后自动选点，目标回传确认后请求跟随，支持人工重选与取消自动意图。
 - TCP / 姿态参考及每关节命令限速为 4 mm/s、4°/s、4°/s。Robot 专用脚本是无力候选试验，关闭累计位移 / 转角及 TCP 位置跟踪误差门，持续到 Ctrl+C 或故障。
 - 模型服务归入 `detector/`，camera / ultralytics 分进程，经私有 socketpair 通信；默认 ID、阈值、缓存和凭据见 [detector 架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
 - 仍需真实扫描点真值、连续检测 / 恢复、独立外参、采集 / 反馈时序、TCP 间距和整段净空验收；历史约 24 mm 深度差及约 11.7 mm 间距差不能直接写成修正。
@@ -160,8 +243,8 @@ SDK 采集改为单线程读取、只保留最新待处理帧，新增 frame_tim
 7项CTest、28项Python测试通过。隔离无力仿真/tmp/wrist_loopback_q1rt98m_共752周期，
 验证planner接受目标、超时/断线/乱序Hold、显式恢复；wrench始终无效、ServoJ发送0。
 
-实机只读检查：/tmp/wrist_no_force_observe_20260917_check.csv及summary，显式
---observe --wrist-no-force、5秒自动结束。500周期robot_valid=1、wrench_valid=0，
+实机只读无力模式检查：/tmp/wrist_no_force_observe_20260917_check.csv及summary，
+5秒自动结束。500周期robot_valid=1、wrench_valid=0，
 force_sensor_enabled=false，ServoJ发送0，无故障；等待点击，不再因wrench无效拒绝。
 本轮未启动相机、未做新间距测量、未进行真实运动。
 
@@ -171,23 +254,23 @@ force_sensor_enabled=false，ServoJ发送0，无故障；等待点击，不再�
 
 ## 2026-09-17：候选外参执行开关与累计运动包络取消
 
-按用户明确授权完成--wrist-candidate-trial和--wrist-unlimited-excursion。
+按用户明确授权完成候选外参试验开关和取消累计运动包络的选项。
 只在显式腕部无力候选试验中允许不设累计位移/累计转角上限，仍限时1..30秒；
 不改外参验证标志，不改原速度/关节/IK/通信/Hold/急停保护。
 编译与7项CTest通过，隔离仿真/tmp/wrist_loopback_4snorfg0共752周期正常结束，
 测试断言合成位移超过5mm；旧帧/超时/断线仍Hold，模拟ServoJ发送0。
-完整真实启动命令见 `../run/camera-wrist-operations.md`。此记录仅为实现/离线验证，不代表真实运动已通过。
+此记录仅为实现/离线验证，不代表真实运动已通过。
 
 ### 本轮真实入口检查结果
 
-已按用户授权启动真实--execute-wrist-follow --wrist-no-force --wrist-candidate-trial
---wrist-unlimited-excursion，30秒/3000周期正常结束，无故障。
+已按用户授权启动真实腕部无力候选试验，取消累计运动包络，
+30秒/3000周期正常结束，无故障。
 日志/tmp/wrist_candidate_execute_20260917.csv及summary，control显示force_sensor_enabled=false、
 wrist_candidate_trial=true、wrist_total_excursion_limits_enabled=false。
 全程Hold，planner调用0，发送2418个保持目标；不能将这些ServoJ计为目标跟随成功。
 相机日志/tmp/wrist_candidate_camera_20260917.jsonl记录点击和end，但没有有效begin；
 终端曾提示select a valid target and wait for Robot before starting。
-相机与Robot均已结束。下一轮需在Robot状态已到达、当前观测有效后按b，才能验证实际跟随。
+相机与Robot均已结束；Robot 状态及有效观测就绪后的实际跟随仍待验证。
 
 ## 2026-09-17：无参数常驻启动
 
@@ -196,7 +279,7 @@ wrist_candidate_trial=true、wrist_total_excursion_limits_enabled=false。
 普通main_rm75无参数入口不变。日志使用唯一/tmp/wrist_continuous_*/runtime.csv。
 编译、7项CTest和shell语法检查通过；隔离连续回归/tmp/wrist_loopback_ssez8qmj，
 3832周期（超过38秒）仍工作，超时/断线/旧帧/恢复通过，SIGINT正常结束，模拟ServoJ发送0。
-本次未启动常驻真实运动进程。命令：bash infer/Camera_wrist/start_robot.sh。
+本次未启动常驻真实运动进程。
 
 ## 2026-09-17：持续跟随时位姿时间不匹配排查与修复
 
@@ -209,7 +292,7 @@ wrist_candidate_trial=true、wrist_total_excursion_limits_enabled=false。
 构建、7项CTest、28项Python测试通过。实机20秒observe无运动验证：
 /tmp/wrist_poll20_observe_20260917.csv及summary，2000周期、920个不同有效状态，
 反馈间隔中位数21.757ms、P95 22.239ms、P99 25.170ms、最大40.509ms，过50ms为0，ServoJ发送0。
-这是较短的只读采样，不能代替ServoJ负载下的持续跟随验收；下一轮按原启动命令重启两端复测。
+这是较短的只读采样，不能代替ServoJ负载下的持续跟随验收；两端更新后的联机复测待完成。
 
 ## 2026-09-17：按用户要求将腕部查询周期改为10ms
 
@@ -229,7 +312,7 @@ RobotRuntimeConfig.StatePollPeriodMs腕部模式由20ms改为10ms，普通模式
 曝光等参数采用设备 Close-Range 预设；实际深度质量与处理延迟仍需实测。
 现有 28 项 Python 离线测试及语法检查通过。设备可枚举，但打开返回
 `uvc_open -6`，尚未完成实际预设读回、1280×800 双流和追踪性能验收。
-关闭 OrbbecViewer/其他占用相机的进程后，原点击追踪命令即可自动应用配置。
+相机占用问题排除后的预设读回与连续采集仍待验证。
 
 ## 2026-09-21：腕部跟随禁用超声 Tool-Y 参考重置
 
@@ -299,7 +382,7 @@ Runme 执行终端生命周期。
 由 `start_camera.sh` 在 `camera` 环境启动相机。脚本保存完整终端输出、退出码，异常时
 保留标签页等待 Enter；不自动重启相机，不改变 Robot 控制或跟随安全门。
 
-17:06:49 在无其他相机/Robot 进程时实际执行 `runme run start-wrist-camera`：Runme 返回 0，
+17:06:49 在无其他相机/Robot 进程时实际执行相机启动单元：Runme 返回 0，
 相机在 Terminator 独立标签页启动。17:09:19 相机仍运行约 2 分 30 秒，JSONL 记录 4463 条
 跟踪事件、149.2 秒连续出帧，无 Redis 错误；未选点时的 `not initialized` 属正常等待状态。
 终端仍出现 `QObject::moveToThread` 与缺少 OpenCV Qt 字体目录的警告，但这次没有导致退出。
@@ -331,8 +414,8 @@ boot ID/标定 SHA/坐标系/有效位匹配；用相机的 `ClickSession` 校�
 终端被关闭/挂起导致 SIGHUP 是最符合证据的解释，但旧日志不能确定具体信号。
 Robot 不在运行时相机界面显示 offline 属于预期。
 
-修复：`start-wrist-robot` 和 `start-wrist-camera` 均以 `nohup setsid -f` 启动独立
-`terminator --no-dbus` 窗口，避免进程依附 Runme 执行终端；机器人新增
+修复：`start-wrist-robot` 和 `start-wrist-camera` 均以脱离父终端的方式启动独立
+Terminator 窗口并禁用 D-Bus 复用，避免进程依附 Runme 执行终端；机器人新增
 `start_robot_terminal.sh` 记录终端输出/退出码，`start_robot.sh` 转发 HUP，
 `main_rm75` 捕获 HUP 并沿原有 StopMotion/静止确认路径结束。`main_rm75` 构建通过。
 在真实 RM75 连接、**只读 observe** 模式下注入 HUP，进程退出码 0、生成 summary，
@@ -358,13 +441,13 @@ Orbbec 官方推荐 USB 3.0，故该链路是间歇性零帧的可能因素，�
 17:48 和 17:53 各出现一次带明确年龄的旧状态拒绝（约 1130 ms、268 ms），
 不是持续的标定不匹配；后续状态会恢复。17:38 的独立终端相机会话持续到 17:42
 仍有跟踪日志，未复现立即闪退。17:55 检查时相机和 Robot 均未运行；如单独启动相机，
-界面仍会显示 offline，需先通过 `start-wrist-robot` 启动 Robot。
+界面仍会显示 offline，实际连接状态依赖 Robot 是否运行。
 
 ## 2026-09-23：腕部启动命令简化
 
 `start-wrist-robot` 与 `start-wrist-camera` 的 Runme 单元各收敛为一行，
-共同调用 `launch_wrist_terminal.sh robot|camera`；独立 Terminator、日志和防重逻辑
-移入脚本。防重匹配同时覆盖相机实际使用的 `python -u` 启动形式。
+共同调用 `launch_wrist_terminal.sh`；独立 Terminator、日志和防重逻辑
+移入脚本。防重匹配同时覆盖相机实际使用的 Python 无缓冲输出形式。
 已通过 Bash 语法检查及两个 Runme 单元的 dry-run；本次未重新启动实体设备。
 
 ## 2026-10-02：Carotid_begin 合并到腕部模块
@@ -387,8 +470,8 @@ NVIDIA 驱动模块，`/dev/nvidia*` 不存在，`nvidia-smi` 无法连接驱动
 生成菜单包含正确默认项，`grub-script-check` 通过。原配置和菜单备份保存在
 `/var/backups/uspilot-grub-20261009_175038/`。
 
-本次未安装或升级驱动、未修改模型代码、未重启电脑。重启后需先确认 `uname -r`
-为 `6.2.1-rt3` 且 `nvidia-smi` 正常，再复测模型加载和相机；GPU 推理与真机运行尚未验证。
+本次未安装或升级驱动、未修改模型代码、未重启电脑。重启后的 `6.2.1-rt3` 内核、
+GPU 驱动、模型加载与相机仍待复核；GPU 推理与真机运行尚未验证。
 
 ## 2026-10-09：改用指定 generic 内核并恢复 NVIDIA 驱动
 
@@ -469,30 +552,17 @@ CMake 配置、`main_rm75` 和 `robot_offline_tests` 构建成功，CTest 6/6 �
 低于现有 16 MiB 传输上限。相关文档和配置差异检查通过。
 未启动真实相机或机械臂；重启相机程序后加载新配置，实机精度及延迟待验收。
 
-### 当前采集配置与运行参数
+### 当轮采集配置补充（历史）
 
-约 30 cm 相机到颈部距离使用固定采集配置：`Close Range Default`（兼容 `Close-Range`）、
+2026-11-09 后续调整后的约 30 cm 采集配置为：`Close Range Default`（兼容 `Close-Range`）、
 128 视差、RGB `MJPG` / 深度 `Y16`，均为 **848×480 @ 60 FPS**。
 配置集中在 `infer/Camera_wrist/gemini_config.py`，启动时校验预设和视差读回；
-不支持所需流时直接报错，不自动降帧。最近只读核查连接为 USB 3（5000 Mbps）；848×480 / 60 FPS 已完成独立双流采集验证。
+不支持所需流时直接报错，不自动降帧。当时只读核查连接为 USB 3（5000 Mbps）；848×480 / 60 FPS 已完成独立双流采集验证。
 Gemini 305 手册 §4.8 对应最小测距为 6 cm，标称理想范围为 7–50 cm；
 30 cm 下的皮肤深度误差、有效深度比例与处理延迟仍需实机验证。
 主程序从所选视频流读取内参；OrbbecViewer 的 XML 默认值不决定主程序配置。
 
-启动器的 `camera`、`robot` 分别选择相机和机械臂终端。以下可选参数传给
-`start_camera.sh`，例如 `bash infer/Camera_wrist/start_camera.sh --manual`（在仓库根目录运行）。
-
-| 相机参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--serial` | `CV2L360000HZ` | Gemini 305 设备序列号 |
-| `--redis-port` | `7777` | 本机 Redis 通信端口 |
-| `--calibration` | `gemini305_to_rm75_armtip.json` | 腕部 Camera → ArmTip 外参，默认位于 `infer/Camera_wrist/` |
-| `--model-id` | [模型配置](../../infer/Camera_wrist/detector/config.py)中的默认模型 | 覆盖检测模型；也可用 `CAROTID_MODEL_ID` 环境变量 |
-| `--model-confidence` | `0.4` | 模型选点置信度阈值，范围 0～1 |
-| `--manual` | 不启用 | 改用鼠标选点，不加载检测模型 |
-
-默认模型模式在 Robot 就绪后自动选点并请求跟随。`p` 暂停、`q` 退出相机；
-机械臂终端按 `Ctrl+C` 结束。
+上述 848×480 / 60 FPS 配置已由 2026-11-10 的 USB 2 双路 640×480 / 30 FPS 配置替代。
 
 
 ## 2026-11-09：按实际可用档位改为 1280×800 / 10 FPS

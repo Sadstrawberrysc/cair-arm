@@ -24,20 +24,26 @@ done
 replay=false
 information=false
 help=false
+motion=false
 coarse=auto
+carotid=false
+headless_requested=false
 forwarded=()
 remaining=("$@")
 while ((${#remaining[@]})); do
     option="${remaining[0]}"
     remaining=("${remaining[@]:1}")
     if [[ "$option" == --coarse ]]; then coarse=true; continue; fi
+    if [[ "$option" == --carotid ]]; then carotid=true; continue; fi
     if [[ "$option" == --monitor-only ]]; then coarse=false; continue; fi
     forwarded+=("$option")
     case "$option" in
         --help) information=true; help=true ;;
         --sdk-info) information=true ;;
-        --live|--headless|--drop-zero-area-triangles|--plan-once|--verbose) ;;
-        --urdf|--calibration|--config|--replay|--record|--mesh-dir|--robot-ip|--robot-port|--max-frames|--pixel-stride|--goal)
+        --execute) motion=true ;;
+        --headless) headless_requested=true ;;
+        --live|--drop-zero-area-triangles|--plan-once|--verbose) ;;
+        --urdf|--calibration|--config|--replay|--record|--mesh-dir|--robot-ip|--robot-port|--max-frames|--pixel-stride|--goal|--shared-frames)
             if ((${#remaining[@]} == 0)); then
                 printf 'Missing value for %s\n' "$option" >&2
                 exit 1
@@ -50,11 +56,29 @@ while ((${#remaining[@]})); do
     esac
 done
 
+if "$carotid" && ! "$information"; then
+    if "$replay" || "$headless_requested" || [[ "$coarse" == false ]]; then
+        echo '--carotid 需要实时点云窗口及粗定位目标。' >&2
+        exit 1
+    fi
+    exec bash "$collision_dir/start_carotid.sh" "${forwarded[@]}"
+fi
+
+# Prevent the usual production senders from already owning the physical arm.
+# Robot also holds an inter-process lock against another coarse executor.
+if "$motion" && ! "$information"; then
+    if pgrep -af '^(/[^ ]*/|\./)?(main_rm75|arm_probe_pose|arm_preset_pose|rm75_servoj_diagnostic|force_sensor_calibration_capture)( |$)'; then
+        printf '%s\n' '请先停止已有 Robot 控制／标定进程，再启动 Collision 执行模式。' >&2
+        exit 1
+    fi
+fi
+
 if "$information"; then
     if "$help"; then
         printf '%s\n' \
             'Usage: start_monitor.sh [monitor options]' \
             'No arguments: live read-only carotid coarse planning (press P) using local resources.' \
+            '--carotid: show live carotid image and point cloud from one camera; map/red-mark the nearest retained point.' \
             'Default robot: 192.168.50.254:8080; override with --robot-ip / --robot-port.' \
             'Use --replay FILE for offline playback; --sdk-info only checks SDK linkage.' \
             'Use --monitor-only for monitoring without planning; --coarse remains a compatible alias.' \

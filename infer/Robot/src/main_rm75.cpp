@@ -35,6 +35,7 @@
 #include <force_calibration.hpp>
 #include <force_sensor.hpp>
 #include <realman_command.hpp>
+#include <motion_ownership.hpp>
 #include <redis_bridge.hpp>
 #include <rm75_control.hpp>
 #include <rm75_runtime_config.hpp>
@@ -196,6 +197,7 @@ bool ParseDouble(const char* text, double& output) {
 
 bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
     bool sensor_baud_explicit = false;
+    bool publish_every_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         auto value = [&]() -> const char* {
@@ -272,6 +274,7 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
         } else if (argument == "--duration-sec") {
             const char* item = value(); if (!item || !ParseInt(item, options.duration_s)) return false;
         } else if (argument == "--publish-every") {
+            publish_every_explicit = true;
             const char* item = value(); if (!item || !ParseInt(item, options.publish_every)) return false;
         } else if (argument == "--runtime-log") {
             const char* item = value(); if (!item) return false; options.runtime_log_path = item;
@@ -297,6 +300,7 @@ bool ParseOptions(int argc, char** argv, RobotRuntimeConfig& options) {
         }
     }
 
+    if (!publish_every_explicit && options.period_ms >= 10) options.publish_every = 5;
     if (!sensor_baud_explicit) options.sensor_baud = DefaultForceSensorBaud(options.sensor_protocol);
     return ValidateRobotRuntimeConfig(options);
 }
@@ -536,7 +540,7 @@ void ExpressWrenchInProbeToolFrame(
 }  // namespace
 
 // -------------------------------------------------------------------------
-// 模块四：进程编排——配置校验 -> 启动 I/O -> 10 ms 控制 -> 停止与报告
+// 模块四：进程编排——配置校验 -> 启动 I/O -> 5 ms 控制 -> 停止与报告
 // -------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -786,7 +790,9 @@ int main(int argc, char** argv) {
     // 只注入运行时标定得到的坐标关系，不再逐项覆盖模块默认参数。
     Rm75ControlConfig control_config = options.control;
     Rm75RuntimeSafetyConfig safety_config = options.EffectiveSafety();
+    const double period_ratio = static_cast<double>(std::min(options.period_ms, 10)) / kRm75ControlPeriodMs;
     control_config.cycle_s = options.period_ms / 1000.0;
+    control_config.maximum_model_y_step_m *= period_ratio;
     // RMState pose is Base -> Arm_Tip. Compose Sensor mount and independent
     // probe axes for control; gravity compensation uses only the Sensor mount.
     const CalibratedFrameChain frame_chain(calibration);
@@ -848,7 +854,13 @@ int main(int argc, char** argv) {
                      "calibration sha256=" << wrist_hash << '\n';
     }
     // 4.4 启动传感器与机械臂 I/O 所有者。
-    // 两类读取均在独立线程中进行，10 ms 主循环只消费线程安全快照。
+    RMMotionOwnership motion_ownership;
+    if (!options.simulate && options.mode==ControllerMode::kExecute &&
+        !motion_ownership.Acquire(RMConnectionConfig{options.robot_ip,options.robot_port})) {
+        std::cerr << "Robot motion is owned by another controller on this host\n";
+        return 4;
+    }
+    // 两类读取均在独立线程中进行，5 ms 主循环只消费线程安全快照。
     ForceSensorConfig sensor_config;
     sensor_config.device = options.sensor_device;
     sensor_config.baud_rate = options.sensor_baud;
@@ -901,7 +913,8 @@ int main(int argc, char** argv) {
         state_reader = std::make_unique<RMStateReader>(
             command,
             std::chrono::milliseconds(options.StatePollPeriodMs()),
-            std::chrono::milliseconds(options.robot_stale_ms));
+            std::chrono::milliseconds(options.robot_stale_ms),
+            std::chrono::milliseconds(options.period_ms));
         result = state_reader->Start();
         if (!result) {
             std::cerr << "Robot state reader failed: " << result.message << '\n';
@@ -1143,6 +1156,12 @@ int main(int argc, char** argv) {
               << "\nwrist_orientation_limit: " << (options.wrist_unlimited_excursion ? "disabled" : "enabled") << '\n'
               << "wrist_position_tracking_error_limit: "
               << (options.wrist_unlimited_position_tracking_error ? "disabled" : "enabled") << '\n'
+              << "wrist_surface_position_filter: disabled\n"
+              << "wrist_surface_position_filter_tau_s: 0\n"
+              << "wrist_position_deadband_start_mm: " << WristFollowController::kPositionStartErrorM * 1000.0 << '\n'
+              << "wrist_position_deadband_stop_mm: " << WristFollowController::kPositionStopErrorM * 1000.0 << '\n'
+              << "wrist_tcp_speed_mm_s: " << WristFollowController::kPositionSpeedMPerS * 1000.0 << '\n'
+              << "wrist_orientation_speed_deg_s: " << WristFollowController::kAngularSpeedDegPerS << '\n'
               << "configured_maximum_no_contact_approach_distance_mm: "
               << safety_config.maximum_no_contact_approach_distance_m * 1000.0
               << '\n'
@@ -1300,7 +1319,7 @@ int main(int argc, char** argv) {
     std::uint64_t previous_reported_command_sequence = 0;
     RedisStatusContext latest_status_context;
     std::vector<double> work_durations_us;
-    constexpr std::size_t kMaximumTimingSamples = 30000;
+    const std::size_t kMaximumTimingSamples = 300000 / options.period_ms;
     work_durations_us.reserve(kMaximumTimingSamples);
     bool retreat_active = false;
     bool legacy_completion_pending = false;
@@ -1322,7 +1341,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------------------------------------------------------------------
-    // 模块五：10 ms 实时控制循环
+    // 模块五：5 ms 实时控制循环
     // 每周期顺序固定为：读取快照 -> 校验 -> wrench 补偿 -> Redis 意图 ->
     // 状态机/力控 -> IK 规划 -> ServoJ/Hold -> 发布与日志 -> 周期调度。
     // ---------------------------------------------------------------------
@@ -1372,7 +1391,7 @@ int main(int argc, char** argv) {
                 const auto stamp=MonotonicNs(robot_state.received_at);
                 if (wrist_history.empty() || stamp>wrist_history.back().time_ns)
                     wrist_history.push_back({stamp,frame_chain.CameraPoseBase(robot_state.pose,wrist_arm_camera)});
-                while (wrist_history.size()>100) wrist_history.pop_front();
+                while (wrist_history.size()>1 && stamp-wrist_history.front().time_ns>1'000'000'000) wrist_history.pop_front();
             }
         }
         bool robot_feedback_hold_started_this_cycle = false;
@@ -1837,9 +1856,12 @@ int main(int argc, char** argv) {
             wrist_age_ms=(now-obs.capture_ns)/1e6;
             Eigen::Matrix4d capture_pose=Eigen::Matrix4d::Identity();
             const bool pose_matched=CalibratedFrameChain::InterpolateCamera(wrist_history,obs.capture_ns,capture_pose,wrist_span_ms);
-            wrist_input.fresh=obs.valid && wrist_snapshot.connected && command_decision.valid
-                && wrist_age_ms>=0 && wrist_age_ms<=200 && pose_matched
+            const bool valid_observation=obs.valid && wrist_snapshot.connected && command_decision.valid
+                && wrist_age_ms>=0 && wrist_age_ms<=200
                 && obs.target==wrist_snapshot.command.target && obs.producer==wrist_snapshot.command.producer;
+            wrist_input.fresh=valid_observation && pose_matched;
+            wrist_input.awaiting_pose_feedback=valid_observation && !pose_matched
+                && !wrist_history.empty() && obs.capture_ns>wrist_history.back().time_ns;
             wrist_input.reject_reason=pose_matched?"wrist_observation_missing_stale_or_mismatched":"wrist_pose_time_unmatched";
             wrist_input.external_hold=fatal_fault || !control_output.fault.empty() || !robot_valid
                 || pause_for_robot_feedback || recoverable_command_hold
@@ -1847,6 +1869,8 @@ int main(int argc, char** argv) {
             if (wrist_snapshot.rejection_generation!=wrist_rejection_generation)
                 wrist_input.reject_reason=wrist_snapshot.error;
             wrist_rejection_generation=wrist_snapshot.rejection_generation;
+            wrist_input.capture_ns=obs.capture_ns;
+            wrist_input.producer_id=obs.producer;
             wrist_input.target_id=obs.target;
             if (req.valid && now>=req.time_ns && now-req.time_ns<=500000000) {
                 wrist_input.request_token=req.producer+":"+std::to_string(req.sequence);
@@ -1854,8 +1878,10 @@ int main(int argc, char** argv) {
                 if (req.action=="begin" || req.action=="resume")
                     wrist_input.fresh=wrist_input.fresh && req.producer==obs.producer && req.target==obs.target;
             }
-            CalibratedFrameChain::CameraObservationBase(capture_pose,obs.point,obs.normal,
-                wrist_input.surface_base,wrist_input.normal_base);
+            if (pose_matched) {
+                CalibratedFrameChain::CameraObservationBase(capture_pose,obs.point,obs.normal,
+                    wrist_input.surface_base,wrist_input.normal_base);
+            }
             wrist_input.actual_tcp=frame_chain.ToolTcpPoseBase(robot_state.pose);
             wrist_input.cycle_s=options.period_ms/1000.;
             wrist_output=wrist_controller.Step(wrist_input);
@@ -1867,7 +1893,7 @@ int main(int argc, char** argv) {
             }
             if (control_output.fault.empty()) {
                 control_output.state=wrist_output.following?Rm75SupervisorState::kApproach:Rm75SupervisorState::kHold;
-                control_output.command_motion=wrist_output.following && arm_control;
+                control_output.command_motion=wrist_output.motion_requested && arm_control;
                 control_output.desired_pose=control_output.command_motion
                     ?frame_chain.ArmTipPoseFromTcp(wrist_output.tcp_reference):cartesian_reference_pose;
                 control_output.fault=wrist_output.reason;
@@ -2097,7 +2123,7 @@ int main(int argc, char** argv) {
 
         // 5.7 异步 ServoJ 发送门。
         // 新目标不能排在尚未写完的旧目标后；门关闭时跳过本周期发送，不让
-        // 10 ms 目标在通信队列中堆积。真实 socket 的 10 ms 最小发送间隔由
+        // 5 ms 目标在通信队列中堆积。真实 socket 的 5 ms 最小发送间隔由
         // RMCommand I/O 所有者精确执行，主循环不提前阻止下一目标发布。
         bool servo_mailbox_available = true;
         if (!fatal_fault && options.mode == ControllerMode::kExecute) {
@@ -2175,6 +2201,7 @@ int main(int argc, char** argv) {
             }
         } else if (!fatal_fault && options.mode == ControllerMode::kExecute
                    && !pause_for_robot_feedback
+                   && !wrist_output.waiting_for_pose
                    && servo_mailbox_available) {
             // 无运动意图时持续发送当前七关节 Hold 目标，而不是退出程序。
             // 这正是 Redis idle/超时/断线状态下保持位置的执行方式。
@@ -2185,9 +2212,9 @@ int main(int argc, char** argv) {
                 control_output.fault = hold_result.message;
             }
             previous_joint_delta.setZero();
-            // A Hold cancels any unapplied Cartesian lead. Resuming begins
-            // from the last valid FK target instead of an old reference.
-            cartesian_reference_pose = model_pose;
+            // A session Hold cancels unapplied Cartesian lead. A deadband keeps
+            // the same committed reference as the anchor for the next frame.
+            if (!wrist_output.following) cartesian_reference_pose = model_pose;
         }
 
         if (!fatal_fault && options.mode == ControllerMode::kExecute) {
@@ -2230,7 +2257,7 @@ int main(int argc, char** argv) {
         }
 
         // 5.9 Redis 输出：状态变化、故障变化或新命令确认时立即发布状态；
-        // 传感器消息按 publish_every 降频发布，避免占用 10 ms 控制预算。
+        // 传感器消息按 publish_every 降频发布，避免占用 5 ms 控制预算。
         const bool command_acknowledgement_due = options.redis_enabled
             && intent.sequence != 0
             && intent.sequence != previous_reported_command_sequence;
@@ -2257,6 +2284,11 @@ int main(int argc, char** argv) {
             }
         }
 
+        const char* wrist_follow_reason = control_output.fault.c_str();
+        if (control_output.fault.empty() && wrist_output.following) {
+            if (wrist_output.waiting_for_pose) wrist_follow_reason = "wrist_waiting_for_pose_feedback";
+            else if (!wrist_output.motion_requested) wrist_follow_reason = "wrist_reference_in_deadband";
+        }
         if (legacy_completion_pending
             || cycle % static_cast<std::uint64_t>(options.publish_every) == 0) {
             RedisSensorMessage message;
@@ -2268,7 +2300,7 @@ int main(int argc, char** argv) {
                 message.wrist_camera_pose=frame_chain.CameraPoseBase(robot_state.pose, wrist_arm_camera);
                 if (redis_config.wrist_follow) {
                     message.wrist_follow_state=wrist_controller.Following()?"following":"hold";
-                    message.wrist_follow_reason=control_output.fault;
+                    message.wrist_follow_reason=wrist_follow_reason;
                     message.wrist_target_id=wrist_input.target_id;
                     message.wrist_resume_required=wrist_controller.ResumeRequired();
                     const auto& req=wrist_snapshot.request;
@@ -2326,7 +2358,7 @@ int main(int argc, char** argv) {
             row.wrist_enabled=true; row.wrist_valid=wrist_input.fresh;
             row.wrist_age_ms=wrist_age_ms; row.wrist_span_ms=wrist_span_ms;
             row.wrist_gap_m=wrist_output.actual_gap_m; row.wrist_target=wrist_input.target_id;
-            row.wrist_reason=control_output.fault;
+            row.wrist_reason=wrist_follow_reason;
             row.wrist_plan_attempted=wrist_plan_attempted; row.wrist_plan_valid=servo_plan.valid;
             row.wrist_plan_error=wrist_plan_attempted?Rm75PlanErrorString(servo_plan.error):"not_run";
             row.wrist_observation_sequence=wrist_snapshot.observation.sequence;

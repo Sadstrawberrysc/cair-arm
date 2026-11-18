@@ -85,7 +85,8 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
     }
     if (!config.wrist_follow_calibration.empty()
         && (!config.wrist_projection_calibration.empty() || !config.wrist_global_calibration.empty()
-            || !config.redis_enabled || config.publish_every > 2 || config.period_ms != 10
+            || !config.redis_enabled || config.publish_every > 20 / std::max(1, config.period_ms)
+            || (config.period_ms != kRm75ControlPeriodMs && config.period_ms != 10)
             || config.manual_action || config.manual_terminate || config.manual_phase != -1
             || config.manual_y_m != 0 || config.manual_rz_deg != 0
             || (config.mode == ControllerMode::kExecute
@@ -93,7 +94,7 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
                     || config.allow_provisional_force_control
                     || (config.duration_s < 1 && !(config.wrist_candidate_trial && config.duration_s == 0))
                     || config.duration_s > 60)))) {
-        SetError(error, "wrist follow requires Redis, 10 ms, publish-every<=2; execute requires confirmation, no-contact warmup, verified calibration and duration 1..60 (candidate trial also accepts 0)");
+        SetError(error, "wrist follow requires Redis, 5 or 10 ms, publish interval <=20 ms; execute requires confirmation, no-contact warmup, verified calibration and duration 1..60 (candidate trial also accepts 0)");
         return false;
     }
     if (config.confirm_wrist_follow && config.wrist_follow_calibration.empty()) {
@@ -105,8 +106,8 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
     }
     if (!config.wrist_projection_calibration.empty()
         && (config.mode != ControllerMode::kObserve || !config.redis_enabled
-            || config.wrist_global_calibration.empty() || config.publish_every > 2)) {
-        SetError(error, "wrist projection requires observe, Redis, both calibrations and publish-every <= 2");
+            || config.wrist_global_calibration.empty() || config.publish_every > 20 / std::max(1, config.period_ms))) {
+        SetError(error, "wrist projection requires observe, Redis, both calibrations and publish interval <=20 ms");
         return false;
     }
     const auto& control = config.control;
@@ -117,7 +118,7 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
     if (config.calibration_path.empty()
         || config.robot_port <= 0 || config.robot_port > 65535
         || config.redis_port <= 0 || config.redis_port > 65535
-        || config.period_ms < 10 || config.period_ms > 100
+        || config.period_ms < kRm75ControlPeriodMs || config.period_ms > 100
         || config.sensor_stale_ms < config.period_ms
         || config.sensor_stale_ms > 1000
         || config.robot_stale_ms < config.period_ms
@@ -180,7 +181,7 @@ bool ValidateRobotRuntimeConfig(const RobotRuntimeConfig& config,
         return false;
     }
     if (config.mode == ControllerMode::kExecute
-        && (config.simulate || config.period_ms != 10
+        && (config.simulate || (config.period_ms != kRm75ControlPeriodMs && config.period_ms != 10)
             || planner.allow_near_singularity)) {
         SetError(error, "invalid execute-mode configuration");
         return false;

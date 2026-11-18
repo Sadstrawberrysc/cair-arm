@@ -1,4 +1,4 @@
-# USPilot 项目进展（Runme notebook）
+# USPilot 项目进展
 
 当前状态核对：2026-10-30。本文记录有效入口、待办与历史证据；接口见
 [系统架构](../../ARCHITECTURE.md)，启动见 [Robot 操作](../run/robot-operations.md)。
@@ -11,10 +11,10 @@
 | 超声闭环 | Redis v1 意图 → 10 ms 控制 → 接触 / 力控 → 七轴 planner → 异步 ServoJ；端到端仿体与计量验收未完成 |
 | 力传感器 | 默认 KWR57 RS422/460800，保留 Haptron / AA55；单位、轴向和新装配多姿态标定待实测 |
 | SensorMonitor（可选工具） | 独立监控，自动识别项目 Redis 遥测或独立串口，无需传参。清零 / CSV / PNG 仅供本地查看，不参与项目控制 |
-| 全局定位 | 新相机快照的顶部首点，短轴 +X 沿切向、+Z 朝内，后退 100 mm；控制器 MoveJ_P，默认速度 3 |
+| 全局定位 | 新相机快照的顶部首点，短轴 +X 沿切向、+Z 朝内，后退 100 mm，与 Collision 一致；控制器 MoveJ_P，默认速度 6 |
 | 腕部跟随 | 模型默认自动初始选点与请求，手动模式人工开始；无力候选脚本持续运行，TCP / 姿态 / 每关节命令限速为 4 mm/s、4°/s、4°/s |
 | 相机标定 | `calibrate_realsense.py` / `calibrate_gemini.py` 默认采集 50 组后求解；提前结束不求解，不自动部署 |
-| Collision | [几何／FCL](../../infer/Collision/README.md)、[只读监测](../../infer/Collision/MONITOR.md)：保留用户确认的 URDF，已实现 D455／独立机械臂状态源、单帧 OctoMap、距离与 3D 回放；下载 SDK 头文件直接链接匹配预编译库，无 SDK 构建，13 项 CTest 通过；实机、安装接触策略、生产反馈桥接、OMPL 和运动仍待完成 |
+| Collision | [架构](../../infer/Collision/ARCHITECTURE.md)、[执行试接](../../infer/Collision/EXECUTION.md)：C++ D455／OctoMap／FCL／IK／OMPL 与路径预览；可选 Robot 同连接反馈、关节轨迹执行、短段场景许可和停止确认；全局入口加 collision 选用，真实执行／制动及自动重规划待验收／实现 |
 
 相机、模型、离线规划可用不代表实际定位精度、力残差、时序或净空合格。
 新 session 先发 idle 是视觉端约定，Robot 接收端尚无独立 idle 握手状态机。
@@ -98,7 +98,7 @@ ServoJ 提交 / 发送结果和周期超期；Redis Hold 通常不退出进程�
 
 建立日期：2026-10-29；当前状态核对：2026-10-30。适用于 RM75 本体不变、更换末端打印件和六维力传感器，以及在 ArmTip 与传感器之间增加安装长度的情况。
 
-本文件是待执行计划，勾选项和结果表均不代表已经完成验证。按阶段执行，不使用 `runme run --all`。含 `<...>` 的命令是填写模板，不能直接执行。初次验证显式使用 Observe 或 DryRun；无参数 `main_rm75` 会进入真实 Execute profile。
+下方保留当时待执行的计划、已完成项和结果，未勾选项不代表已经完成验证。初次 Observe、DryRun 与后续真实执行的验收范围分别记录。
 
 ### 当前状态
 
@@ -184,7 +184,7 @@ ArmTip → TCP（A 轴表达）
 ```
 
 - [ ] 核对实际装配与保留的几何建模约定一致，记录核对结果；用户确认保留数值不等于已完成独立几何验收。
-- [ ] 采集和拟合统一使用 `--sensor-to-tool-rpy-deg 0,0,30`，满足 `R = Rz * Ry * Rx`。
+- [ ] 核对采集和拟合中的 Sensor 安装旋转均为 `[0,0,30]` deg，满足 `R = Rz * Ry * Rx`。
 - [ ] 确认逻辑 +Z 为预期接近方向、X/Y 与探头成像和扫描方向匹配。
 - [ ] 现场核验第 5 步已实现的坐标链和探头相对 0° 配置，通过后再恢复运动和闭环。
 
@@ -266,33 +266,22 @@ STL 表示用于反算接触点的表面，不是全装配碰撞模型。仅改�
 | 量程变化 | `rm75_runtime_config.hpp`、`rm75_control.hpp`，并核对标定采集工具的固定原始量程门 |
 | 入口路径不一致 | `rm75_runtime_config.cpp`、腕部与粗定位脚本，第 8 步统一 |
 
-本轮需在同一标定 JSON 内独立表达 `R_A_S` 与 `R_S_T`，同步扩展读写、工具参数、日志与相关消费者；不新建部署文件。原采集/拟合命令中的 `0,0,30` 始终表示传感器安装角。第 6 步命令已加入 `--probe-to-sensor-rpy-deg 0,0,0`；采集记录该字段，拟合核对后写回 schema v2。必须核对扫描/居中、姿态规划、接触点控制与遥测、粗定位和腕部入口全部使用正确工作轴。
+本轮已在同一标定 JSON 内独立表达 `R_A_S` 与 `R_S_T`，同步扩展读写、工具参数、日志与相关消费者，沿用现有部署文件。采集与拟合中的 Sensor 安装角保持 `[0,0,30]` deg，探头相对旋转为 0°；采集记录该字段，拟合核对后写回 schema v2。扫描/居中、姿态规划、接触点控制与遥测、粗定位和腕部入口的工作轴一致性仍待现场核对。
 
 新增非零平移应验证 TCP 正反变换；新增轴旋转需验证力、力矩和接触点表达一致。若修改标定 schema，必须同步 JSON 读写、采集/拟合工具及全部消费者；新的公共接口决策记录到 `DECISIONS.md`。仅更换末端通常不改 RM75 本体 DH 参数。
-
-```bash {"name":"build-replacement-tools","excludeFromRunAll":"true"}
-cd /home/cair-jacen/uspilot_ctrl-main
-cmake -S infer/Robot -B infer/Robot/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_MAINTENANCE_TOOLS=ON
-cmake --build infer/Robot/build --target main_rm75 robot_offline_tests force_sensor_calibration_capture force_sensor_calibrate
-ctest --test-dir infer/Robot/build --output-on-failure
-```
 
 - [x] 角度修改所需主程序、离线测试、标定工具和姿态工具编译通过（2026-10-29）。
 - [x] 本轮角度修改离线检查通过：7/7 CTest；包含 +60° 合成、非零平移 TCP 往返、力/力矩/接触一致性及 JSON 兼容检查。
 
 ### 6. 新装配重力、零偏和质心标定
 
-当前使用 [力传感器自动静态标定](../run/calibration_force.md)：以当前悬空姿态为基准，
-自动完成 1000 个不同静态姿态，采满后拟合并写回项目现有 JSON，无需手动换姿态。
-
-```bash {"name":"calibrate-replacement-force","excludeFromRunAll":"true","interactive":"true"}
-python3 /home/cair-jacen/uspilot_ctrl-main/infer/Robot/tools/calibrate_force_static.py
-```
+当时计划采用自动静态标定，以悬空姿态为基准完成 1000 个不同静态姿态，
+采满后拟合并写回项目现有 JSON。操作说明见[力传感器标定](../run/calibration_force.md)。
 
 - 默认按模型全关节范围选样，结合 TCP 三维空间覆盖和重力方向，保留 `--path-mode local` 局部扫描。
 - 每点到位后直接采集至少 20 帧、0.5 秒窗口取平均，允许关节、位置和姿态变化，不等待停稳；1000 姿态输出 1000 行样本。
 - 工具自动读取当前 JSON 的 Sensor/Probe 安装旋转、平移、TCP 和几何验证状态，采集与拟合保持一致。
-- 输入为 KWR57 / 460800 / `/dev/ttyUSB0`；SensorMonitor 直连及其他机器人控制进程需先退出。
+- 计划输入为 KWR57 / 460800 / `/dev/ttyUSB0`，串口独占及其他控制进程退出状态待核对。
 - 完成后返回起始关节，CSV 写 `infer/Robot/build/calibration_samples.csv`，
   力标定写 `infer/Robot/build/rm75_force_calibration.json`，传感器身份设为 `KWR57`。
 - 原始 CSV、完整路径和拟合质量保留；独立无接触姿态的补偿误差仍需实际验证。
@@ -319,7 +308,7 @@ python3 /home/cair-jacen/uspilot_ctrl-main/infer/Robot/tools/calibrate_force_sta
 | 无参数 `main_rm75` | 可执行文件旁 `rm75_force_calibration.json` | 路径已统一；复核 KWR57 身份、设备、模型和新装配标定 |
 | `infer/Camera_wrist/start_robot.sh` | `build/rm75_force_calibration.json` | 保持路径，复核已覆盖的标定、腕部外参和试验参数 |
 | `infer/hand_eye_calibration-main/run_probe_target.py` | `build/rm75_force_calibration.json` | 保持路径，读取覆盖后的同一装配标定 |
-| 手工命令及 notebooks | 各命令的 `--calibration` / `--tool-calibration` | 更新实际使用的命令 |
+| 运行文档 | 显式指定的力标定 / 工具标定路径 | 核对各入口读取相同装配配置 |
 
 - [ ] 修改前后检查 Git 状态，保留他人已有修改。
 - [ ] 新配置与启动日志一致；示例 JSON 只是模板，不是默认部署文件。
@@ -329,15 +318,7 @@ python3 /home/cair-jacen/uspilot_ctrl-main/infer/Robot/tools/calibrate_force_sta
 
 ### 9. Observe、预演及低速几何验证
 
-先用显式 Observe，在多个悬空姿态读取补偿结果。需要监看时先确认 Robot 已向本机 Redis 发布遥测，再直接运行 SensorMonitor 自动识别并订阅；不要同时直连串口。仅记录到日志时可显式加 `--no-redis`。
-
-```text
-infer/Robot/build/main_rm75 --observe \
-  --calibration infer/Robot/build/rm75_force_calibration.json --expected-sensor-id <配置身份> \
-  --probe-model infer/Robot/model/Lprobe-IFS.STL --robot-ip <IP> \
-  --sensor-device <设备路径> --sensor-protocol <协议> --sensor-baud <波特率> \
-  --duration-sec 30 --runtime-log infer/Robot/build/logs/replacement_observe.csv
-```
+待完成多个悬空姿态下的 Observe 补偿验证，并核对 Robot Redis 遥测与 SensorMonitor 的只读订阅结果。独立串口采集与 Robot 遥测监看属于不同验证范围。
 
 - [ ] 初次不加 tare，先检查跨姿态重力补偿本身；需要时另测 tare 效果。
 - [ ] 使用 DryRun 检查目标方向、规划结果与 IK；它不发送 ServoJ，但通常仍连接真实设备。
@@ -346,7 +327,7 @@ infer/Robot/build/main_rm75 --observe \
 - [ ] 检查加长支架、相机、探头和线缆的整段净空。STL 接触估计并不提供全装配避碰。
 - [ ] 在已知接触位置的工装上验证接触点，覆盖探头中心及不同偏移位置，记录误差和无效原因。
 
-真实运动命令应在目标姿态、速度、持续时间和工作区确定后生成；本计划不提供可误触的一键运动单元。现有生产接近速度、力门限和行程不能自动视为新装配的首试参数。
+新装配首试的目标姿态、速度、持续时间和工作区仍待明确；现有生产接近速度、力门限和行程尚未完成适用性验证。
 
 通过条件：实际平移/旋转与预测一致，TCP 几何和接触点误差满足预算；没有通过关闭保护来隐藏的偏差。
 

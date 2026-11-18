@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "motion_ownership.hpp"
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -97,7 +98,7 @@ void PrintUsage(const char* program) {
         << "   or: " << program << " --target-position-base-m x,y,z\n"
         << "   or: " << program << " --artery-path-base PATH\n"
         << "       --tool-calibration PATH [--ip A.B.C.D] [--port PORT]\n"
-        << "       [--velocity 1..5] [--max-joint-delta-deg DEG]\n"
+        << "       [--velocity 1..6] [--max-joint-delta-deg DEG]\n"
         << "       [--inspect-transform-only]\n"
         << "       [--controller-movej-p] (initial positioning via controller IK)\n"
         << "       [--target-inward-normal-base nx,ny,nz] (Base-position only)\n"
@@ -293,8 +294,8 @@ bool ParseOptions(int argc, char** argv, Options& options) {
         std::cerr << "Invalid controller address\n";
         return false;
     }
-    if (options.velocity < 1 || options.velocity > 5) {
-        std::cerr << "velocity must be in 1..5\n";
+    if (options.velocity < 1 || options.velocity > 6) {
+        std::cerr << "velocity must be in 1..6\n";
         return false;
     }
     if (options.max_joint_delta_deg <= 0.0
@@ -740,6 +741,11 @@ int main(int argc, char** argv) {
         return 4;
     }
 
+    RMMotionOwnership motion_ownership;
+    if (options.execute && !motion_ownership.Acquire(RMConnectionConfig{options.ip,options.port})) {
+        std::cerr << "Robot motion is owned by another controller on this host\n";
+        return 4;
+    }
     RMCommand command(RMConnectionConfig{options.ip, options.port});
     std::cout << "Connecting to Realman controller at " << options.ip
               << ":" << options.port << "\n";

@@ -1,5 +1,4 @@
 """Exercise the coarse launcher with fake camera/robot/Redis, never hardware."""
-import argparse
 import contextlib
 import io
 import json
@@ -18,7 +17,7 @@ import run_probe_target as launcher
 
 
 class HandoffTests(unittest.TestCase):
-    def exercise(self, code=0, dry_run=False, fail_camera=False, mutate=False):
+    def exercise(self, code=0, dry_run=False, fail_camera=False, mutate=False, collision=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             camera = root/"infer/Camera_RT"
@@ -27,6 +26,10 @@ class HandoffTests(unittest.TestCase):
             robot.mkdir(parents=True)
             binary = robot/"arm_probe_pose"
             binary.touch(); binary.chmod(0o700)
+            if collision:
+                monitor=root/"infer/Collision/build-monitor/collision_monitor"
+                monitor.parent.mkdir(parents=True)
+                monitor.touch()
             (robot/"rm75_force_calibration.json").write_text("{}")
             global_path = root/"global.json"
             wrist_path = root/"wrist.json"
@@ -35,8 +38,13 @@ class HandoffTests(unittest.TestCase):
                 path.write_text(json.dumps(dict(schema_version=1, transform=name, user_confirmed=True,
                     transform_convention="T_A_B maps coordinates from frame B to frame A",
                     translation_unit="m", **{key:np.eye(4).tolist()})))
-            args = argparse.Namespace(wrist_handoff=True, calibration=global_path,
-                wrist_calibration=wrist_path, wrist_serial="serial", dry_run=dry_run, velocity=3)
+            args = launcher.build_parser().parse_args([
+                "--wrist-handoff", "--calibration", str(global_path),
+                "--wrist-calibration", str(wrist_path), "--wrist-serial", "serial",
+            ] + (["--dry-run"] if dry_run else []))
+            if collision:
+                args.wrist_handoff=False
+                args.collision=True
             calls=[]
             class Client:
                 def delete(self, key): calls.append(("delete", key))
@@ -51,7 +59,8 @@ class HandoffTests(unittest.TestCase):
                 if mutate:
                     global_path.write_text(global_path.read_text()+"\n")
                 return types.SimpleNamespace(returncode=code)
-            with patch.dict(sys.modules, {"redis":types.SimpleNamespace(Redis=lambda **kwargs:client)}):
+            with patch.dict(sys.modules, {"redis":types.SimpleNamespace(Redis=lambda **kwargs:client)}), \
+                    patch.object(launcher,"ensure_global_camera_free"):
                 error=None
                 try:
                     with contextlib.redirect_stdout(io.StringIO()):
@@ -65,6 +74,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(result,0)
         self.assertEqual(calls[0][0],"delete")
+        self.assertEqual(commands[1][commands[1].index("--velocity")+1], "6")
         seed=calls[1][2]
         np.testing.assert_allclose(seed["surface_point_base_m"],[.1,.2,1])
         self.assertEqual(calls[1][3],60)
@@ -79,6 +89,23 @@ class HandoffTests(unittest.TestCase):
         calls,commands,result,error=self.exercise(dry_run=True)
         self.assertEqual([c[0] for c in calls],["delete"])
         self.assertNotIn("--execute",commands[1])
+
+    def test_collision_routes_to_supervised_joint_execution(self):
+        calls, commands, result, error=self.exercise(collision=True)
+        self.assertIsNone(error)
+        self.assertEqual(result,0)
+        self.assertEqual(calls,[])
+        self.assertEqual(len(commands),1)
+        self.assertTrue(commands[0][1].endswith("Collision/start_monitor.sh"))
+        self.assertIn("--execute",commands[0])
+        self.assertIn("--carotid",commands[0])
+        self.assertNotIn("--controller-movej-p",commands[0])
+
+    def test_collision_preview_never_enables_execution(self):
+        _, commands, result, error=self.exercise(collision=True,dry_run=True)
+        self.assertIsNone(error)
+        self.assertEqual(result,0)
+        self.assertNotIn("--execute",commands[0])
 
     def test_failed_motion_never_publishes(self):
         calls,commands,result,error=self.exercise(code=3)

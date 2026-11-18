@@ -57,8 +57,16 @@ struct CoarseTarget {
     Json metadata;
     bool Expired() const { return valid_until_unix_ns > 0 && UnixNowNs() > valid_until_unix_ns; }
 };
+struct LiveCarotidTarget {
+    Eigen::Vector3d point_color_m, outward_normal_color, tangent_color, matched_base_m;
+    std::string session_id;
+    std::uint64_t source_sequence=0, scene_sequence=0;
+    std::int64_t captured_at_ns=0;
+    double match_distance_m=0;
+};
 inline CoarseTarget LoadCoarseTarget(const Json& config, const std::filesystem::path& goal_path,
-                                     const CameraCalibration& active) {
+                                     const CameraCalibration& active,
+                                     const std::optional<LiveCarotidTarget>& live = std::nullopt) {
     TargetKeys(config, {"artery_path_file", "camera_calibration_file", "tool_calibration_file", "arm_tip_link",
         "max_target_age_s", "standoff_m", "surface_match_tolerance_m", "ik_options"});
     auto resolve = [&](const std::string& key) {
@@ -70,35 +78,40 @@ inline CoarseTarget LoadCoarseTarget(const Json& config, const std::filesystem::
         throw TargetError("target_context_mismatch", "Target camera calibration differs from active scene calibration");
     const auto source = resolve("artery_path_file");
     struct stat before{}, after{};
-    if (::stat(source.c_str(), &before) || before.st_size <= 0 || before.st_size > 1024 * 1024)
+    if (!live && (::stat(source.c_str(), &before) || before.st_size <= 0 || before.st_size > 1024 * 1024))
         throw std::invalid_argument("Missing/oversized artery_path_file; save a new camera snapshot first");
     CoarseTarget result;
     const double max_age = config.contains("max_target_age_s") ? TargetNumber(config.at("max_target_age_s")) : 0;
-    const double standoff = config.contains("standoff_m") ? TargetNumber(config.at("standoff_m")) : .20;
+    const double standoff = config.contains("standoff_m") ? TargetNumber(config.at("standoff_m")) : .10;
     result.surface_match_tolerance_m = config.contains("surface_match_tolerance_m") ? TargetNumber(config.at("surface_match_tolerance_m")) : 0;
     if (max_age < 0 || max_age > 3600 || standoff <= 0 || standoff > .3 ||
         result.surface_match_tolerance_m < 0 || result.surface_match_tolerance_m > .1)
         throw std::invalid_argument("Invalid target age, standoff or surface observation tolerance");
     const auto saved_ns = std::int64_t(before.st_mtim.tv_sec) * 1000000000 + before.st_mtim.tv_nsec;
-    if (max_age > 0) {
+    if (!live && max_age > 0) {
         result.valid_until_unix_ns = saved_ns + static_cast<std::int64_t>(max_age * 1e9);
         if (saved_ns > UnixNowNs() || result.Expired()) throw TargetError("stale_target", "Carotid file is old/future-dated; acquire and save a new snapshot");
     }
-    std::ifstream input(source);
     std::vector<Eigen::Vector3d> rows;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
-        std::istringstream stream(line); Eigen::Vector3d v; std::string extra;
-        if (!(stream >> v.x() >> v.y() >> v.z()) || (stream >> extra) || !v.allFinite())
-            throw std::invalid_argument("Artery path requires three finite values per row");
-        rows.push_back(v);
+    std::string source_sha;
+    if (live) {
+        rows={live->outward_normal_color, live->point_color_m, live->point_color_m+.01*live->tangent_color};
+    } else {
+        std::ifstream input(source);
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            std::istringstream stream(line); Eigen::Vector3d v; std::string extra;
+            if (!(stream >> v.x() >> v.y() >> v.z()) || (stream >> extra) || !v.allFinite())
+                throw std::invalid_argument("Artery path requires three finite values per row");
+            rows.push_back(v);
+        }
+        source_sha = FileSha256(source);
+        if (::stat(source.c_str(), &after) || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+            before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+            before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
+            throw std::invalid_argument("Artery path changed while loading; save it again");
     }
-    const auto source_sha = FileSha256(source);
-    if (::stat(source.c_str(), &after) || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
-        before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
-        before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
-        throw std::invalid_argument("Artery path changed while loading; save it again");
     if (rows.size() < 3 || rows[0].norm() < 1e-9 || rows[0].z() > 1e-6 || rows[1].z() <= 0)
         throw std::invalid_argument("Expected camera-facing outward normal followed by at least two optical-frame points in m");
     Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
@@ -110,7 +123,7 @@ inline CoarseTarget LoadCoarseTarget(const Json& config, const std::filesystem::
     x -= x.dot(z) * z;
     if (x.norm() < 1e-3) throw std::invalid_argument("Vessel tangent is parallel to surface normal");
     x.normalize(); const Eigen::Vector3d y = z.cross(x).normalized(); x = y.cross(z);
-    result.surface_base_m = active.base_from_color * rows[1];
+    result.surface_base_m = live ? live->matched_base_m : active.base_from_color * rows[1];
     result.base_from_tcp.linear().col(0) = x; result.base_from_tcp.linear().col(1) = y;
     result.base_from_tcp.linear().col(2) = z;
     result.base_from_tcp.translation() = result.surface_base_m - standoff * z;
@@ -180,6 +193,21 @@ inline CoarseTarget LoadCoarseTarget(const Json& config, const std::filesystem::
         {"standoff_m", standoff}, {"outward_normal_base", TargetVecJson(-z)},
         {"tcp_offset_base_m", TargetVecJson(-standoff * z)}, {"arm_tip_link", result.tip_link},
         {"T_base_tcp_target", TargetMatrixJson(result.base_from_tcp)}, {"T_armtip_tcp", TargetMatrixJson(result.tip_from_tcp)}};
+    if (live) {
+        result.metadata["source_path"]="live_shared_camera";
+        result.metadata["target_clock"]="shared_camera_capture";
+        result.metadata["sample_saved_at_unix_ns"]=nullptr;
+        result.metadata["target_age_check_enabled"]=false; // No file clock in shared mode.
+        result.metadata["session_id"]=live->session_id;
+        result.metadata["source_sequence"]=live->source_sequence;
+        result.metadata["mapping_scene_sequence"]=live->scene_sequence;
+        result.metadata["source_captured_at_ns"]=live->captured_at_ns;
+        result.metadata["mapped_surface_point_base_m"]=TargetVecJson(live->matched_base_m);
+        result.metadata["unmapped_surface_point_base_m"]=TargetVecJson(active.base_from_color*live->point_color_m);
+        result.metadata["mapping_distance_m"]=live->match_distance_m;
+        result.metadata["max_target_age_s"]=0;
+        result.metadata["live_max_source_age_s_at_mapping"]=2;
+    }
     return result;
 }
 } // namespace uspilot::collision::app

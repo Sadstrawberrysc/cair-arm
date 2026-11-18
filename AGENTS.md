@@ -1,48 +1,15 @@
 # USPilot Control
 
-## 项目上下文
+在线超声推理通过 Redis `127.0.0.1:7777` 向 RM75 发送控制意图。设备控制使用另一实例 `127.0.0.1:6379`。模块入口、协议和坐标约定见[系统架构](ARCHITECTURE.md)。
 
-本仓库用于超声扫描机器人的视觉—力觉闭环控制，包含 RM75 七轴控制、在线超声推理、
-相机定位与追踪、标定，以及模型训练实验。超声视觉主链路通过本机 Redis
-（`127.0.0.1:7777`）向机器人控制进程传递命令。
+## 真机操作
 
-## 代码入口
-
-按任务定位代码：
-
-- `infer/Robot/`：机器人控制与通信；入口为 `src/main_rm75.cpp`。
-- `intergrate_infer/`：在线超声推理；主入口为 `main_redis_seg_newphase_recovery_mode.py`。
-- `infer/Camera_RT/`：全局相机与粗定位；`infer/Camera_wrist/`：腕部相机、模型/手动选点与追踪，
-  `detector/` 子包负责模型服务。
-- `infer/hand_eye_calibration-main/`：手眼标定。
-- `infer/ContactPointShow/`、`infer/SensorMonitor/`：接触点显示与独立传感器监控，均非控制入口。
-- `infer/Collision/`：纯 C++17 几何审计、FCL 检查、只读相机监测及 OMPL 规划；监测窗口按 P／`--plan-once` 接通相机快照规划，`--coarse` 支持颈动脉点 → TCP → 多候选 IK；生产反馈桥接和执行待接入。架构见 ARCHITECTURE.md，进展见 PROGRESS.md，操作见 MONITOR.md、PLANNING.md。
-- `scan_pilot/`、`pose_pilot/`、`segmentation/`、`encoder_pretrain/`：训练与实验。
-- `SonoScape_api/`、`py-xiaokai/`：超声设备接口及语音/UI 辅助模块。
-
-## 协作与完成标准
-
-根据用户当前请求和会话上下文确定交付目标，自主完成必要的实现、相关验证和问题修复。
-用户要求落地时，持续推进到可交付结果，不停在方案或第一版实现等待例行确认。
-实现方式由任务决定，不预设逐功能串行验收、文件数量或模块拆分方式。
-
-常规实现细节自行判断；只有缺失信息会实质改变结果且无法从上下文推断时才提问，
-并继续推进不依赖该答案的工作。用户中途补充要求时，保留已完成且仍适用的工作。
-
-用户明确指令优先于本文件及技能中的项目工作建议。在读取技能或其他指引时，
-只采用与当前任务相关的内容；如果某条指引导致暂停、请求确认或偏离目标，
-指出具体文件和条文，并说明实际阻碍。
-
-改动应覆盖请求所需的完整范围，避免夹带无关清理。修改前后检查 `git status --short`，
-保留用户已有的未提交改动；不把构建产物、运行日志、模型权重或本机临时文件纳入提交。
+- 无参数 `main_rm75`、腕部 `start_robot.sh` 和一键扫描都会驱动真机。按[系统运行手册](.runme/run/system-operations.md)逐个运行单元；禁止 Run All。
+- Collision 监测默认只读，一键扫描的 `--collision` 模式允许按 E 执行。执行前使用固定快照检查路径，运动中新增或移动的障碍物不会触发相机避障停止。真机验收待完成，见[执行说明](infer/Collision/EXECUTION.md)。
 
 ## 环境与验证入口
 
-Robot 使用 Linux/Bash、C++17、CMake >=3.16，依赖 Eigen >=3.3、OpenSSL、Threads 和 hiredis。
-视觉主链路使用 Conda 环境 `carotid`；其他子项目按各自依赖文件选择环境。
-具体版本和可用设备以当前环境及配置为准，不把历史版本记录视为全仓库锁定要求。
-
-Robot 构建与离线测试入口（在仓库根目录执行，按改动选择所需命令）：
+在仓库根目录构建 Robot 并运行离线测试。涉及 `arm_probe_pose` 或标定工具时，将 `BUILD_MAINTENANCE_TOOLS` 设为 `ON` 以启用相应目标和测试。
 
 ```bash
 cmake -S infer/Robot -B infer/Robot/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_MAINTENANCE_TOOLS=OFF
@@ -50,24 +17,8 @@ cmake --build infer/Robot/build --target main_rm75 robot_offline_tests
 ctest --test-dir infer/Robot/build --output-on-failure
 ```
 
-本地构建、离线测试及本次改动引起的修复可连续执行，无需逐步确认。
-验证应与改动范围相称：文档改动检查内容、链接与差异；代码改动运行相关构建或测试。
-相关检查通过后，仅在新增改动、失败或未解决疑点需要时扩大或重复验证。
+## 仓库维护
 
-交付时说明实际改动、验证结果和仍未完成的事项。区分源码检查、编译、离线测试与实际运行，
-不把未执行的验证描述为通过；环境阻塞时说明具体原因和剩余步骤。
-
-## 按需查阅
-
-- 理解系统关系或接口时，查 [ARCHITECTURE.md](ARCHITECTURE.md) 及其模块文档索引。
-- 确认当前进度、配置、待办或启动方式时，查本机 `.runme/README.md` 及对应 notebook；
-  `.runme/` 中的 Markdown notebooks 纳入 Git，缺失时以 `ARCHITECTURE.md` 和当前源码为准重新建立。
-- 处理 Robot 构建与测试时，以 [CMakeLists.txt](infer/Robot/CMakeLists.txt) 为准。
-- 处理相机时，查对应模块架构及 `.runme/run/camera-*-operations.md`；当前没有独立远程相机监控文档。
-- 追溯设计原因时，查 [DECISIONS.md](DECISIONS.md)。新的跨模块、公共 API 或长期维护
-  决策在该文件追加日期、决策及原因，保留旧记录；普通小修无需新增决策条目。
-
-## 沟通
-
-默认使用简洁中文，先说明结果，再补充必要证据和文件位置。
-较长任务只更新关键进展、发现和阻碍；最终回复让用户无需翻阅过程也能理解交付状态。
+- 修改前后检查 `git status --short`，保留已有未提交改动。提交时排除构建产物、运行日志、权重和本机临时文件。
+- 接口或启动方式变化时，直接替换对应文档中的旧说明。操作和进展见 [Runme 索引](.runme/README.md)。跨模块接口和长期设计取舍的原因按日期追加到 [DECISIONS.md](DECISIONS.md)。
+- 默认用中文交付，分别说明实际执行的离线验证和真机验收情况。

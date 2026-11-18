@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <fstream>
+#include <json.hpp>
 #include <librealsense2/rs.hpp>
 #include <librealsense2/rsutil.h>
 #include <mutex>
@@ -13,17 +15,20 @@
 namespace uspilot::collision {
 struct LiveMonitorSource::Impl {
     LiveSourceOptions options;
-    ReadOnlyRobot robot;
+    std::unique_ptr<ReadOnlyRobot> robot;
     rs2::pipeline pipeline;
     rs2::pointcloud pointcloud;
+    rs2::align color_align{RS2_STREAM_COLOR};
+    std::int64_t last_shared_ns=0;
     std::atomic<bool> stop{false};
     std::thread feedback;
     std::mutex mutex;
     std::deque<ReadOnlyRobotState> history;
     bool started = false;
-    explicit Impl(const LiveSourceOptions &o) : options(o), robot(o.robot_ip, o.robot_port) {
+    explicit Impl(const LiveSourceOptions &o) : options(o) {
         if (o.camera_serial.empty() || o.pixel_stride < 1 || o.pixel_stride > 32)
             throw std::invalid_argument("Explicit camera serial/valid stride required");
+        if (!o.feedback) robot=std::make_unique<ReadOnlyRobot>(o.robot_ip,o.robot_port);
         rs2::config config;
         config.enable_device(o.camera_serial);
         config.enable_stream(RS2_STREAM_DEPTH, 1280, 720, RS2_FORMAT_Z16, 30);
@@ -39,7 +44,7 @@ struct LiveMonitorSource::Impl {
             }
             feedback = std::thread([this] {
                 while (!stop.load()) {
-                    auto state = robot.Read();
+                    auto state = options.feedback ? options.feedback() : robot->Read();
                     {
                         std::lock_guard<std::mutex> lock(mutex);
                         history.push_back(std::move(state));
@@ -65,6 +70,32 @@ struct LiveMonitorSource::Impl {
             } catch (...) {
             }
         }
+    }
+    void Publish(const rs2::frameset& frames, const MonitorFrame& frame) {
+        if (options.shared_frame_directory.empty() || frame.received_at_ns-last_shared_ns<100000000) return;
+        last_shared_ns=frame.received_at_ns;
+        const auto aligned=color_align.process(frames).as<rs2::frameset>();
+        const auto color=aligned.get_color_frame();
+        const auto depth=aligned.get_depth_frame();
+        if (!color || !depth || color.get_width()!=depth.get_width() || color.get_height()!=depth.get_height())
+            throw std::runtime_error("Shared RGB/depth frame dimensions mismatch");
+        const auto intr=color.get_profile().as<rs2::video_stream_profile>().get_intrinsics();
+        const nlohmann::json metadata={{"schema_version",1},{"session_id",options.shared_frame_directory.filename().string()},
+            {"sequence",frame.sequence},{"captured_at_ns",frame.captured_at_ns},
+            {"capture_time_trusted",frame.capture_time_trusted},{"camera_serial",frame.camera_serial},
+            {"calibration_id",options.calibration_id},{"width",intr.width},{"height",intr.height},
+            {"fx",intr.fx},{"fy",intr.fy},{"ppx",intr.ppx},{"ppy",intr.ppy},
+            {"depth_scale",depth.get_units()},{"color_format","rgb8"},{"depth_format","z16_le"}};
+        const auto temporary=options.shared_frame_directory/"frame.tmp";
+        std::ofstream output(temporary,std::ios::binary|std::ios::trunc);
+        output << metadata.dump() << '\n';
+        for (int y=0; y<intr.height; ++y)
+            output.write(static_cast<const char*>(color.get_data())+y*color.get_stride_in_bytes(),intr.width*3);
+        for (int y=0; y<intr.height; ++y)
+            output.write(static_cast<const char*>(depth.get_data())+y*depth.get_stride_in_bytes(),intr.width*2);
+        output.close();
+        if (!output) throw std::runtime_error("Cannot publish shared camera frame");
+        std::filesystem::rename(temporary,options.shared_frame_directory/"frame.bin");
     }
 };
 LiveMonitorSource::LiveMonitorSource(const LiveSourceOptions &o) {
@@ -114,7 +145,8 @@ MonitorFrame LiveMonitorSource::Next() {
         if (best) {
             result.joints = best->joints;
             result.robot_at_ns = best->received_at_ns;
-            result.robot_valid = best->valid && best->received_at_ns - best->request_started_ns <= 100000000;
+            result.robot_valid = best->valid && (!best->request_timing_available ||
+                best->received_at_ns - best->request_started_ns <= 100000000);
         }
         if (!p.history.empty() && !p.history.back().valid)
             result.robot_valid = false;
@@ -147,6 +179,7 @@ MonitorFrame LiveMonitorSource::Next() {
             }
             result.colors.push_back(pixel);
         }
+    p.Publish(frames,result);
     return result;
 }
 } // namespace uspilot::collision

@@ -9,7 +9,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_tracker import LocalTracker
 from follow_session import ClickSession
-from click_follow import draw_detection_boxes
+from click_follow import draw_selected_detection
 from wrist_projection import boot_id, FRAME
 from model_selection import (DetectionCenterFusion, fuse_model_observation,
                              replay_selection, observation_is_fresh)
@@ -29,18 +29,24 @@ class ModelSelectionTests(unittest.TestCase):
         image = cv2.warpAffine(self.image, np.array([[1., 0, dx], [0, 1., dy]]), (320, 240))
         return image, self.depth, timestamp
 
-    def test_preview_draws_recent_box_but_not_stale_box(self):
+    def test_preview_draws_only_the_selected_recent_box(self):
         response = dict(capture_monotonic_ns=1_000_000_000,
                         image_size=[320, 240],
                         detections=[dict(x=160, y=120, width=40, height=30,
-                                         confidence=.8, **{'class': 'carotid'})],
-                        valid=False, reason='more than one candidate')
+                                         confidence=.8, **{'class': 'carotid'}),
+                                    dict(x=240, y=180, width=40, height=30,
+                                         confidence=.95, **{'class': 'other'})],
+                        valid=True,
+                        prediction=dict(box_xyxy=[140, 105, 180, 135],
+                                        confidence=.8, class_name='carotid'))
         recent = np.zeros((240, 320, 3), np.uint8)
-        self.assertTrue(draw_detection_boxes(recent, response, 1_200_000_000))
+        self.assertTrue(draw_selected_detection(recent, response, 1_200_000_000))
         self.assertEqual(tuple(recent[105, 140]), (0, 165, 255))
-        stale = np.zeros_like(recent)
-        self.assertFalse(draw_detection_boxes(stale, response, 1_600_000_000))
-        self.assertFalse(stale.any())
+        self.assertFalse(recent[145:, 200:].any())
+        blank = np.zeros_like(recent)
+        self.assertFalse(draw_selected_detection(blank, response, 1_600_000_000))
+        self.assertFalse(draw_selected_detection(blank, dict(response, valid=False), 1_200_000_000))
+        self.assertFalse(blank.any())
 
     def test_replay_tracks_model_point_to_fresh_frame(self):
         tracker = LocalTracker()

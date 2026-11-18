@@ -37,6 +37,7 @@ struct CollisionScene {
 };
 
 struct CheckOptions {
+    double joint_limit_margin_rad = 0;
     bool allow_unknown_space = false; // Planning policy only; does not erase occupancy.
     double clearance_m = 0.005;  // Example setting, not a measured safety margin.
     double numerical_guard_m = 1e-6;

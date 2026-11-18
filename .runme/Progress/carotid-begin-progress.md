@@ -1,4 +1,4 @@
-# 腕部 detector 模型进展及 Carotid_begin 历史（Runme notebook）
+# 腕部 detector 模型进展及 Carotid_begin 历史
 
 ## 2026-11-10：超声窗口恢复原显示
 
@@ -54,13 +54,13 @@ Robot 新增 `runtime_tare_applied` 标记，录像只将已 tare 且有效、�
 > 最简启动命令见 [启动 notebook](../run/camera-wrist-operations.md)。
 >
 > Notebook 整理及模块合并日期：2026-10-02。下方历史验证结果保留原记录的日期与执行范围，迁移未新增实测。
-> 历史验证命令标记为 `ignore=true`，仅供查阅；日常启动在 run notebook 中逐个执行。
+> 本文件只保留进展、验证结果与待办；操作说明统一见运行文档。
 
 ## 当前组织与待验收
 
 原 `Carotid_begin` 已并入 `Camera_wrist/detector/`。默认模型 ID 取 `detector/config.py`，显式 CLI 优先于环境变量；
 相机默认模型模式，`--manual` 保留手动跟踪，始终连接 Redis。2026-10-12 起模型在 Robot 就绪后自动选点并请求跟随，
-TCP / 姿态 / 每关节命令限速为 4 mm/s、4°/s、4°/s；下方 10-02 的人工首次开始和限速值保留历史语义。
+TCP / 姿态 / 每关节命令限速自 2026-11-13 起为 4 mm/s、4°/s、4°/s；下方 10-02 的人工首次开始和限速值保留历史语义。
 
 模型进程使用 ultralytics，SDK 使用 camera，经私有 socketpair 交互；Robot 负责坐标与运动。
 当前仍需真实目标连续融合 / 恢复、独立扫描点真值、外参 / TCP / 时序与净空验收；接触和超声力控交接未实现。
@@ -127,13 +127,8 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 （`live_protocol.py`）和启动/常驻循环（`model_worker.py`）。原入口、CLI 默认值、
 响应字段、框中心规则和 CUDA provider 要求保留；现有相机模块删除状态保留。
 
-在 `camera` 环境运行以下命令，13 项离线测试通过，覆盖凭据、检测、协议、
-配置拒绝、同一 socket 多帧处理、无目标后继续处理、源帧标识、异常模型输出和断连：
-
-```bash {"name":"carotid-recorded-module-tests","ignore":"true"}
-/home/cair-jacen/anaconda3/envs/camera/bin/python -m unittest discover \
-  -s infer/Carotid_begin/tests -v
-```
+在 `camera` 环境完成 13 项离线测试，覆盖凭据、检测、协议、配置拒绝、
+同一 socket 多帧处理、无目标后继续处理、源帧标识、异常模型输出和断连。
 
 本次未运行 GPU 推理、真实相机、Redis 或 Robot。调用方
 `Camera_wrist/tests/test_model_selection.py` 的重构前基线为 9 项中 6 项通过、
@@ -145,8 +140,7 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 
 相机每次启动都连接 Redis 并订阅 Robot 状态，已取消 `--no-redis` 和仅用于
 独立视觉的 `--standard-vision` 参数。统一使用标准跟踪门槛，默认选点置信度
-当时为 0.5（当前为 0.4）；启动顺序见 [最简启动 notebook](../run/camera-wrist-operations.md)：Redis → 相机 → Robot。模型模式首次按 `b` 自动选点并请求跟随。
-已运行的旧相机进程需按 `q` 退出后重新启动，修改才会生效。
+当时为 0.5（当前为 0.4）；当时模型模式首次由人工触发自动选点并请求跟随。
 
 本次相机离线测试 48 项全部通过，Python 编译及差异检查通过；未重启现场
 相机或 Robot，未执行真机运动验证。上文模块化验证时记录的 3 项调用方测试
@@ -156,8 +150,7 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 
 按要求将腕部 TCP 平移参考限速从 5 mm/s 降为 2.5 mm/s，姿态参考限速
 从 5°/s 降为 2.5°/s。`main_rm75` 已重新编译，6 项 Robot 离线测试全部通过。
-本次未重启 Robot 或执行真机运动验证；正在运行的旧进程仍使用原限速，
-需在 Robot 终端用 `Ctrl+C` 正常停止后，重新运行 `start_robot.sh` 才生效。
+本次未重启 Robot 或执行真机运动验证，现场旧进程仍使用原限速。
 
 ## 跟随参考限速降至 1（2026-10-02）
 
@@ -165,8 +158,8 @@ ServoJ 发送数为 0。新配置尚未进行真机验收。
 角速度从 2.5°/s 降至 1°/s。进一步按“关节角速度”要求，为腕部跟随的
 ServoJ 规划增加每个关节 **1°/s** 的命令步长上限，即 10 ms 周期内每关节
 最多 0.01°。普通超声模式的关节规划速度配置保持原值；实际关节速度还需
-真机日志测量。`main_rm75` 已重新编译，6 项 Robot 离线测试通过。若旧进程
-仍在运行，需在 Robot 终端用 `Ctrl+C` 正常停止，再运行 `start_robot.sh`。
+真机日志测量。`main_rm75` 已重新编译，6 项 Robot 离线测试通过；现场旧进程
+是否已加载新限速仍待核对。
 隔离 Redis 模拟跟随及两次自动恢复通过：1346 条记录中的最大相邻关节命令
 步长约 0.0063°，低于 10 ms 周期的 0.01° 上限；模拟未发送真实 ServoJ。
 
@@ -193,7 +186,7 @@ ServoJ 规划增加每个关节 **1°/s** 的命令步长上限，即 10 ms 周�
 
 52 项相机离线测试通过，覆盖连续两次主动 Hold 后恢复及身份、回执、时效
 与取消条件；Python 编译检查通过。本次未进行 Redis 回环或真机运动验证。
-需退出并重启相机进程才能使用新逻辑；模型模式首次跟随按 `b` 自动选点并开始。
+现场相机是否已加载新逻辑仍待核对。
 
 ## 模型模式单键开始（2026-10-02）
 
@@ -203,19 +196,16 @@ ServoJ 规划增加每个关节 **1°/s** 的命令步长上限，即 10 ms 周�
 失败后需再次按 `b`。通信错误、状态超时、Robot 重启、故障及 `p/q` 取消待启动
 请求，重复按 `b` 不重复排队。`d` 仍可仅选点，非模型鼠标模式保持点击后按 `b`。
 
-57 项相机离线测试通过；未执行真机验证。需重启相机进程后使用新按键流程。
+57 项相机离线测试通过；未执行真机验证。
 
-## 历史启动约定（2026-10-02）
+## 首次开始交互沿革（2026-10-02）
 
-Redis → 相机 → Robot；Redis 单独存在不会消除 `waiting for Robot state`。
-当时首次按 b 选点并请求开始，d 只选点，视觉丢失后暂停确认 / 重选 / resume；p 取消、q 退出相机，Robot 用 Ctrl+C 停止。
-这段人工首次开始约定已由 2026-10-12 模型自动初始开始替代；当前命令见[启动手册](../run/camera-wrist-operations.md)。
+当时模型模式由人工首次触发选点并请求开始，视觉丢失后经暂停确认、重选及恢复请求继续跟随。
+这段人工首次开始约定已由 2026-10-12 模型自动初始开始替代；当前操作见[腕部手册](../run/camera-wrist-operations.md)。
 
 ## 运行配置与诊断记录（2026-10-02）
 
-Robot 使用 `--wrist-no-force --wrist-candidate-trial --wrist-unlimited-excursion`
-和 `--wrist-unlimited-position-tracking-error --duration-sec 0`，
-持续运行直至 `Ctrl+C` 或故障；Hold 只暂停运动，**不读取力传感器**，
+当时 Robot 使用无力候选试验配置，持续运行至人工结束或故障；Hold 只暂停运动，**不读取力传感器**，
 已取消实际与规划 TCP 的累计位移、累计转角检查，也取消实测 TCP 与规划
 模型之间的 50 mm 位置误差检查；关节、规划、通信和停止检查仍在。Robot 对
 融合观测生成的参考轨迹另有限速：TCP 位置 2 mm/s、姿态 2°/s；
@@ -227,20 +217,5 @@ Robot 使用 `--wrist-no-force --wrist-candidate-trial --wrist-unlimited-excursi
 记录出框时间，`model_fusion` 记录校正或拒绝原因，`model_recovery_wait` 和
 `model_auto_resume` 记录自动恢复转换。Robot 的 `runtime.csv.wrist.csv`
 及 `runtime.summary.json` 在 `infer/Camera_wrist/log/wrist_continuous_*/`。
-可在无真实运动条件下复测模拟 Redis 链路：
-
-```bash {"name":"carotid-recorded-loopback","ignore":"true"}
-/home/cair-jacen/anaconda3/envs/camera/bin/python \
-  infer/Camera_wrist/tests/loopback_check.py --no-force --candidate-trial --unlimited-excursion \
-  --unlimited-position-tracking-error --auto-recovery
-```
-
-## 更换模型
-
-以后拿到新 Roboflow Model ID，可通过 `CAROTID_MODEL_ID` 覆盖
-[detector/config.py](../../infer/Camera_wrist/detector/config.py) 的默认值，或在相机入口显式传入
-`--model-id`；类别改变时传入 `--model-class`。如使用终端启动脚本，可先导出
-`CAROTID_MODEL_ID='新的完整 Model ID'`，再运行
-`bash infer/Camera_wrist/launch_wrist_terminal.sh camera`。
-不要把 API Key 写入命令；本机凭据检查命令为
-`/home/cair-jacen/anaconda3/envs/ultralytics/bin/python -m infer.Camera_wrist.detector.credentials check`。
+无真实运动的模拟 Redis 链路验证结果见上方合并前证据汇总。
+模型更换和凭据检查说明见[腕部操作](../run/camera-wrist-operations.md#更换模型)。

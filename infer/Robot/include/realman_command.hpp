@@ -103,6 +103,13 @@ struct RMConnectionConfig {
     int port = 8080;
 };
 
+struct RMMoveJStatus {
+    std::uint64_t sequence = 0;
+    bool sent = false, accepted = false, completed = false;
+    bool restart_required = false;
+    RMResult result;
+};
+
 class RMStateReader;
 
 class RMCommand {
@@ -138,6 +145,10 @@ public:
                        int velo,
                        int timeout_ms = 30000);
     RMResult TryServoJ(const Eigen::Matrix<double, 7, 1>& joints, bool follow);
+    // Single asynchronous, unblended MoveJ. RMStateReader remains the only
+    // receiver; accepted ACK is distinct from trajectory completion.
+    RMResult TryStartMoveJ(const Eigen::Matrix<double, 7, 1>& joints, int velocity_percent);
+    RMMoveJStatus MoveJStatus() const;
 
     // Hold resends a validated joint target through ServoJ. The no-target
     // overload uses the latest successfully read or commanded target.
@@ -169,6 +180,7 @@ private:
                       const char* label,
                       bool low_priority = false);
     RMResult ReceiveJsonLocked(nlohmann::json& response, int timeout_ms);
+    RMResult ReceiveJsonUntilLocked(nlohmann::json& response, std::chrono::steady_clock::time_point deadline);
     RMResult DrainInputLocked();
     RMResult WaitTrajectoryResponseLocked(
         const char* label, int timeout_ms,
@@ -186,11 +198,14 @@ private:
                          Eigen::Matrix<double, 7, 1>& joints,
                          bool& follow) const;
     std::uint64_t DiscardPendingServoTarget();
-    RMResult SendLatestServoTarget(std::uint64_t& last_dispatched_sequence);
+    RMResult SendLatestServoTarget(std::uint64_t& last_dispatched_sequence, std::chrono::nanoseconds minimum_gap);
     void StoreServoSendResult(std::uint64_t sequence,
                               bool sent,
                               const RMResult& result);
     void CompleteStopRequest(std::uint64_t sequence, const RMResult& result);
+    RMResult SendPendingMoveJ();
+    bool HandleMoveJResponse(const nlohmann::json& response);
+    void AbortMoveJ(const RMResult& result);
 
     struct ServoMailboxSlot {
         // Single-producer seqlock. Odd means that the producer is rewriting
@@ -241,6 +256,11 @@ private:
     std::atomic<std::uint64_t> stop_in_flight_sequence_{0};
     mutable std::mutex stop_call_mutex_;
     std::shared_ptr<const StopCompletion> stop_completion_snapshot_;
+    mutable std::mutex movej_mutex_;
+    RMMoveJStatus movej_status_;
+    Eigen::Matrix<double, 7, 1> movej_target_ = Eigen::Matrix<double, 7, 1>::Zero();
+    int movej_velocity_percent_ = 6;
+    std::atomic<bool> movej_active_{false};
 };
 
 // Requests a bounded, explicitly acknowledged StopMotion. A non-timeout
@@ -262,7 +282,7 @@ private:
 };
 
 // A single background I/O owner for one RMCommand connection. It serializes
-// and sends each accepted ServoJ mailbox target, prioritizes StopMotion,
+// and sends ServoJ targets or a single asynchronous MoveJ, prioritizes StopMotion,
 // issues state queries, and consumes all incoming JSON. The real-time thread
 // only publishes a fixed-size target and atomically loads immutable snapshots.
 class RMStateReader {
@@ -271,7 +291,8 @@ public:
                   std::chrono::milliseconds poll_period =
                       std::chrono::milliseconds(40),
                   std::chrono::milliseconds stale_after =
-                      std::chrono::milliseconds(250));
+                      std::chrono::milliseconds(250),
+                  std::chrono::milliseconds servo_period = std::chrono::milliseconds(10));
     ~RMStateReader();
     RMStateReader(const RMStateReader&) = delete;
     RMStateReader& operator=(const RMStateReader&) = delete;
@@ -291,6 +312,7 @@ private:
 
     RMCommand& command_;
     std::chrono::milliseconds poll_period_;
+    std::chrono::milliseconds servo_period_;
     std::chrono::milliseconds stale_after_;
     std::shared_ptr<const RobotStateSnapshot> latest_snapshot_;
     std::shared_ptr<const RMResult> last_result_snapshot_;

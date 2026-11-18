@@ -5,7 +5,7 @@
     "camera_calibration_file": "../../hand_eye_calibration-main/d455_to_rm75_base.json",
     "tool_calibration_file": "../../Robot/build/rm75_force_calibration.json",
     "arm_tip_link": "Link7",
-    "standoff_m": 0.20,
+    "standoff_m": 0.10,
     "max_target_age_s": 0,
     "surface_match_tolerance_m": 0,
     "ik_options": {

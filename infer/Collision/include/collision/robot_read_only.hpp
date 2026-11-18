@@ -10,6 +10,7 @@ struct ReadOnlyRobotState {
     std::int64_t received_at_ns = 0;
     int arm_error = 0, system_error = 0;
     bool valid = false;
+    bool request_timing_available = true;
     std::string error;
 };
 // A deliberately restricted facade: only connect/query/close. No background
