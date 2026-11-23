@@ -16,7 +16,7 @@ bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal
 
 ## 机械臂
 
-TCP 位置参考限速为 3 mm/s，姿态参考及每关节命令限速为 3°/s。
+TCP 位置参考限速为 4 mm/s，姿态参考及每关节命令限速为 4°/s。
 TCP 位置误差大于 7 mm 才启动平移，收敛到 3 mm 内时停止。
 
 ```bash {"excludeFromRunAll":"true","interactive":"true","name":"start-wrist-robot"}
@@ -34,7 +34,7 @@ bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal
 | `--serial` | `CV2L360000HZ` | Gemini 305 设备序列号 |
 | `--redis-port` | `7777` | 本机 Redis 通信端口 |
 | `--calibration` | `gemini305_to_rm75_armtip.json` | 腕部 Camera → ArmTip 外参，默认位于 `infer/Camera_wrist/` |
-| `--model-id` | [模型配置](../../infer/Camera_wrist/detector/config.py)中的默认模型 | 显式参数优先于 `CAROTID_MODEL_ID` 环境变量，再使用源码默认值 |
+| `--model-id` | [模型配置](../../infer/Camera_wrist/detector/config.py)中的默认本地模型 | 显式参数优先于 `CAROTID_MODEL_ID` 环境变量，再使用源码默认值 |
 | `--model-class` | `carotid` | 检测目标类别 |
 | `--model-confidence` | `0.4` | 模型选点置信度阈值，范围 0～1 |
 | `--manual` | 不启用 | 改用鼠标选点，不加载检测模型；与 `--model-id` 互斥 |
@@ -57,26 +57,18 @@ bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/launch_wrist_terminal
 暂停后，模型模式可用 `b` 重新选点并跟随；手动模式需重新点击选点。
 机械臂终端按 `Ctrl+C` 结束控制进程。
 
-## 更换模型
+## 更换本地模型
 
-通过 `CAROTID_MODEL_ID` 覆盖源码默认模型，或向 `start_camera.sh` 显式传入 `--model-id`。
-使用上面的独立相机终端单元时，可先在启动它的同一终端导出
-`CAROTID_MODEL_ID='新的完整 Model ID'`。类别改变时直接调用相机脚本，并传入 `--model-class`。
-
-以下为填写模型 ID 和类别后使用的模板：
+模型包放在 `infer/Camera_wrist/data/local_models/<模型 ID>/`，包含 ONNX、类别表和推理配置。
+用 `CAROTID_MODEL_ROOT` 指定其他模型根目录。启动时可通过 `CAROTID_MODEL_ID` 或显式 `--model-id` 选择目录。
+本地 worker 自行加载 CUDA 模型，正常启动无需网络和 API Key。模型包格式见[检测器架构](../../infer/Camera_wrist/detector/ARCHITECTURE.md)。
 
 ```bash {"name":"start-wrist-custom-model-template","ignore":"true"}
 bash /home/cair-jacen/uspilot_ctrl-main/infer/Camera_wrist/start_camera.sh \
-  --model-id '新的完整 Model ID' --model-class 'carotid'
+  --model-id '本地包的模型 ID' --model-class 'carotid'
 ```
 
-API Key 保存在本机私有凭据文件或 `ROBOFLOW_API_KEY` 环境变量中，不写入启动命令。
-检查凭据是否可用（只显示存在状态）：
-
-```bash {"name":"check-wrist-model-credentials","excludeFromRunAll":"true"}
-cd /home/cair-jacen/uspilot_ctrl-main
-/home/cair-jacen/anaconda3/envs/ultralytics/bin/python -m infer.Camera_wrist.detector.credentials check
-```
+在含校验文件的模型包目录中运行 `sha256sum -c SHA256SUMS`，检查复制后的文件。
 
 ## 离线 Redis 回环验证
 

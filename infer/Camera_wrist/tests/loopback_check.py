@@ -49,7 +49,8 @@ try:
  probe=np.array(force.get('probe_to_sensor',{}).get('rotation_row_major',np.eye(3).ravel())).reshape(3,3)
  tool_rotation=base_arm[:3,:3]@mount@probe
  tcp=base_arm[:3,3]+base_arm[:3,:3]@mount@(np.array(force['probe_tcp_sensor_m'])-np.array(force['sensor_to_tool']['translation_sensor_to_tool_m']))
- normal=-tool_rotation[:,2];skin=tcp+np.array([.010 if (args.unlimited_excursion or args.unlimited_translation) else .0075,0,0])-.05*normal
+ # Give the override trial room to cross 5 mm in simulated feedback before the reference settles.
+ normal=-tool_rotation[:,2];skin=tcp+np.array([.020 if (args.unlimited_excursion or args.unlimited_translation) else .0075,0,0])-.05*normal
  seq=0;events=[];capture=0;history=[state];capture_state=state
  def envelope(target):
   global seq
@@ -196,7 +197,7 @@ try:
  assert summary['control']['wrist_translation_limit_enabled'] == (not (args.unlimited_excursion or args.unlimited_translation))
  assert summary['control']['wrist_orientation_limit_enabled'] == (not args.unlimited_excursion)
  assert summary['control']['wrist_position_tracking_error_limit_enabled'] == (not args.unlimited_position_tracking_error)
- assert summary['control']['joint_speed_cap_deg_s'] == 3.0
+ assert summary['control']['joint_speed_cap_deg_s'] == 4.0
  assert summary['control']['wrist_candidate_trial'] == args.candidate_trial
  assert summary['control']['force_sensor_enabled'] == (not args.no_force)
  if args.no_force:

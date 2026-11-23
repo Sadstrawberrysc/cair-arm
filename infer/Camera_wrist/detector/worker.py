@@ -3,8 +3,7 @@ import argparse
 import os
 import socket
 
-from .config import DEFAULT_MODEL_CACHE, ModelConfig
-from .credentials import get_api_key
+from .config import DEFAULT_LOCAL_MODEL_ROOT, ModelConfig
 from .gpu_model import load_cuda_model
 from .protocol import MAX_READY, send_json, unpack_frame
 from .pipeline import DetectionPipeline
@@ -48,11 +47,8 @@ def serve(sock, pipeline):
 def main(argv=None):
     socket_fd, config = parse_args(argv)
     with socket.socket(fileno=socket_fd) as sock:
-        key = get_api_key()
-        if not key:
-            raise ValueError('Roboflow API Key missing; save it with credentials.py')
-        os.environ.setdefault('MODEL_CACHE_DIR', str(DEFAULT_MODEL_CACHE))
-        model = load_cuda_model(config.model_id, key)
+        model_root = os.environ.get('CAROTID_MODEL_ROOT', '').strip() or DEFAULT_LOCAL_MODEL_ROOT
+        model = load_cuda_model(config.model_id, model_root)
         serve(sock, DetectionPipeline(model, config))
 
 

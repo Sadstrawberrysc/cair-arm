@@ -4,8 +4,8 @@ import math
 from pathlib import Path
 
 
-DEFAULT_MODEL_ID = 'songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1'
-DEFAULT_MODEL_CACHE = Path(__file__).resolve().parents[1] / 'data' / 'model_cache'
+DEFAULT_MODEL_ID = 'songjiatong/carotid-detect-c9gi9-10-rfdetr-large-t1'
+DEFAULT_LOCAL_MODEL_ROOT = Path(__file__).resolve().parents[1] / 'data' / 'local_models'
 
 
 @dataclass(frozen=True)

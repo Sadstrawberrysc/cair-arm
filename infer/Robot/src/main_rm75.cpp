@@ -1081,6 +1081,7 @@ int main(int argc, char** argv) {
               << '\n'
               << "period_ms: " << options.period_ms << '\n'
               << "joint_speed_cap_deg_s: " << planner_config.max_joint_speed_deg_s << '\n'
+              << "ik_damping: " << planner_config.damping << '\n'
               << "sensor_protocol: "
               << ForceSensorProtocolName(sensor_config.protocol) << '\n'
               << "sensor_baud: " << sensor_config.baud_rate << '\n'

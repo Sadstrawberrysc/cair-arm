@@ -69,7 +69,7 @@ class ModelWorkerTests(unittest.TestCase):
         self.assertEqual(len(result['detections']), 2)
         self.assertEqual(result['capture_monotonic_ns'], 123)
         self.assertEqual(result['image_size'], [32, 32])
-        self.model.infer.assert_called_once_with(self.image, confidence=.4)
+        self.model.infer.assert_called_once_with(self.image, confidence=.4, max_detections=1)
 
     def test_nonfinite_or_malformed_model_output_is_serializable_rejection(self):
         for output in [native_response(x=float('nan')), object(), [None]]:
@@ -109,20 +109,28 @@ class ModelWorkerTests(unittest.TestCase):
     def test_selector_subprocess_uses_migrated_worker_and_roundtrips_capture(self):
         """Run the real worker CLI/socket loop with an offline model substitute."""
         child_code = textwrap.dedent('''
+            import os
             from types import SimpleNamespace
             from infer.Camera_wrist.detector import worker
 
             class OfflineModel:
-                def infer(self, image, confidence):
+                def infer(self, image, confidence, max_detections):
                     assert image.shape == (32, 32, 3)
                     assert confidence == .4
+                    assert max_detections == 1
                     return [SimpleNamespace(
                         image=SimpleNamespace(width=32, height=32),
                         predictions=[SimpleNamespace(x=16, y=16, width=8, height=10,
                                                      confidence=.9, class_name='carotid')])]
 
-            worker.get_api_key = lambda: 'offline-test-key'
-            worker.load_cuda_model = lambda model_id, key: OfflineModel()
+            def load_local_model(model_id, model_root):
+                assert model_id == 'test/model'
+                assert model_root.name == 'local_models'
+                return OfflineModel()
+
+            worker.load_cuda_model = load_local_model
+            os.environ.pop('CAROTID_MODEL_ROOT', None)
+            os.environ.pop('ROBOFLOW_API_KEY', None)
             worker.main()
         ''')
         real_popen = subprocess.Popen

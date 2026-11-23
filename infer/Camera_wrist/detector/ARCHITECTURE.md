@@ -18,11 +18,10 @@
 
 | 文件 / 入口 | 职责 | 边界 |
 | --- | --- | --- |
-| [config.py](config.py) · `DEFAULT_MODEL_ID`、`ModelConfig` | 默认模型 ID、不可变配置及 ID/类别/置信度/边距校验 | 非法配置在凭据读取和模型加载前拒绝 |
-| [credentials.py](credentials.py) · `get_api_key` | 优先读环境变量，再读本机私有凭据 | 密钥不进入帧协议、Redis 或日志 |
-| [gpu_model.py](gpu_model.py) · `load_cuda_model` | 加载 Roboflow 模型并检查 provider 和实际模型会话 | 必须包含 `CUDAExecutionProvider` |
+| [config.py](config.py) · `DEFAULT_MODEL_ID`、`ModelConfig` | 默认本地模型 ID、模型根目录及选点参数 | 非法配置在模型加载前拒绝 |
+| [gpu_model.py](gpu_model.py) · `load_cuda_model` | 以 ONNX Runtime 读取本地固定尺寸 RF-DETR 检测模型，负责图像预处理和框解码 | `CUDAExecutionProvider` 必须是首选 provider |
 | [detection.py](detection.py) | 原生响应转原图框，选择置信度最高的合格框中心 | 输出二维 `scan_start`，不做深度反投影 |
-| [pipeline.py](pipeline.py) · `DetectionPipeline.process` | 注入模型、推理、框转换、选点和响应组装 | 不管理凭据、socket、深度几何或 Robot 请求 |
+| [pipeline.py](pipeline.py) · `DetectionPipeline.process` | 注入模型、推理、框转换、选点和响应组装 | 不管理 socket、深度几何或 Robot 请求 |
 | [protocol.py](protocol.py) | RGB-D 校验、NPZ 编解码、受长度约束的 JSON 发送 | 保留源时间，禁用 pickle 和非有限 JSON 数值 |
 | [worker.py](worker.py) · `main`、`serve` | CLI、加载模型、ready 握手、常驻顺序服务 | 仅响应相机，关闭时释放 socket |
 | [model_selection.py](../model_selection.py) | 子进程生命周期、后台交换、赶帧与同源帧融合 | 不发布 Redis 命令，worker 退出后不自动重建 |
@@ -35,33 +34,29 @@
 `python infer/Camera_wrist/click_follow.py` 均默认模型模式；无需传入参数。
 
 模型 ID 优先级为 **显式 `--model-id` → `CAROTID_MODEL_ID` 环境变量 → `DEFAULT_MODEL_ID`**。
-当前默认 ID 是 `songjiatong/carotid-detect-c9gi9-9-rfdetr-small-t1`。
+当前默认 ID 是 `songjiatong/carotid-detect-c9gi9-10-rfdetr-large-t1`，对应模型根目录下的同名子目录。
 `--manual` 切换鼠标选点跟踪，不启动模型子进程。
 
 | 配置 / 检查 | 默认规则 | 可调整入口 |
 | --- | --- | --- |
 | 类别 | 精确匹配 `carotid` | 相机 `--model-class` |
 | 模型出框 / 选点置信度 | 均为 0.4 | 相机 `--model-confidence` 修改选点阈值；当前调用固定推理阈值 0.4 |
+| 模型最大出框数 | 每帧最多 1 个框，随后执行类别与选点检查 | `DetectionPipeline.process` 固定传入 `max_detections=1` |
 | 候选选择 | 类别和置信度过滤后选择最高分框中心；同分保留模型输出中靠前者，无候选拒绝 | `scan_start_from_boxes` |
 | 坐标 | 响应图像尺寸与输入一致；正框尺寸，合格框不越原图 | `detection.py` |
 | P0 与边距 | 检测框中心，默认额外边距 0 px | `ModelConfig.margin`；跟踪器另检查纹理/深度 |
 | worker Python | 本机 `ultralytics` 环境 | 相机 `--detector-python` |
-| 模型缓存 | `Camera_wrist/data/model_cache/`，Git 忽略 | `MODEL_CACHE_DIR` 环境变量 |
+| 本地模型根目录 | `Camera_wrist/data/local_models/`，Git 忽略 | `CAROTID_MODEL_ROOT` 环境变量 |
 
 模型进程入口为 `python -m infer.Camera_wrist.detector.worker`。它由 `ModelSelector` 传入
 必需的 `--socket-fd` 和 `--model-id` 等参数；直接启动 worker 不是相机运行入口。
-初始化时相机为子进程装配 CUDA/cuDNN 和可用的 MKL 库路径。
-`gpu_model` 使用 `device='cpu'` 输入路径避免额外 PyCUDA 依赖；ONNX 会话同时配置 CUDA
-和 CPU provider。provider 检查证明 CUDA 已启用，不证明每个算子都在 GPU 执行。
+相机为子进程装配 CUDA/cuDNN 和可用的 MKL 库路径。worker 直接读取本地模型包，不加载 Roboflow SDK，不读取 API Key。
+ONNX 会话首选 CUDA provider，允许 CPU provider 执行分配给它的算子；若 CUDA provider 未启用，启动失败。
 
-凭据优先从 `ROBOFLOW_API_KEY` 读取，否则使用迁移前已保存的
-`~/.config/carotid_begin/roboflow_api_key`。该旧目录名继续兼容，无需重录密钥。
-读取要求普通文件且无组/其他用户权限；保存工具写入 `0600`，不打印密钥。
-在仓库根目录检查凭据：
-
-```bash
-/home/cair-jacen/anaconda3/envs/ultralytics/bin/python -m infer.Camera_wrist.detector.credentials check
-```
+模型目录内提供 `weights.onnx`、`class_names.txt`、`inference_config.json` 和 `model_config.json`。
+默认模型包来自已部署版本的本地缓存，复制时已解引用符号链接，可用 `sha256sum -c SHA256SUMS` 核对。
+移机时需单独复制模型包，本地加载器支持固定尺寸、RGB 拉伸的 RF-DETR ONNX 检测导出。
+当前模型以 704×704 输入执行 RGB 归一化，恢复到原始图像坐标后将框边界取整。相机选点沿用置信度和类别校验。
 
 ## 私有帧协议
 
@@ -75,7 +70,7 @@ Robot Redis 公共协议不随目录迁移改变。
 | 逐帧结果 | UTF-8 JSON，65536 字节 | `valid`、原始 `capture_monotonic_ns`；相机复核源时间与请求一致 |
 | 有效候选 | 同上 | `prediction` 含 `scan_start:[x,y]`、`confidence`、`box_xyxy`、`class_name` |
 | 检测拒绝 | 同上 | `valid:false`、`reason`；正常拒绝后继续接收下一帧 |
-| 检测诊断 | 框转换成功后才存在 | `detections`、`image_size:[W,H]`、`inference_ms`；保留全部检测框，无合格框时也可带这些字段 |
+| 检测诊断 | 框转换成功后才存在 | `detections`、`image_size:[W,H]`、`inference_ms`；保留模型返回的检测框，无合格框时也可带这些字段 |
 
 腕部窗口只绘制近期有效结果中 `prediction.box_xyxy` 指定的检测框。
 
@@ -87,7 +82,7 @@ Robot Redis 公共协议不随目录迁移改变。
 
 | 条件 | 模型服务 / 相机行为 |
 | --- | --- |
-| 配置、凭据、模型加载或 ready 失败 | 相机启动失败；`ModelSelector` 关闭 socket 并终止子进程 |
+| 本地模型包、CUDA 初始化或 ready 失败 | 相机启动失败；`ModelSelector` 关闭 socket 并终止子进程 |
 | 无合格目标、非法框或管线捕获的 `ValueError/TypeError/KeyError` | 拒绝当前帧，worker 继续接收 |
 | 截断、非法帧、未捕获运行异常或发送错误 | worker 结束，后台线程将交换错误交给相机主循环 |
 | 完整消息边界上相机关闭 socket | worker 正常结束 |
@@ -107,7 +102,7 @@ ready 的 socket 操作 timeout 为 60 s，逐帧交换为 15 s；均不是观�
 
 | 证据入口 | 可验证范围 |
 | --- | --- |
-| [test_credentials.py](../tests/test_credentials.py) | 环境变量优先、私有文件读取和权限校验 |
+| [test_local_detector.py](../tests/test_local_detector.py) | 本地模型预处理、背景类过滤、原图坐标和缺失模型拒绝 |
 | [test_detector_worker.py](../tests/test_detector_worker.py)、[test_detection_protocol.py](../tests/test_detection_protocol.py) | 假模型下配置、框转换、消息边界、多帧服务、源时间及异常处理 |
 | [test_model_selection.py](../tests/test_model_selection.py)、[test_tracker.py](../tests/test_tracker.py) | 合成 RGB-D 赶帧、同源帧融合、校正限幅与丢失锁存 |
 | [test_model_start.py](../tests/test_model_start.py)、[test_click_session.py](../tests/test_click_session.py) | 会话身份、目标回传、暂停回执、开始/恢复和取消条件 |

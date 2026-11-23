@@ -93,11 +93,11 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertTrue(current_result['valid'])
         response = dict(valid=True, capture_monotonic_ns=source[2],
                         prediction={'scan_start': [157, 116]})
-        aligned, reason = fusion.aligned_center(response, 'target-a', current_result,
-                                                current[2]+80_000_000)
+        offset, reason = fusion.center_offset(response, 'target-a', current_result,
+                                              current[2]+80_000_000)
         self.assertIsNone(reason)
-        np.testing.assert_allclose(aligned,
-                                   np.asarray(current_result['pixel'])+[2, -1], atol=.001)
+        np.testing.assert_allclose(offset, [2, -1], atol=.001)
+        aligned = np.asarray(current_result['pixel']) + offset
         corrected, reason = tracker.correct_from_detection(
             aligned, current[1], self.k, self.distortion, current[2])
         self.assertIsNone(reason)
@@ -119,25 +119,25 @@ class ModelSelectionTests(unittest.TestCase):
                              pixel=[155, 117]), 'target-a')
         jump = dict(valid=True, capture_monotonic_ns=1_000_000_000,
                     prediction={'scan_start': [180, 117]})
-        aligned, reason = fusion.aligned_center(jump, 'target-a', current,
-                                                1_100_000_000)
+        offset, reason = fusion.center_offset(jump, 'target-a', current,
+                                              1_100_000_000)
         self.assertIsNone(reason)
-        np.testing.assert_allclose(aligned, [183, 119])
+        np.testing.assert_allclose(offset, [25, 0])
         normal = dict(jump, prediction={'scan_start': [157, 116]})
-        self.assertIn('stale', fusion.aligned_center(normal, 'target-a', current,
-                                                     1_600_000_000)[1])
-        self.assertIn('active target', fusion.aligned_center(normal, 'target-b', current,
-                                                             1_100_000_000)[1])
+        self.assertIn('stale', fusion.center_offset(normal, 'target-a', current,
+                                                    1_600_000_000)[1])
+        self.assertIn('active target', fusion.center_offset(normal, 'target-b', current,
+                                                           1_100_000_000)[1])
         fusion.remember(dict(valid=True, capture_monotonic_ns=1_100_000_000,
                              pixel=[160, 120]), 'target-b')
-        self.assertIn('unavailable', fusion.aligned_center(normal, 'target-b', current,
-                                                            1_100_000_000)[1])
+        self.assertIn('unavailable', fusion.center_offset(normal, 'target-b', current,
+                                                          1_100_000_000)[1])
 
-    def test_large_model_offset_keeps_track_and_limits_correction(self):
+    def test_model_offset_of_fifteen_pixels_keeps_limited_correction(self):
         stamp = 1_000_000_000
         source = self.frame(0, 0, stamp)
         response = dict(valid=True, capture_monotonic_ns=stamp,
-                        prediction={'scan_start': [190, 117]})
+                        prediction={'scan_start': [170, 117]})
         tracker = LocalTracker()
         current = tracker.initialize(source[0], source[1], [155, 117],
                                      self.k, self.distortion, stamp)
@@ -153,6 +153,31 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertIsNone(reason)
         np.testing.assert_allclose(output['pixel'], [157, 117], atol=.001)
+
+    def test_model_offset_over_fifteen_pixels_loses_track_and_allows_reselection(self):
+        stamp = 1_000_000_000
+        source = self.frame(0, 0, stamp)
+        tracker = LocalTracker()
+        source_result = tracker.initialize(*source[:2], [155, 117], self.k,
+                                           self.distortion, stamp)
+        fusion = DetectionCenterFusion()
+        fusion.remember(source_result, 'target-a')
+        frame = self.frame(3, 2, stamp+33_000_000)
+        current = tracker.update(*frame[:2], self.k, self.distortion, frame[2])
+        response = dict(valid=True, capture_monotonic_ns=stamp,
+                        prediction={'scan_start': [165, 129]})
+        output, applied, reason, confirmed = fuse_model_observation(
+            tracker, fusion, response, stamp, frame, current,
+            'target-a', self.k, self.distortion, frame[2]+50_000_000)
+        self.assertFalse(output['valid'])
+        self.assertAlmostEqual(output['model_offset_px'], np.hypot(10, 12))
+        self.assertIn('exceeds 15 px', reason)
+        self.assertFalse(applied or confirmed or tracker.active)
+
+        selected = replay_selection(tracker, source, [frame], response['prediction'],
+                                    self.k, self.distortion)
+        self.assertTrue(selected['valid'], selected)
+        np.testing.assert_allclose(selected['pixel'], [168, 131], atol=.4)
 
     def test_fusion_rejects_response_from_different_capture(self):
         stamp = 1_000_000_000

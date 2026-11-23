@@ -22,7 +22,8 @@ class DetectionPipeline:
         response = dict(valid=False, capture_monotonic_ns=capture_monotonic_ns)
         started_ns = time.monotonic_ns()
         try:
-            result = self.model.infer(image, confidence=self.config.inference_confidence)
+            result = self.model.infer(
+                image, confidence=self.config.inference_confidence, max_detections=1)
             inference_ms = (time.monotonic_ns() - started_ns) / 1e6
             raw = response_to_boxes(result)
             # Preview boxes remain available even if no eligible center is found.

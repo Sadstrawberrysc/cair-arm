@@ -1,5 +1,13 @@
 # 腕部 detector 模型进展及 Carotid_begin 历史
 
+## 2026-11-23 腕部默认模型更新至 RF-DETR Large 第 10 版
+
+相机默认加载 `songjiatong/carotid-detect-c9gi9-10-rfdetr-large-t1`，类别为 `carotid`，默认置信度阈值为 0.4。
+腕部离线回归 126 项通过。现有相机选择器通过私有 socket 启动真实 worker，取得权重并启用 ONNX Runtime CUDA provider。
+使用存档 `data/pictures/1.png` 连续推理四次，均返回 `carotid`，置信度约 0.675，框中心为 `(480.0, 354.5)` px。
+首次模型调用约 309 ms，后三次约 23–24.5 ms。计时仅覆盖模型调用。
+相机按正常流程下次启动时加载新版本。本次未启动相机或 Robot，实时选点、跟踪和运动待现场验收。
+
 ## 2026-11-10：超声窗口恢复原显示
 
 按用户要求移除 Tool-Y 修复新增的中心参考线、目标圆圈及新状态 / 误差来源文字，

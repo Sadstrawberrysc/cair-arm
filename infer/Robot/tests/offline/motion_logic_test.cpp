@@ -180,8 +180,8 @@ int main() {
                     "real tilt beyond deadband updates orientation goal");
         const double angle_step = Eigen::Quaterniond(first.tcp_reference.topLeftCorner<3,3>()).angularDistance(
             Eigen::Quaterniond(large.tcp_reference.topLeftCorner<3,3>()));
-        ok &= Check(std::abs(angle_step-3.*M_PI/180.*input.cycle_s) < 1e-12,
-                    "wrist orientation advances at 3 deg/s for a distant goal");
+        ok &= Check(std::abs(angle_step-4.*M_PI/180.*input.cycle_s) < 1e-12,
+                    "wrist orientation advances at 4 deg/s for a distant goal");
     }
 
     {
@@ -203,7 +203,7 @@ int main() {
         input.capture_ns += 33'000'000;
         input.surface_base.x() = .008;
         const auto moving = wrist_position.Step(input);
-        ok &= Check(moving.motion_requested && std::abs(moving.tcp_reference(0,3)-.003*input.cycle_s)<1e-12,
+        ok &= Check(moving.motion_requested && std::abs(moving.tcp_reference(0,3)-.004*input.cycle_s)<1e-12,
                     "position starts outside the deadband and advances at the reference speed limit");
         wrist_position.Commit(moving.tcp_reference);
 
@@ -289,7 +289,7 @@ int main() {
         ok &= Check((continued.tcp_goal.topRightCorner<3,1>()-expected_goal).norm()<1e-12,
                     "the first matched frame supplies the entire new surface position");
         ok &= Check((continued.tcp_reference.topRightCorner<3,1>()-
-                     first.tcp_reference.topRightCorner<3,1>()).norm()<=.003*input.cycle_s+1e-12,
+                     first.tcp_reference.topRightCorner<3,1>()).norm()<=.004*input.cycle_s+1e-12,
                     "the Cartesian reference still limits the step toward the latest surface position");
         --matched.capture_ns;
         const auto backwards = late_feedback.Step(matched);
@@ -307,8 +307,8 @@ int main() {
     ok &= Check(wo.following && wo.reference_reset, "wrist explicit begin resets measured reference");
     ok &= Check((wo.tcp_goal.topRightCorner<3,1>()-Eigen::Vector3d(.01,0,.05)).norm()<1e-12,
                 "wrist adds exactly 50 mm outward");
-    ok &= Check(std::abs(wo.tcp_reference.topRightCorner<3,1>().norm()-.003*wi.cycle_s)<1e-12,
-                "wrist TCP reference advances at 3 mm/s for a distant goal");
+    ok &= Check(std::abs(wo.tcp_reference.topRightCorner<3,1>().norm()-.004*wi.cycle_s)<1e-12,
+                "wrist TCP reference advances at 4 mm/s for a distant goal");
     ok &= Check((wo.tcp_goal.topLeftCorner<3,3>().col(2)-Eigen::Vector3d(0,0,1)).norm()<1e-12,
                 "wrist Tool Z points inward");
     wrist.Commit(wo.tcp_reference);
@@ -324,7 +324,7 @@ int main() {
         - wi.actual_tcp.topRightCorner<3,1>();
     const Eigen::Vector3d resume_goal_delta = wo.tcp_goal.topRightCorner<3,1>()
         - wi.actual_tcp.topRightCorner<3,1>();
-    ok &= Check(wo.following && wo.reference_reset && resume_step.norm()<=.003*wi.cycle_s+1e-12
+    ok &= Check(wo.following && wo.reference_reset && resume_step.norm()<=.004*wi.cycle_s+1e-12
                 && resume_step.dot(resume_goal_delta)>0.,
                 "wrist resume rebases on actual TCP");
     wi.request_token="producer:4"; wi.action="pause";
@@ -333,7 +333,7 @@ int main() {
     wi.normal_base=Eigen::Vector3d(.1,0,-1).normalized();
     wo=wrist.Step(wi);
     ok &= Check(wo.following && Eigen::AngleAxisd(wo.tcp_reference.topLeftCorner<3,3>()).angle()
-                <=3.*M_PI/180.*wi.cycle_s+1e-9, "angular reference limited to 3 deg/s");
+                <=4.*M_PI/180.*wi.cycle_s+1e-9, "angular reference limited to 4 deg/s");
     wrist.Hold("planner_rejected");
     ok &= Check(!wrist.Step(wi).following, "planner rejection is latched");
     wi.normal_base=Eigen::Vector3d(1,0,0); wi.target_id="degenerate";

@@ -410,8 +410,8 @@ class WristFollowController {
 public:
     static constexpr double kPositionStartErrorM = .007;
     static constexpr double kPositionStopErrorM = .003;
-    static constexpr double kPositionSpeedMPerS = .003;
-    static constexpr double kAngularSpeedDegPerS = 3.0;
+    static constexpr double kPositionSpeedMPerS = .004;
+    static constexpr double kAngularSpeedDegPerS = 4.0;
 
     WristFollowOutput Step(const WristFollowInput& input);
     void Hold(const std::string& reason);

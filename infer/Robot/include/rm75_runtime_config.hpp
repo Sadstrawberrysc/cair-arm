@@ -79,8 +79,10 @@ struct RobotRuntimeConfig {
 
     Rm75ServoPlannerConfig EffectivePlanner() const {
         auto result = planner;
-        if (!wrist_follow_calibration.empty())
+        if (!wrist_follow_calibration.empty()) {
             result.max_joint_speed_deg_s = WristFollowController::kAngularSpeedDegPerS;
+            result.damping *= 0.8;
+        }
         return result;
     }
 

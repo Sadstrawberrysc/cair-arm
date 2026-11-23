@@ -68,7 +68,7 @@ def parse_args(argv=None):
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--model-id',
                            default=os.environ.get('CAROTID_MODEL_ID', '').strip() or DEFAULT_MODEL_ID,
-                           help='Override the default model; initial selection and follow start automatically')
+                           help='Select a local model bundle; initial selection and follow start automatically')
     selection.add_argument('--manual', action='store_true',
                            help='Use mouse selection instead of loading the detector')
     parser.add_argument('--detector-python', type=Path, default=DEFAULT_DETECTOR_PYTHON)
@@ -406,10 +406,15 @@ def main():
                                             session.target, k, d, time.monotonic_ns())
                                         if confirmed:
                                             last_model_confirmed_ns = time.monotonic_ns()
-                                        record(dict(type='model_fusion', applied=applied,
-                                                    reason=reason, source_capture_monotonic_ns=initial[2],
-                                                    current_capture_monotonic_ns=timestamp,
-                                                    pixel=result.get('pixel')))
+                                        fusion_event = dict(type='model_fusion', applied=applied,
+                                                            reason=reason, source_capture_monotonic_ns=initial[2],
+                                                            current_capture_monotonic_ns=timestamp,
+                                                            pixel=result.get('pixel'))
+                                        if not result['valid']:
+                                            fusion_event['model_offset_px'] = result.pop('model_offset_px')
+                                            if not session.following and not recovery.waiting:
+                                                selection_requested = True
+                                        record(fusion_event)
                             if (0 <= time.monotonic_ns()-timestamp <= 200_000_000
                                     and startup.queue(
                                         session, model_start, time.monotonic_ns(),

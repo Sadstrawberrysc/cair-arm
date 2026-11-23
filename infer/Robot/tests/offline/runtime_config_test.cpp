@@ -1,3 +1,4 @@
+#include <cmath>
 #include <iostream>
 #include <string>
 
@@ -126,10 +127,14 @@ int main() {
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==25.0, "ordinary tracking error remains 25 mm");
     ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==0.0,
                 "ordinary planner keeps its existing joint speed envelope");
+    ok &= Check(polling.EffectivePlanner().damping == polling.planner.damping,
+                "ordinary planner uses the configured IK damping");
     polling.wrist_follow_calibration="wrist.json";
     ok &= Check(polling.EffectiveSafety().max_tracking_position_error_mm==50.0, "wrist tracking error uses 50 mm");
-    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==3.0,
-                "wrist follow caps each planned joint at 3 deg/s");
+    ok &= Check(polling.EffectivePlanner().max_joint_speed_deg_s==4.0,
+                "wrist follow caps each planned joint at 4 deg/s");
+    ok &= Check(std::abs(polling.EffectivePlanner().damping - 0.04) < 1e-12,
+                "wrist follow reduces the default IK damping by 20 percent");
     ok &= Check(polling.StatePollPeriodMs()==5, "wrist feedback is requested at 200 Hz");
     return ok ? 0 : 1;
 }

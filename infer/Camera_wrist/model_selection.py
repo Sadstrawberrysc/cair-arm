@@ -157,6 +157,9 @@ def observation_is_fresh(result, now_ns):
     return isinstance(capture, int) and 0 <= now_ns - capture <= 200_000_000
 
 
+MODEL_RESELECT_DISTANCE_PX = 15.0
+
+
 class DetectionCenterFusion:
     """Align an asynchronous detection with optical flow from the same source frame."""
 
@@ -182,7 +185,8 @@ class DetectionCenterFusion:
         elif not self.history or stamp > self.history[-1][0]:
             self.history.append((stamp, point))
 
-    def aligned_center(self, response, target_id, current_result, now_ns):
+    def center_offset(self, response, target_id, current_result, now_ns):
+        """Measure the detection-to-track offset in the detection source frame."""
         if not target_id or target_id != self.target_id or not current_result.get('valid'):
             return None, 'no active target for fusion'
         if not isinstance(response, dict) or response.get('valid') is not True:
@@ -211,7 +215,7 @@ class DetectionCenterFusion:
                 not all(isinstance(value, (int, float)) and math.isfinite(value)
                         for value in current)):
             return None, 'invalid current tracking point'
-        return [current[0]+center[0]-source[0], current[1]+center[1]-source[1]], None
+        return (center[0]-source[0], center[1]-source[1]), None
 
 
 def fuse_model_observation(tracker, fusion, response, source_timestamp, frame,
@@ -219,11 +223,17 @@ def fuse_model_observation(tracker, fusion, response, source_timestamp, frame,
     """Return (observation, applied, reason, confirmed) for one model preview."""
     if response.get('capture_monotonic_ns') != source_timestamp:
         return current_result, False, 'model response frame identity mismatch', False
-    aligned, reason = fusion.aligned_center(response, target_id, current_result, now_ns)
-    if aligned is None:
+    offset, reason = fusion.center_offset(response, target_id, current_result, now_ns)
+    if offset is None:
         return current_result, False, reason, False
     if not observation_is_fresh(current_result, now_ns):
         return current_result, False, 'current tracking observation is stale', False
+    offset_px = math.hypot(*offset)
+    if offset_px > MODEL_RESELECT_DISTANCE_PX:
+        reason = 'model center offset exceeds %.0f px' % MODEL_RESELECT_DISTANCE_PX
+        tracker.lose(reason, force=True)
+        return dict(valid=False, reason=reason, model_offset_px=offset_px), False, reason, False
+    aligned = [point + delta for point, delta in zip(current_result['pixel'], offset)]
     corrected, reason = tracker.correct_from_detection(
         aligned, frame[1], k, distortion, frame[2])
     if corrected is not None:
